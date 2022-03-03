@@ -1,0 +1,10 @@
+# Auxiliary dependencies that are intended to be used for local debugging and testing.
+
+boto3~=1.21.7
+setuptools~=57.4.0
+python-dateutil~=2.8.2
+dill~=0.3.4
+packaging~=21.3
+pytest~=7.0.1
+mock~=4.0.3
+moto~=3.0.4

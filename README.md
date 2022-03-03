@@ -1,11 +1,15 @@
-## My Project
+# RheocerOS
 
-TODO: Fill this README out!
+TODO
 
-Be sure to:
+## Documentation
 
-* Change the title in this README
-* Edit your repository description on GitHub
+Generated documentation for the latest released version can be accessed here:
+TODO link to generated doc
+
+## Development
+
+See [DEVELOPMENT.md](./doc/DEVELOPMENT.md)
 
 ## Security
 
