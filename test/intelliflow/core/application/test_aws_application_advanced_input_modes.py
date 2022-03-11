@@ -193,6 +193,38 @@ class TestAWSApplicationAdvancedInputModes(AWSTestBase):
 
         self.patch_aws_stop()
 
+    def test_application_reference_inputs_in_different_layers_2(self):
+        app = self._create_app()
+
+        timer_signal_daily = app.add_timer(
+            id="daily_timer", schedule_expression="rate(1 day)", time_dimension_id="day"  # you can use CRON tab here as well
+        )
+
+        pdex_data = app.marshal_external_data(
+            S3Dataset(
+                "111222333444",
+                "dex-inc-bucket",
+                "output",
+                "filtered-data-merged-with-header-v1.2-{}",
+                dataset_format=DataFormat.CSV,
+            ),
+            "smart_filtered_data",
+            {"day": {"type": DimensionType.DATETIME, "format": "%Y-%m-%d"}},
+            protocol=SignalIntegrityProtocol("FILE_CHECK", {"file": "_SUCCESS"}),
+        )
+
+        # should succeed and output should get auto-linked to (non-reference signal) timer here
+        preprocess_1_dedupe_2 = app.create_data(
+            id="preprocessed_deduped",
+            inputs={
+                "daily_data": pdex_data.ref,
+                "timer": timer_signal_daily,
+            },
+            compute_targets=[NOOPCompute],
+        )
+
+        self.patch_aws_stop()
+
     def test_application_range_check_succeeds_via_event_ingestion(self):
         app = self._create_app()
 

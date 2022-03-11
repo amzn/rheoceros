@@ -4,68 +4,83 @@
 
 ## Setup Dev-Env / Debugging
 
-We maintain the requirements file ("./requirements.txt"). Create your Python (3.7+) environment following
-these steps. 
+We maintain the requirements file ("./requirements.txt"). 
 
-    2.1-
-    Install Python via Conda
-        https://ecshackweek.github.io/tutorial/installing-python-with-conda/
+Create your Python (3.7+) environment.
 
-    Update conda’s listing of packages for your system: 
+### Python
+
+#### Option 1: Install Python via Conda
+
+First install miniconda: https://conda.io/miniconda.html.
+
+Update conda’s listing of packages for your system: 
+
     >> conda update conda
 
-    Test your installation: 
-    >> conda list
-    For a successful installation, a list of installed packages appears.
+Test your installation: 
 
-    Test that Python 3 is your default Python: 
+    >> conda list
+
+For a successful installation, a list of installed packages appears.
+
+Test that Python 3 is your default Python: 
 
     >> python -V
-    You should see something like Python 3.7.x :: Anaconda, Inc.
-    ----
-    Create conda environment:
 
-    >> conda create --name RheocerOS python=3.7 jinja2 pytest sphinx mypy pylint (... FUTURE to be extended)
+You should see something like 
+    
+    Python 3.7.x :: Anaconda, Inc.
+
+----
+Create conda environment:
+
+    >> conda create --name RheocerOS python=3.7
     >> conda activate RheocerOS 
-    To deactivate an active environment, use
+
+To deactivate an active environment, use
+
     >> conda deactivate
 
-    Now we can use this isolated environment and its python as the base interpreter.
-    Note: If we are going to use this environment within PyCharm, you might want to use Conda Package Manager,
-    to manage project packages in stead of PyCharm's default pip. 
+Now we can use this isolated environment and its python as the base interpreter.
+Note: If we are going to use this environment within PyCharm, you might want to use Conda Package Manager,
+to manage project packages in stead of PyCharm's default pip. 
 
-    2.2- Simply jump to (3) below and use PyCharm for both Python setup and your environment. Choose
-    the right Python version (3.7) during the initial auto-download that PyCharm will attempt.
+#### Option 2: Within PyCharm
 
-3- For the rest (actual app development using RheocerOS):
+Download PyCharm from http://www.jetbrains.com/pycharm/download/
 
-3.1- VirtualEnv: RheocerOS maintains "requirements.txt" file for an easy setup of your own virtual-env. 
+Simply jump to the next section below and use PyCharm for both Python setup and your environment. Choose
+the right Python version (3.7) during the auto-installation by PyCharm.
 
-    3.1.1- You can use PyCharm to setup the rest (as Project Interpreter) once the above steps are done.
-        - Choose "Base Interpreter" from the steps above (Conda or PyCharm auto-download of Python 3.7 from "python.org")
-        - For more details, see https://www.jetbrains.com/help/idea/creating-virtual-environment.html
-    3.1.2- TODO VIM setup. Also an example for console based development outside an IDE.
-    
-3.2- Conda Environment: 
-    3.2.1- TODO PyCharm: download RheocerOS Conda env and then use it as "Existing Environment" 
-    while creating a Conda Environment in PyCharm. https://www.jetbrains.com/help/idea/conda-support-creating-conda-virtual-environment.html
-    3.2.2- TODO VIM setup. Also an example for console based development outside an IDE.
+### Setup PyCharm
 
-3.3- TBD
-
-## Container Based Dev-Env
-
-TODO
-
-    ### Using CPython3
+* pull package and open it as new project
+* mark 'src' folder as source
+* Interpreter
+    * Choose "Base Interpreter" from the steps above (Conda or PyCharm auto-download of Python 3.7+ from "python.org")
+    * Choose 'virtualenv' For more details, see https://www.jetbrains.com/help/idea/creating-virtual-environment.html
+    * Check the creation of 'venv' as a root directory.
+* VirtualEnv: RheocerOS maintains "requirements.txt" and "requirements_test.txt" files for an easy setup of your own virtual-env. 
+  * "requirements_test.txt": Use as is (for test-runs) or modify (for your local experimentation in ipython, local Jupyter notebook, etc)
+    * Refer [Testing](#Testing) section below run unit or integ tests
+  * "requirements.txt": restore the RELEASE configuration before integ-tests or application activations against cloud
 
 ## Building
 
 ## Testing
 
+### Unit-tests
+
+See [test/README.md](./test/README.md)
+
+### integ-tests
+
+See [test_integration README.md](./test_integration/README.md)
 
 ## Running
 
-
 ## Deploying
+
+## Container Based Dev-Env
 

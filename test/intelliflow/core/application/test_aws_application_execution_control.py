@@ -472,7 +472,7 @@ class TestAWSApplicationExecutionControl(AWSTestBase):
         def _datetime(str_value: str) -> int:
             return int(datetime.datetime.fromisoformat(str_value).timestamp())
 
-        datum_lower_bound = int(datetime.datetime(1970, 1, 1).timestamp())
+        datum_lower_bound = int(datetime.datetime(1971, 1, 1).timestamp())
         datum_upper_bound = int((datetime.datetime.now() + datetime.timedelta(hours=1)).timestamp())
         # failing with datum below lower bound
         with pytest.raises(ValueError):

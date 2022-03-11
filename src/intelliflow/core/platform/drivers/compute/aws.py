@@ -21,6 +21,7 @@ from intelliflow.core.permission import PermissionContext
 from intelliflow.core.platform.definitions.aws.glue.script.batch.glueetl_scala_all_ABI import GlueAllABIScala
 from intelliflow.core.signal_processing import DimensionFilter, DimensionSpec, Signal, Slot
 from intelliflow.core.signal_processing.definitions.compute_defs import ABI, Lang
+from intelliflow.core.signal_processing.definitions.dimension_defs import Type as DimensionType
 from intelliflow.core.signal_processing.routing_runtime_constructs import Route
 from intelliflow.core.signal_processing.signal import SignalDomainSpec, SignalType
 from intelliflow.core.signal_processing.signal_source import (
@@ -839,6 +840,25 @@ class AWSGlueBatchComputeBasic(AWSConstructMixin, BatchCompute):
         """Early stage check on a new route, so that we can fail fast before the whole activation."""
         super().hook_internal(route)
 
+        # capture one of the most common scenarios early (':' char output path causing issues on old Hadoop envs)
+        output_path_might_have_colon = any(
+            [
+                (not dim.params or not dim.params.get("format", None) or ":" in dim.params.get("format", None))
+                for dim in route.output.domain_spec.dimension_spec.get_flattened_dimension_map().values()
+                if dim.type == DimensionType.DATETIME
+            ]
+        )
+
+        if not output_path_might_have_colon:
+            # check all of the material dimensions to see if user inputted colon in filter values
+            output_path_might_have_colon = any(
+                [
+                    isinstance(dim.value, str) and ":" in dim.value
+                    for dim in route.output.domain_spec.dimension_filter_spec.get_flattened_dimension_map().values()
+                    if dim.is_material_value()
+                ]
+            )
+
         for slot in route.slots:
             if slot.type == SlotType.ASYNC_BATCH_COMPUTE:
                 code_metadata = slot.code_metadata
@@ -850,6 +870,17 @@ class AWSGlueBatchComputeBasic(AWSConstructMixin, BatchCompute):
                 extra_params: Dict[str, Any] = dict(slot.extra_params)
                 self._resolve_glue_version(extra_params, route.link_node.signals)
                 evaluate_execution_params(GlueJobCommandType.BATCH, GlueJobLanguage.from_slot_lang(slot.code_lang), extra_params, True)
+
+                glue_version = extra_params.get("GlueVersion", None)
+
+                # special handling of Hadoop 2.4 relative path exception
+                if output_path_might_have_colon and glue_version == GlueVersion.VERSION_1_0:
+                    module_logger.warning(
+                        f"Route {route.output.alias!r} might not be executed on Glue version {GlueVersion.VERSION_1_0!r}"
+                        f" because its output path would contain ':' character. If it is due to missing 'format' in"
+                        f" one of the DATETIME dimensions of the output then define its format (e.g '%Y-%m-%d') without"
+                        f" that character."
+                    )
 
     def hook_external(self, signals: List[Signal]) -> None:
         # hook early during app activation so that we can fail fast, without letting

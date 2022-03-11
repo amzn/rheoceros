@@ -1,4 +1,7 @@
-# This are the direct dependencies of RheocerOS runtime.
+# RELEASE configuration: use this to update your venv before releases to cloud or for more stable integ-test runs.
+# These will be picked up during bundle creation (deployments to cloud during application activation).
+#
+# These are the direct dependencies of RheocerOS runtime.
 # Maintain the list of packages that will form the deployable runtime bundle stripped of development
 # time auxiliary dependencies (testing, visualization, etc).
 #
@@ -8,19 +11,19 @@
 #
 # For testing and development, it is advised that you maintain a different requirements test to keep
 # local only packages from getting deployed to compute environments.
-# ---
-# Easiest way to install this:
 #
-#  pip install -U -r requirements.txt
-#
-# Or let your IDE (e.g PyCharm) install these automatically
+# How to create the virtualenv:
+# - Create a virtualenv using these dependencies. Use "./venv" as the library root. Or use DependencyConfiguration
+# module in your code to specify your dependencies folder.
+# - let your IDE (e.g PyCharm) create the virtualenv (./venv) for you.
 #
 # These versions are from our dependency graph that uses python_version=3.7 (on linux, win32 and darwin)
 # If you are using a different python_version, please contribute to these file using the following format
 #   SomeProject==5.4 ; python_version==3.7
 #   SomeProject      ; sys_platform=='win32'
 
-boto3~=1.21.7
+boto3~=1.20.9
+botocore~=1.23.9
 setuptools~=57.4.0
 python-dateutil~=2.8.2
 dill~=0.3.4

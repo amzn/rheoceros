@@ -1950,13 +1950,13 @@ class Application(CoreApplication):
             elif not isinstance(datum, int):
                 raise ValueError("please provide a value that is either datetime or an int value that can be converted into a datetime")
 
-            if datetime(1970, 1, 1).timestamp() >= datum or datum > int(datetime.utcnow().timestamp()):
+            if datetime(1971, 1, 1).timestamp() >= datum or datum > int(datetime.utcnow().timestamp()):
                 # datum must be greater than the start of utc and also less than the current day.
                 raise ValueError(
                     f"""
                                  Cannot poll {internal_data_node.data_id!r}!
                                  The datum parameter "{datum}" is out of the required datetime range.
-                                 Must be greater than:{datetime(1970, 1, 1)!r}! and must be less than (NOW):{datetime.utcnow()!r}
+                                 Must be greater than:{datetime(1971, 1, 1)!r}! and must be less than (NOW):{datetime.utcnow()!r}
                                  """
                 )
 

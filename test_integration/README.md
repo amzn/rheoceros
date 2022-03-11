@@ -1,12 +1,13 @@
 ## How to run
 
-$ bb test_integ
+You can run tests individually via the GUI and PyCharm. 
+You must set up PyCharm to use PyTest, and then you can select and right click a specific test to run it.
+Make sure you have PyCharm setup to use Pytest:
 
+To configure Pytest, In PyCharm,
+navigate to 
 
-## what to put in 'test_integration.intelliflow...'
+    → File → Settings →Tools → Python Integrated Tools
 
-Only the things (helpers, etc) specific to RheocerOS core framework integration tests.
+And under "testing", select "pytest" as the default test runner.
 
-If it is an essential mechanism that would be required (or even convenient, reusable) for application packages
-that will rely on RheocerOS, then checked in under 'src/intellifow/mixins' or somewhere else within the release
-bundle, framework source code.

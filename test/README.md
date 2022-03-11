@@ -8,24 +8,35 @@ Prerequisites
 
 Check the requirements files inside this folder.
 
-The easiest way to install these (and some useful pytest add-ons) is running
-```
-pip install -U -r requirements-test.txt
-```
-
 Running the Tests
 -----------------
 
-To run the tests, navigate to the root directory of the PyInstaller project and
-run the following command:
+Option 1 - IDE (PyCharm)
+--------------
+
+You can run tests individually via the GUI and PyCharm.
+You must set up PyCharm to use PyTest, and then you can select and right click a specific test to run it.
+Make sure you have PyCharm setup to use Pytest:
+
+To configure Pytest, In PyCharm,
+navigate to
+
+    → File → Settings →Tools → Python Integrated Tools
+
+And under "testing", select "pytest" as the default test runner.
+
+Option 2
+--------
+
+Navigate to the root directory of the project and run the following command:
 
     py.test
 
-Or, to speed up test runs by sending tests to multiple CPUs:
+Or, to speed up test and run them in parallel:
 
     py.test -n NUM
 
-Or, targetting sub-modules:
+Or, targeting sub-modules:
 
     py.test test/intelliflow/core/application
     py.test test/intelliflow/core/platform

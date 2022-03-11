@@ -1,10 +1,21 @@
+# DEBUG/DEVELOPMENT configuration: use this to update your venv to experiment with modules that won't or should not be
+# deployed to compute environments on cloud (e.g AWS Lambda, Glue, EMR). Main category of modules that fall
+#
 # Auxiliary dependencies that are intended to be used for local debugging and testing.
+#
+# This list is the bare minimum for a testing/debugging environment. You can add more such as PySpark, etc based on your
+# local development requirements. You are advised to restore your venv with 'requirements.txt' before any activations
+# against cloud. This is the case till a much smarter deployment (activation) time venv / dependency management is
+# supported in the framework.
 
-boto3~=1.21.7
+boto3~=1.20.9
+botocore~=1.23.9
 setuptools~=57.4.0
 python-dateutil~=2.8.2
 dill~=0.3.4
 packaging~=21.3
+requests~=2.25.1
+responses~=0.10.6
 pytest~=7.0.1
 mock~=4.0.3
-moto~=3.0.4
+moto~=1.3.16

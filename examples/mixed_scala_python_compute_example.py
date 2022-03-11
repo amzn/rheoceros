@@ -6,7 +6,7 @@ from intelliflow.api_ext import *
 
 flow.init_basic_logging()
 
-app = AWSApplication("scala-python", "us-east-1", "842027028048")
+app = AWSApplication("scala-python", "us-east-1")
 
 d_ad_orders_na = app.glue_table("dex_ml_catalog", "d_ad_orders_na")
 

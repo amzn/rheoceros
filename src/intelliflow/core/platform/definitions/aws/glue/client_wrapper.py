@@ -9,6 +9,8 @@ from typing import Any, Dict, List, Set, Tuple
 
 import boto3
 from botocore.exceptions import ClientError
+from packaging import version
+from packaging.version import Version
 
 from intelliflow.core.platform.definitions.compute import ComputeFailedSessionStateType, ComputeSessionStateType
 from intelliflow.core.signal_processing.definitions.compute_defs import Lang
@@ -94,6 +96,18 @@ class GlueVersion(str, Enum):
     VERSION_1_0 = "1.0"
     VERSION_2_0 = "2.0"
     VERSION_3_0 = "3.0"
+
+
+def glue_spark_version_map() -> Dict[GlueVersion, Version]:
+    """
+    Source: https://docs.aws.amazon.com/glue/latest/dg/release-notes.html
+    """
+    return {
+        GlueVersion.VERSION_0_9: version.parse("2.2.1"),
+        GlueVersion.VERSION_1_0: version.parse("2.4.3"),
+        GlueVersion.VERSION_2_0: version.parse("2.4.3"),
+        GlueVersion.VERSION_3_0: version.parse("3.1.1"),
+    }
 
 
 @unique

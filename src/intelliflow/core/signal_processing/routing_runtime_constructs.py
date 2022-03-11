@@ -89,23 +89,22 @@ class _SignalRangeAnalyzer(_SignalAnalyzer):
                 elif signal.resource_access_spec.source in [SignalSourceType.GLUE_TABLE] or (
                     signal.resource_access_spec.proxy and signal.resource_access_spec.proxy.source in [SignalSourceType.GLUE_TABLE]
                 ):
-                    database = None
-                    table = None
                     full_path = path
                     if required_resource_name:
                         full_path = full_path + signal.resource_access_spec.path_delimiter() + required_resource_name
                     elif signal.resource_access_spec.path_format_requires_resource_name():
                         full_path = full_path + signal.resource_access_spec.path_delimiter() + "_resource"
+                    # do path extraction using the actual spec (not the proxy)
                     dimension_values = signal.resource_access_spec.extract_source(full_path).dimension_values
 
+                    resource_access_spec = signal.resource_access_spec
                     if signal.resource_access_spec.proxy and signal.resource_access_spec.proxy.source in [
                         SignalSourceType.GLUE_TABLE,
                     ]:
-                        database = signal.resource_access_spec.proxy.database
-                        table = signal.resource_access_spec.proxy.table_name
-                    else:
-                        database = signal.resource_access_spec.database
-                        table = signal.resource_access_spec.table_name
+                        resource_access_spec = signal.resource_access_spec.proxy
+
+                    database = resource_access_spec.database
+                    table = resource_access_spec.table_name
 
                     session = platform.routing_table.session
                     region = platform.routing_table.region

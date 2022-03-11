@@ -1020,7 +1020,7 @@ class AWSApplication(ApplicationExt):
                                 for other_indep_input in independent_signals:
                                     other_dim = other_indep_input.domain_spec.dimension_spec.find_dimension_by_name(dim_name)
                                     if other_dim:
-                                        link = (dim_name, None, SignalDimensionTuple(other_indep_input, other_dim))
+                                        link = (dim_name, None, SignalDimensionTuple(other_indep_input.clone(None), other_dim))
                                         break
                                 if link is None:
                                     raise ValueError(

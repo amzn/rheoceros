@@ -4,7 +4,8 @@
 import json
 import logging
 import uuid
-from typing import Any, ClassVar, Dict, List, Optional, Set, Tuple, Type, cast
+from enum import Enum, unique
+from typing import Any, ClassVar, Dict, List, Optional, Set, Tuple, Type, Union, cast
 
 import boto3
 from botocore.exceptions import ClientError
@@ -40,8 +41,10 @@ from ...constructs import (
 from ...definitions.aws.common import AWS_COMMON_RETRYABLE_ERRORS, MAX_SLEEP_INTERVAL_PARAM
 from ...definitions.aws.common import CommonParams as AWSCommonParams
 from ...definitions.aws.common import exponential_retry
+from ...definitions.aws.emr.client_wrapper import EmrJobLanguage, EmrReleaseLabel, build_job_arn, validate_job_name
+from ...definitions.aws.emr.script.batch.emr_default_ABI import EmrDefaultABIPython
+from ...definitions.aws.emr.script.batch.emr_scala_all_ABI import EmrAllABIScala
 from ...definitions.aws.glue import catalog as glue_catalog
-from ...definitions.aws.glue.catalog import check_table, query_table_spec
 from ...definitions.aws.glue.client_wrapper import GlueVersion
 from ...definitions.aws.glue.script.batch.common import (
     AWS_REGION,
@@ -77,6 +80,23 @@ from ..aws_common import AWSConstructMixin
 module_logger = logging.getLogger(__file__)
 
 
+@unique
+class RuntimeConfig(Enum):
+    GlueVersion_0_9 = "GlueVersion0.9"
+    GlueVersion_1_0 = "GlueVersion1.0"
+    GlueVersion_2_0 = "GlueVersion2.0"
+    GlueVersion_3_0 = "GlueVersion3.0"
+
+    @classmethod
+    def from_glue_version(cls, glue_version: GlueVersion):
+        return {
+            GlueVersion.VERSION_0_9: RuntimeConfig.GlueVersion_0_9,
+            GlueVersion.VERSION_1_0: RuntimeConfig.GlueVersion_1_0,
+            GlueVersion.VERSION_2_0: RuntimeConfig.GlueVersion_2_0,
+            GlueVersion.VERSION_3_0: RuntimeConfig.GlueVersion_3_0,
+        }[glue_version]
+
+
 class AWSEMRBatchCompute(AWSConstructMixin, BatchCompute):
     """AWS EMR based BatchCompute impl"""
 
@@ -103,6 +123,51 @@ class AWSEMRBatchCompute(AWSConstructMixin, BatchCompute):
                 },
             }
         )
+
+    @classmethod
+    def runtime_config_mapping(cls) -> Dict[EmrJobLanguage, Dict[ABI, Dict[RuntimeConfig, Dict]]]:
+        return {
+            EmrJobLanguage.PYTHON: {
+                ABI.GLUE_EMBEDDED: {
+                    RuntimeConfig.GlueVersion_0_9: {
+                        "runtime_version": EmrReleaseLabel.resolve_from_glue_version(GlueVersion.VERSION_0_9),
+                        "boilerplate": EmrDefaultABIPython,
+                    },
+                    RuntimeConfig.GlueVersion_1_0: {
+                        "runtime_version": EmrReleaseLabel.resolve_from_glue_version(GlueVersion.VERSION_1_0),
+                        "boilerplate": EmrDefaultABIPython,
+                    },
+                    RuntimeConfig.GlueVersion_2_0: {
+                        "runtime_version": EmrReleaseLabel.resolve_from_glue_version(GlueVersion.VERSION_2_0),
+                        "boilerplate": EmrDefaultABIPython,
+                    },
+                    RuntimeConfig.GlueVersion_3_0: {
+                        "runtime_version": EmrReleaseLabel.resolve_from_glue_version(GlueVersion.VERSION_3_0),
+                        "boilerplate": EmrDefaultABIPython,
+                    },
+                }
+            },
+            EmrJobLanguage.SCALA: {
+                ABI.GLUE_EMBEDDED: {
+                    RuntimeConfig.GlueVersion_0_9: {
+                        "runtime_version": EmrReleaseLabel.resolve_from_glue_version(GlueVersion.VERSION_0_9),
+                        "boilerplate": EmrAllABIScala,
+                    },
+                    RuntimeConfig.GlueVersion_1_0: {
+                        "runtime_version": EmrReleaseLabel.resolve_from_glue_version(GlueVersion.VERSION_1_0),
+                        "boilerplate": EmrAllABIScala,
+                    },
+                    RuntimeConfig.GlueVersion_2_0: {
+                        "runtime_version": EmrReleaseLabel.resolve_from_glue_version(GlueVersion.VERSION_2_0),
+                        "boilerplate": EmrAllABIScala,
+                    },
+                    RuntimeConfig.GlueVersion_3_0: {
+                        "runtime_version": EmrReleaseLabel.resolve_from_glue_version(GlueVersion.VERSION_3_0),
+                        "boilerplate": EmrAllABIScala,
+                    },
+                }
+            },
+        }
 
     def __init__(self, params: ConstructParamsDict) -> None:
         super().__init__(params)
@@ -148,6 +213,48 @@ class AWSEMRBatchCompute(AWSConstructMixin, BatchCompute):
     def dev_init(self, platform: "DevelopmentPlatform") -> None:
         super().dev_init(platform)
 
+        # construct lang -> runtime_version -> {name, arn, boilerplate, suffix, ext}
+        # how to de-dup?? each run will create a new folder with uuid
+        # arn format https://docs.aws.amazon.com/service-authorization/latest/reference/list_amazonelasticmapreduce.html#amazonelasticmapreduce-resources-for-iam-policies
+        self._intelliflow_python_workingset_key = build_object_key(["batch"], "bundle.zip")
+        self._bucket_name = self.build_bucket_name()
+        # eagerly validate all possible job names
+        self.validate_job_names()
+
+    def validate_job_names(self):
+        for lang, lang_spec in self.runtime_config_mapping().items():
+            for abi, abi_spec in lang_spec.items():
+                for runtime_config, runtime_config_spec in abi_spec.items():
+                    boilerplate_type = runtime_config_spec["boilerplate"]
+                    if not boilerplate_type:
+                        raise ValueError(f"No boilerplate defined for lang: {lang}, abi: {abi}, runtime_config: {runtime_config}")
+                    job_name = self.build_job_name(lang, abi, runtime_config)
+                    if len(job_name) > 255:
+                        raise ValueError(
+                            f"Cannot dev_init {self.__class__.__name__} due to very long"
+                            f" AWS EMR Job Name {job_name} (limit < 255),"
+                            f" as a result of very long context_id '{self._dev_platform.context_id}'."
+                        )
+                    if not validate_job_name(job_name):
+                        raise ValueError(
+                            f"Cannot dev_init {self.__class__.__name__} due to invalid job name {job_name} doesn't meet EMR job name "
+                            f"pattern"
+                        )
+
+    def build_bucket_name(self) -> str:
+        bucket_name: str = f"if-awsemr-{self._dev_platform.context_id.lower()}-{self._account_id}-{self._region}"
+        bucket_len_diff = len(bucket_name) - MAX_BUCKET_LEN
+        if bucket_len_diff > 0:
+            msg = (
+                f"Platform context_id '{self._dev_platform.context_id}' is too long (by {bucket_len_diff}!"
+                f" {self.__class__.__name__} needs to use it create {bucket_name} bucket in S3."
+                f" Please refer https://docs.aws.amazon.com/AmazonS3/latest/dev/BucketRestrictions.html"
+                f" to align your naming accordingly in order to be able to use this driver."
+            )
+            module_logger.error(msg)
+            raise ValueError(msg)
+        return bucket_name
+
     def runtime_init(self, platform: "RuntimePlatform", context_owner: "BaseConstruct") -> None:
         AWSConstructMixin.runtime_init(self, platform, context_owner)
         self._emr = boto3.client("emr", region_name=self._region)
@@ -183,21 +290,106 @@ class AWSEMRBatchCompute(AWSConstructMixin, BatchCompute):
         return ["elasticmapreduce.amazonaws.com", "ec2.amazonaws.com"]
 
     def provide_runtime_default_policies(self) -> List[str]:
-        return []
+        return [
+            # TODO: fill policies
+            # "service-role/AmazonEMRServicePolicy_v2",
+            # "service-role/AmazonElasticMapReduceRole",
+            # "service-role/AmazonElasticMapReduceforEC2Role",
+        ]
 
     def provide_runtime_permissions(self) -> List[ConstructPermission]:
-        # managed policy provided via provide_runtime_default_policies will not cover the requirements of exec role
-        # used on EC2 instances.
-        # Use the following guide to decorate exec-role:
-        # TODO
-        #  https://docs.aws.amazon.com/emr/latest/ManagementGuide/emr-iam-role-for-ec2.html
-        # - should be similar to Glue drivers runtime permissions.
-        # - what AWS suggests here is very well aligned with how IF drivers are expected to provide these permissions
-        return []
+        # allow exec-role (post-activation, cumulative list of all trusted entities [AWS services]) to do the following;
+        permissions = [
+            ConstructPermission([f"arn:aws:s3:::{self._bucket_name}", f"arn:aws:s3:::{self._bucket_name}/*"], ["s3:*"]),
+            # TODO be more picky.
+            # allow other service assuming our role to call the jobs here
+            ConstructPermission([build_job_arn(self._region, self._account_id, "*")], ["ec2:*", "elasticmapreduce:*"]),
+            # CW Logs (might look redundant, but please forget about other drivers while declaring these),
+            # deduping is handled automatically.
+            ConstructPermission([f"arn:aws:logs:{self._region}:{self._account_id}:*"], ["logs:*"]),
+            # must add a policy to allow your users the iam:PassRole permission for IAM roles to match your naming convention
+            ConstructPermission([self._params[AWSCommonParams.IF_EXE_ROLE]], ["iam:PassRole"]),
+        ]
+
+        external_library_resource_arns = set()
+        for route in self._pending_internal_routes:
+            for slot in route.slots:
+                if slot.code_metadata.external_library_paths:
+                    for s3_path in slot.code_metadata.external_library_paths:
+                        try:
+                            s3_spec = S3SignalSourceAccessSpec.from_url(account_id=None, url=s3_path)
+                        except Exception:
+                            module_logger.error(
+                                f"External library path {s3_path} attached to route {route.route_id!r} "
+                                f" via slot: {(slot.type, slot.code_lang)!r} is not supported by "
+                                f" BatchCompute driver {self.__class__.__name__!r}. "
+                            )
+                            raise
+                        # exact resource (JARs, zips)
+                        external_library_resource_arns.add(f"arn:aws:s3:::{s3_spec.bucket}/{s3_path[len(f's3://{s3_spec.bucket}/'):]}")
+
+                # TODO Move into <BatchCompute>
+                # TODO evalute moving is_batch_compute check even before the external library paths extraction.
+                if slot.type.is_batch_compute() and slot.permissions:
+                    for compute_perm in slot.permissions:
+                        # TODO check compute_perm feasibility in AWS EMR (check ARN, resource type, etc)
+                        if compute_perm.context != PermissionContext.DEVTIME:
+                            permissions.append(ConstructPermission(compute_perm.resource, compute_perm.action))
+
+        if external_library_resource_arns:
+            permissions.append(
+                ConstructPermission(list(external_library_resource_arns), ["s3:GetObject", "s3:GetObjectVersion", "s3:ListBucket"])
+            )
+
+        # might look familiar (from Processor impl maybe), but please forget about other drivers while declaring these),
+        # deduping is handled automatically.
+        ext_s3_signals = [
+            ext_signal for ext_signal in self._pending_external_signals if ext_signal.resource_access_spec.source == SignalSourceType.S3
+        ]
+        if ext_s3_signals:
+            # External S3 access
+            permissions.append(
+                ConstructPermission(
+                    [
+                        f"arn:aws:s3:::{ext_signal.resource_access_spec.bucket}{'/' + ext_signal.resource_access_spec.folder if ext_signal.resource_access_spec.folder else ''}/*"
+                        for ext_signal in ext_s3_signals
+                    ]
+                    + [
+                        f"arn:aws:s3:::{ext_signal.resource_access_spec.bucket}/{ext_signal.resource_access_spec.folder if ext_signal.resource_access_spec.folder else ''}"
+                        for ext_signal in ext_s3_signals
+                    ],
+                    ["s3:GetObject", "s3:GetObjectVersion", "s3:ListBucket"],
+                )
+            )
+
+            encryption_key_list: List[str] = [
+                ext_signal.resource_access_spec.encryption_key
+                for ext_signal in ext_s3_signals
+                if ext_signal.resource_access_spec.encryption_key
+            ]
+
+            if encryption_key_list:
+                permissions.append(
+                    ConstructPermission(
+                        encryption_key_list,
+                        ["kms:Decrypt", "kms:DescribeKey", "kms:DescribeCustomKeyStores", "kms:ListKeys", "kms:ListAliases"],
+                    )
+                )
+
+        return permissions
 
     @classmethod
     def provide_devtime_permissions(cls, params: ConstructParamsDict) -> List[ConstructPermission]:
-        return []
+        return [
+            # TODO narrow down to exact operations and resources
+            ConstructPermission(["*"], ["elasticmapreduce:*"]),
+            ConstructPermission(["*"], ["ec2:*"]),
+            # instance-profile for ec2 instance in cluster
+            ConstructPermission(
+                [f"arn:aws:iam::{params[AWSCommonParams.ACCOUNT_ID]}:instance-profile/*"],
+                ["iam:CreateInstanceProfile", "iam:AddRoleToInstanceProfile"],
+            ),
+        ]
 
     def _provide_system_metrics(self) -> List[Signal]:
         return []
@@ -219,6 +411,7 @@ class AWSEMRBatchCompute(AWSConstructMixin, BatchCompute):
 
     def terminate(self) -> None:
         super().terminate()
+        # TODO eliminate emr instance profile
 
     def check_update(self, prev_construct: "BaseConstruct") -> None:
         super().check_update(prev_construct)
@@ -254,5 +447,11 @@ class AWSEMRBatchCompute(AWSConstructMixin, BatchCompute):
     ) -> None:
         pass
 
-    def _revert_security_conf(selfs, security_conf: ConstructSecurityConf, prev_security_conf: ConstructSecurityConf) -> None:
+    def _revert_security_conf(self, security_conf: ConstructSecurityConf, prev_security_conf: ConstructSecurityConf) -> None:
         pass
+
+    def build_job_name(self, lang: EmrJobLanguage, abi: ABI, runtime_config: RuntimeConfig):
+        return (
+            f"IntelliFlow-{self._dev_platform.context_id}-{self._region}-{self.__class__.__name__}-{lang.extension}-{abi.name.lower()}-"
+            f"{runtime_config.name}"
+        )

@@ -46,7 +46,7 @@ setup(
     name="rheoceros",
     python_requires=">=3.7",
     version=version,
-    description="rheoceros is a cloud-based data science application/workflow development framework.",
+    description="rheoceros is a cloud-based data science / AI / ML workflow development framework.",
     keywords="aws cloud data model ai workflow ai-team ml mesh collaboration event flow automation functional low-code"
              "machine learning feature engineering emr glue athena sagemaker serverless",
     author="Amazon.com Inc.",

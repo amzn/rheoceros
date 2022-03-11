@@ -480,6 +480,8 @@ class DatasetSignalSourceAccessSpec(SignalSourceAccessSpec):
 
     @property
     def partition_keys(self) -> List[str]:
+        if self._proxy and isinstance(self._proxy, GlueTableSignalSourceAccessSpec):
+            return self._proxy.partition_keys
         return self._partition_keys
 
     @property
