@@ -34,6 +34,8 @@ class GenericRoutingHookImpl(HookBase):
         super().__init__()
 
     def __call__(self, routing_table: "RoutingTable", *args, **kwargs) -> None:
+        assert kwargs.get("dimensions", None) is not None, "Output 'dimensions' map not in hook params"
+        assert kwargs.get("dimensions_map", None) is not None, "Output 'dimensions_map' map not in hook params"
         super()._save(routing_table)
 
 

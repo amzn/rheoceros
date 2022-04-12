@@ -75,6 +75,12 @@ class TestAWSApplicationOutputParametrization(AWSTestBase):
             dataset_format=DatasetSignalSourceFormat.PARQUET,
         )
 
+        # SERIALIZATION: inject serialize/deserialize sequence for enhanced serialization coverage
+        json_str = app.dev_context.to_json()
+        dev_context = CoreData.from_json(json_str)
+        app._dev_context = dev_context
+        #
+
         app.activate()
 
         # 1- test IF automatically materializes the timer input as "2021-06-27" using the output link

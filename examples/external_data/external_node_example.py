@@ -111,7 +111,9 @@ ducsi_with_AD_orders_NA = app.create_data(id="DUCSI_WITH_AD_ORDERS_NA",
                                    ducsi_data["1"]["*"]
                                ],
                                input_dim_links=[
-                                   (ducsi_data('ship_day'), lambda dim: dim, d_ad_orders_na('order_day'))
+                                   (ducsi_data('ship_day'),
+                                    lambda dim: dim
+                                    , d_ad_orders_na('order_day'))
                                ],
                                compute_targets=[
                                    BatchCompute("""
@@ -128,6 +130,11 @@ output=d_unified_cust_shipment_items.limit(100).join(d_ad_orders_na.limit(100), 
 
 # experiment early (warning: will activate the application with the nodes added so far).
 #materialized_output_path = app.execute(repeat_ducsi, ducsi_data[1]['2020-12-01'])
+
+json_str = app.dev_context.to_json()
+dev_context = CoreData.from_json(json_str)
+
+app._dev_context = dev_context
 
 app.activate(allow_concurrent_executions=False)
 

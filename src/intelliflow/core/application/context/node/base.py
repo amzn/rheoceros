@@ -264,8 +264,7 @@ class DataNode(Node, ABC):
     @property
     def route_id(self) -> str:
         # It is by design that we allow the same route_id generation for the same data_id.
-        # It is the same scoping semantics that Python uses, which allows the most recent node to
-        # overwrite / update the route (during activation).
+        # This allows the most recent node to overwrite / update the route (during activation).
         return "{0}-{1}".format(self.__class__.__name__, self._data_id)
 
 

@@ -1346,14 +1346,29 @@ Layout of the dashboard:
 
         dashboard.update({"widgets": widgets})
 
-        response = exponential_retry(
-            self._cw.put_dashboard, {"InternalServiceFault"}, DashboardName=dashboard_name, DashboardBody=json.dumps(dashboard)
-        )
-        validation_messages = response["DashboardValidationMessages"]
-        if validation_messages:
-            module_logger.warning(f"Dashboard has been generated with validation errors: {validation_messages!r}")
-        else:
-            module_logger.critical(f"Default diagnostics dashboard {dashboard_name!r} has been created successfully!")
+        if len(widgets) > 100:
+            # refer https://docs.aws.amazon.com/AmazonCloudWatch/latest/APIReference/CloudWatch-Dashboard-Body-Structure.html
+            # for max limit
+            module_logger.critical(
+                f"Application topology contains too many nodes for default diagnostics CW dashboard. "
+                f"Creation of {dashboard_name!r} might fail. Widget count: {len(widgets)}"
+            )
+
+        try:
+            response = exponential_retry(
+                self._cw.put_dashboard, {"InternalServiceFault"}, DashboardName=dashboard_name, DashboardBody=json.dumps(dashboard)
+            )
+            validation_messages = response["DashboardValidationMessages"]
+            if validation_messages:
+                module_logger.warning(f"Dashboard has been generated with validation errors: {validation_messages!r}")
+            else:
+                module_logger.critical(f"Default diagnostics CW dashboard {dashboard_name!r} has been created successfully!")
+        except Exception as error:
+            logging.critical(
+                f"Default diagnostics CW dashboard {dashboard_name!r} could not be created due to error: {error!r}!"
+                f" Widget count: {len(widgets)}"
+            )
+            logging.critical(f"By-passing the error as it has no direct impact on the runtime of this application.")
 
     def rollback(self) -> None:
         # roll back activation, something bad has happened (probably in another Construct) during app launch

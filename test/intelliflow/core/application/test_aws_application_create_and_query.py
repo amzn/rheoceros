@@ -139,6 +139,12 @@ class TestAWSApplicationBuild(AWSTestBase):
             **{"foo": "i am also default_dataset"}
         )
 
+        # SERIALIZATION: inject serialize/deserialize sequence for enhanced serialization coverage
+        json_str = app.dev_context.to_json()
+        dev_context = CoreData.from_json(json_str)
+        app._dev_context = dev_context
+        #
+
         return app
 
     def test_application_basic_query(self):
@@ -242,7 +248,7 @@ class TestAWSApplicationBuild(AWSTestBase):
         assert eureka_training_all_data.partition_values()
         assert eureka_training_all_data.partitions()
         internal_data_1 = app["eureka_default_selection_data_over_two_days"]
-        assert internal_data_1.metadata() == json.dumps(internal_data_1.attributes(), indent=6)
+        assert internal_data_1.metadata() == json.dumps(internal_data_1.attributes(), indent=6, default=repr)
         # assert internal_data_1.foo == 'i am DEFAULT_DATAset'
         assert internal_data_1.paths()
         assert internal_data_1.path_format()

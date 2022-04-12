@@ -5,10 +5,8 @@ from intelliflow.core.serialization import Serializable
 
 
 class CoreData(Serializable):
-    """Provide basic dunder implementations for serializable core 'data' entities
-
-    Use this for backwards compatibility on Plain Old Data Object cases where NamedTuple is causing
-    runtime issues particularly on environments with Livy, PySpark running Python 3.6
+    """Provide basic dunder implementations for core entities and mechanism to marshal them across different layers of
+    application development (e.g from/to JSON)
     """
 
     def __eq__(self, other) -> bool:

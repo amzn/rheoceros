@@ -962,6 +962,12 @@ output=DEXML_DUCSI.limit(100).join(d_ad_orders_na.limit(100), ['customer_id']).l
         # experiment early (warning: will activate the application with the nodes added so far).
         # materialized_output_path = app.execute(repeat_ducsi, ducsi_data[1]['2020-12-01'])
 
+        # SERIALIZATION: inject serialize/deserialize sequence for enhanced serialization coverage
+        json_str = app.dev_context.to_json()
+        dev_context = CoreData.from_json(json_str)
+        app._dev_context = dev_context
+        #
+
         app.activate(allow_concurrent_executions=False)
 
         self.patch_aws_stop()
@@ -1232,6 +1238,12 @@ output=DEXML_DUCSI.limit(100).join(d_ad_orders_na.limit(100), ['customer_id']).l
             ],
         )
 
+        # SERIALIZATION: inject serialize/deserialize sequence for enhanced serialization coverage
+        json_str = app.dev_context.to_json()
+        dev_context = CoreData.from_json(json_str)
+        app._dev_context = dev_context
+        #
+
         app.activate()
 
         self.patch_aws_stop()
@@ -1380,6 +1392,12 @@ output=DEXML_DUCSI.limit(100).join(d_ad_orders_na.limit(100), ['customer_id']).l
             ],
         )
 
+        # SERIALIZATION: inject serialize/deserialize sequence for enhanced serialization coverage
+        json_str = app.dev_context.to_json()
+        dev_context = CoreData.from_json(json_str)
+        app._dev_context = dev_context
+        #
+
         app.activate()
 
         self.patch_aws_stop()
@@ -1500,6 +1518,12 @@ output=DEXML_DUCSI.limit(100).join(d_ad_orders_na.limit(100), ['customer_id']).l
             ],
             compute_targets=[NOOPCompute],
         )
+
+        # SERIALIZATION: inject serialize/deserialize sequence for enhanced serialization coverage
+        json_str = app.dev_context.to_json()
+        dev_context = CoreData.from_json(json_str)
+        app._dev_context = dev_context
+        #
 
         app.execute(adpd_shadow_json_processed_SCHEDULED["2021-09-21"], wait=True)
 

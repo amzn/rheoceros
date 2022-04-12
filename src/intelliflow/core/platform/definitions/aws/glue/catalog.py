@@ -17,8 +17,11 @@ from intelliflow.core.signal_processing.definitions.dimension_defs import Type
 from intelliflow.core.signal_processing.dimension_constructs import AnyVariant, Dimension, DimensionFilter
 from intelliflow.core.signal_processing.signal import SignalDomainSpec, SignalType
 from intelliflow.core.signal_processing.signal_source import (
+    DATA_FORMAT_KEY,
     ENCRYPTION_KEY_KEY,
     PARTITION_KEYS_KEY,
+    DatasetSignalSourceFormat,
+    GlueTableSignalSourceAccessSpec,
     DatasetType,
     GlueTableSignalSourceAccessSpec,
     S3SignalSourceAccessSpec,
@@ -71,6 +74,28 @@ def _create_dimension_spec(partition_keys: List[Dict[str, Any]]) -> DimensionSpe
     return dim_spec
 
 
+def get_data_format(output_format: str, serde: str) -> Optional[DatasetSignalSourceFormat]:
+    if output_format == "org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat":
+        # refer
+        # https://hive.apache.org/javadocs/r2.2.0/api/org/apache/hadoop/hive/ql/io/HiveIgnoreKeyTextOutputFormat.html
+        if serde in ["org.apache.hadoop.hive.serde2.OpenCSVSerde", "org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe"]:
+            return DatasetSignalSourceFormat.CSV
+        elif serde in ["org.apache.hive.hcatalog.data.JsonSerDe", "org.openx.data.jsonserde.JsonSerDe"]:
+            return DatasetSignalSourceFormat.JSON
+    elif output_format == "org.apache.hadoop.hive.ql.io.avro.AvroContainerOutputFormat":
+        # refer
+        # https://hive.apache.org/javadocs/r1.2.2/api/org/apache/hadoop/hive/ql/io/avro/AvroContainerOutputFormat.html
+        return DatasetSignalSourceFormat.AVRO
+    elif output_format == "org.apache.hadoop.hive.ql.io.orc.OrcOutputFormat":
+        # refer
+        # https://hive.apache.org/javadocs/r1.2.2/api/org/apache/hadoop/hive/ql/io/orc/OrcOutputFormat.html
+        return DatasetSignalSourceFormat.ORC
+    elif output_format == "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat":
+        # refer
+        # https://hive.apache.org/javadocs/r1.2.2/api/org/apache/hadoop/hive/ql/io/parquet/MapredParquetOutputFormat.html
+        return DatasetSignalSourceFormat.PARQUET
+
+
 def create_signal(glue_client, database_name: str, table_name: str) -> Optional[GlueTableDesc]:
     try:
         table = exponential_retry(
@@ -88,6 +113,7 @@ def create_signal(glue_client, database_name: str, table_name: str) -> Optional[
     location: str = storage_desc["Location"]
     output_format: str = storage_desc["OutputFormat"]
     serde_name: str = storage_desc["SerdeInfo"].get("Name", "")
+    serde: str = storage_desc["SerdeInfo"].get("SerializationLibrary", "")
 
     partition_keys = table["Table"]["PartitionKeys"]
     partition_key_names = None
@@ -112,19 +138,34 @@ def create_signal(glue_client, database_name: str, table_name: str) -> Optional[
         has_encrypted_data = table["Table"]["Parameters"].get("has_encrypted_data", "false")
         encryption_key_placeholder = "NEEDS_ENCRYPTION_KEY" if has_encrypted_data == "true" else None
 
+        params = {
+            # @USER_PARAM depends on this key (if not None)
+            ENCRYPTION_KEY_KEY: encryption_key_placeholder,
+            PARTITION_KEYS_KEY: partition_key_names,
+        }
+        data_format = get_data_format(output_format, serde)
+        if data_format:
+            params.update({DATA_FORMAT_KEY: data_format})
+        else:
+            logger.warning(
+                f"Data format could not be inferred for table: {table_name!r} (in DB: {database_name!r})! "
+                f"If the following metadata maps to one of the formats from {DatasetSignalSourceFormat!r}, "
+                f"then please specify it. OutputFormat: {output_format!r}, Serde {serde!r}"
+            )
+
         access_spec = S3SignalSourceAccessSpec(
             None,
             s3_spec.bucket,
             s3_spec.folder,
             *partition_key_names,
             # @USER_PARAM depends on this key (if not None)
-            **{ENCRYPTION_KEY_KEY: encryption_key_placeholder, PARTITION_KEYS_KEY: partition_key_names},
+            **params,
         )
 
     partitions = exponential_retry(
         glue_client.get_partitions, CATALOG_COMMON_RETRYABLE_ERRORS, DatabaseName=database_name, TableName=table_name, MaxResults=1
     )
-    if not partitions:
+    if not partitions or "Partitions" not in partitions or not partitions["Partitions"]:
         logger.critical(f"There no partitions in Glue catalog for table: {table_name} in DB: {database_name}!")
     else:
         partition = partitions["Partitions"][0]
@@ -184,6 +225,25 @@ def is_partition_present(glue_client, database_name: str, table_name: str, value
         raise
 
     return partition and partition["Partition"]
+
+
+def get_location(glue_client, database_name: str, table_name: str, values: List[str]) -> Optional[str]:
+    """Return the 'Location' (e.g S3 full path) for partition from the catalog"""
+    try:
+        partition = exponential_retry(
+            glue_client.get_partition,
+            CATALOG_COMMON_RETRYABLE_ERRORS,
+            DatabaseName=database_name,
+            TableName=table_name,
+            PartitionValues=values,
+        )
+    except ClientError as ex:
+        if ex.response["Error"]["Code"] == "EntityNotFoundException":
+            return None
+        raise
+
+    if partition and ("Partition" in partition) and partition["Partition"]:
+        return partition["Partition"]["StorageDescriptor"]["Location"]
 
 
 def check_table(session: boto3.Session, region: str, database: str, table_name: str) -> bool:

@@ -122,6 +122,10 @@ class InternalDataNode(DataNode):
             data_id, output_source_access_spec, output_domain_spec, None, None, None  # parent_node  # child_nodes
         )  # node_id (will automatically set)
 
+        # add originator / unique route_id and compute types info to metadata
+        output_source_access_spec.route_id = self.route_id
+        output_source_access_spec.slot_types = [slot.type for slot in self._slots()]
+
     @classmethod
     def _check_hook_type(cls, route_hook: Optional[Union[ComputeTargetDescriptor, Callable, Slot]]) -> Optional[Slot]:
         if route_hook:

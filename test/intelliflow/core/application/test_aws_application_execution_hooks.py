@@ -13,6 +13,7 @@ from intelliflow.api_ext import *
 from intelliflow.core.application.application import Application
 from intelliflow.core.platform import development as development_module
 from intelliflow.core.platform.compute_targets.email import EMAIL
+from intelliflow.core.platform.compute_targets.slack import Slack
 from intelliflow.core.platform.constructs import ConstructPermission
 from intelliflow.core.platform.definitions.compute import (
     ComputeFailedSessionState,
@@ -121,6 +122,12 @@ class TestAWSApplicationExecutionHooks(AWSTestBase):
             ),
             pending_node_expiration_ttl_in_secs=20,
         )
+
+        # SERIALIZATION: inject serialize/deserialize sequence for enhanced serialization coverage
+        json_str = app.dev_context.to_json()
+        dev_context = CoreData.from_json(json_str)
+        app._dev_context = dev_context
+        #
 
         app.activate()
 
@@ -307,6 +314,10 @@ class TestAWSApplicationExecutionHooks(AWSTestBase):
         email_obj = EMAIL(sender="if-test-list@amazon.com", recipient_list=["yunusko@amazon.com"])
 
         self._test_all_application_hooks(lambda: GenericComputeDescriptorHookVerifier(email_obj.action()))
+
+    def test_all_application_hooks_with_slack(self):
+        slack_obj = Slack(recipient_list=["https://hooks.slack.com/workflows/1/"], message="test message")
+        self._test_all_application_hooks(lambda: GenericComputeDescriptorHookVerifier(slack_obj.action()))
 
     def test_application_hooks_generate_right_permissions(self):
         """Test system provided compute targets' compatibility and runtime permission contribution as hooks"""

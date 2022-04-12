@@ -418,7 +418,7 @@ def get_glue_job_run_state_type(job_run) -> ComputeSessionStateType:
         return ComputeSessionStateType.PROCESSING
     elif run_state in ["SUCCEEDED"]:
         return ComputeSessionStateType.COMPLETED
-    elif run_state in ["STOPPING", "STOPPED", "FAILED"]:
+    elif run_state in ["STOPPING", "STOPPED", "FAILED", "TIMEOUT"]:
         return ComputeSessionStateType.FAILED
     else:
         logger.critical(
@@ -434,6 +434,8 @@ def get_glue_job_run_failure_type(job_run) -> ComputeFailedSessionStateType:
     run_state = job_run["JobRunState"]
     if run_state in ["STOPPING", "STOPPED"]:
         return ComputeFailedSessionStateType.STOPPED
+    elif run_state in ["TIMEOUT"]:
+        return ComputeFailedSessionStateType.TIMEOUT
     elif run_state in ["FAILED"]:
         error_message = job_run["ErrorMessage"]
         # TODO AWS Glue should provide better support for concurrent capacity exceeding

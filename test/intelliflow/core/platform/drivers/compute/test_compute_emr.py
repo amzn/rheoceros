@@ -7,6 +7,7 @@ import boto3
 import pytest
 
 from intelliflow.core.platform.definitions.aws.common import CommonParams
+from intelliflow.core.platform.definitions.aws.s3.bucket_wrapper import bucket_exists
 from intelliflow.core.platform.development import AWSConfiguration, HostPlatform
 from intelliflow.core.platform.drivers.compute.aws_emr import AWSEMRBatchCompute
 from intelliflow.mixins.aws.test import AWSTestBase
@@ -85,4 +86,14 @@ class TestAWSGlueBatchComputeBasic(AWSTestBase, DriverTestUtils):
             self.mock_host_platform._context_id = "😀"
             self.mock_compute.dev_init(self.mock_host_platform)
         assert error.typename == "ValueError"
+        self.patch_aws_stop()
+
+    def test_compute_activate_successful(self):
+        self.patch_aws_start()
+        self.setup_platform_and_params()
+        self.mock_host_platform.context_id = "test123"
+        self.mock_compute.dev_init(self.mock_host_platform)
+        self.mock_compute.activate()
+        s3 = boto3.resource("s3")
+        assert bucket_exists(s3, self.mock_compute._bucket_name)
         self.patch_aws_stop()

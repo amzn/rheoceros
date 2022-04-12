@@ -183,7 +183,7 @@ class MarshalerNode(Node, SignalProvider):
         return self.access_spec()["attributes"]
 
     def metadata(self) -> str:
-        return json.dumps(self.attributes(), indent=6)
+        return json.dumps(self.attributes(), indent=6, default=repr)
 
     ''' TODO enable this functionality once there is an workaround for calls onto this from serialization.
     def __getattr__(self, item) -> Any:

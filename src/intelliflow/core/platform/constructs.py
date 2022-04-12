@@ -27,6 +27,8 @@ from intelliflow.core.platform.definitions.compute import (
     ComputeSessionStateType,
     ComputeSuccessfulResponse,
     ComputeSuccessfulResponseType,
+    create_output_dimension_map,
+    create_pending_output_dimension_map,
 )
 from intelliflow.core.serialization import Serializable, loads
 from intelliflow.core.signal_processing import DimensionFilter, Signal, Slot
@@ -40,7 +42,7 @@ from intelliflow.core.signal_processing.definitions.metric_alarm_defs import (
     MetricSubDimensionMapType,
     MetricValueCountPairData,
 )
-from intelliflow.core.signal_processing.routing_runtime_constructs import Route, RouteID, current_timestamp_in_utc
+from intelliflow.core.signal_processing.routing_runtime_constructs import Route, RouteID, RoutingSession, current_timestamp_in_utc
 from intelliflow.core.signal_processing.signal import SignalDomainSpec, SignalLinkNode, SignalProvider, SignalType
 from intelliflow.core.signal_processing.signal_source import (
     METRIC_VISUALIZATION_PERIOD_HINT,
@@ -871,7 +873,12 @@ class BatchCompute(BaseConstruct, ABC):
         """
         from random import uniform
 
-        elapsed_time = current_timestamp_in_utc() - active_compute_record.trigger_timestamp_utc
+        trigger_timestamp_in_utc = (
+            active_compute_record.last_retry_timestamp_utc
+            if active_compute_record.last_retry_timestamp_utc
+            else active_compute_record.trigger_timestamp_utc
+        )
+        elapsed_time = current_timestamp_in_utc() - trigger_timestamp_in_utc
         max_wait_time = self.get_max_wait_time_for_next_retry_in_secs()
         wait_time = max_wait_time - elapsed_time
         if wait_time < (max_wait_time / 30):  # %3 deferral probability for the rest of the lifetime of a retryable compute
@@ -894,6 +901,9 @@ class BatchCompute(BaseConstruct, ABC):
 
     def kill_session(self, active_compute_record: "RoutingTable.ComputeRecord") -> None:
         pass
+
+    def describe_compute_record(self, active_compute_record: "RoutingTable.ComputeRecord") -> Optional[Dict[str, Any]]:
+        return dict()
 
     @abstractmethod
     def query_external_source_spec(
@@ -1353,6 +1363,10 @@ class CompositeBatchCompute(BatchCompute):
         super().activation_completed()
         for driver in self._drivers:
             driver.activation_completed()
+
+    def describe_compute_record(self, active_compute_record: "RoutingTable.ComputeRecord") -> Optional[Dict[str, Any]]:
+        driver: BatchCompute = self._get_driver(active_compute_record.slot, active_compute_record.state.resource_desc.driver_type)
+        return driver.describe_compute_record(active_compute_record)
 
 
 class Diagnostics(BaseConstruct, ABC):
@@ -2077,6 +2091,7 @@ class RoutingTable(BaseConstruct, ABC):
             self._state = state
             self._session_state = session_state
             self._last_checkpoint_mark = None
+            self._last_retry_timestamp_utc = None
             self._deactivated_timestamp_utc = deactivated_timestamp_utc
             self._number_of_attempts_on_failure: int = 0
 
@@ -2130,6 +2145,14 @@ class RoutingTable(BaseConstruct, ABC):
         @last_checkpoint_mark.setter
         def last_checkpoint_mark(self, value) -> None:
             self._last_checkpoint_mark = value
+
+        @property
+        def last_retry_timestamp_utc(self) -> int:
+            return getattr(self, "_last_retry_timestamp_utc", None)
+
+        @last_retry_timestamp_utc.setter
+        def last_retry_timestamp_utc(self, value: int) -> None:
+            self._last_retry_timestamp_utc = value
 
         @property
         def deactivated_timestamp_utc(self) -> int:
@@ -2407,7 +2430,6 @@ class RoutingTable(BaseConstruct, ABC):
             self._route_index.add(route)
 
     def _provide_route_metrics(self, route: Route) -> List[ConstructInternalMetricDesc]:
-        # TODO generic routing table metrics (subclasses should call this)
         return [
             ConstructInternalMetricDesc(id="routing_table.receive", metric_names=["RouteHit", "RouteLoadError", "RouteSaveError"]),
             ConstructInternalMetricDesc(
@@ -2494,6 +2516,7 @@ class RoutingTable(BaseConstruct, ABC):
         resource_path: str,
         target_route_id: Optional[RouteID] = None,
         filter_only=False,
+        routing_session: RoutingSession = RoutingSession(),
     ) -> "RoutingTable.Response":
         """RheocerOS routing core that relies on persistence/synchronization methods from
         RoutingTable impls.
@@ -2526,6 +2549,9 @@ class RoutingTable(BaseConstruct, ABC):
         resource_path: materialized/concrete path that maps to a physical resource
         target_route_id: if specified, RoutingTable makes sure that only the target route receives the incomming
         signal, otherwise the entire table is scanned.
+        routing_session: keeps track of the details of ongoing routing session. it will also be used as a time-keeper
+        internally by the routing module, so max duration for the session should be set accordingly based on the
+        limitations of the compute env.
 
         Returns
         -------
@@ -2561,6 +2587,9 @@ class RoutingTable(BaseConstruct, ABC):
             logger.info("Found matching routes for incoming signal:")
             self.metric("routing_table.receive")["RouteHit"].emit(len(route_and_signal_map.keys()))
             for route, incoming_signal in route_and_signal_map.items():
+                if routing_session.is_expired():
+                    break
+
                 if target_route_id and route.route_id != target_route_id:
                     logger.critical(f"Skipping route={route.route_id} since this session targets {target_route_id!r} only.")
                     continue
@@ -2576,12 +2605,12 @@ class RoutingTable(BaseConstruct, ABC):
                     # record for it.
                     route_record = RoutingTable.RouteRecord(route.clone())
                 else:
-                    self._check_active_compute_records_for(route_record)
+                    self._check_active_compute_records_for(route_record, routing_session)
                     # OPTIMIZATION: it is safe to skip ready_node check since ready-check will implicitly be done
                     #               as part of this signal ingestion within Route::receive down there (for each impacted
                     #               pending node). And actually it is not mandatory as _check_active_compute_records_for
                     # self._check_ready_pending_nodes_for(route, route_record)  # do this before expiration check (next), graceful
-                    self._check_pending_nodes_for(route_record)
+                    self._check_pending_nodes_for(route_record, routing_session)
 
                 # the following operation is stateful (changes the internal state of a route)
                 # so TODO best way to rollback
@@ -2826,16 +2855,18 @@ class RoutingTable(BaseConstruct, ABC):
                     )
                     route_record.remove_execution_context(execution_context.id)
 
-    def check_active_routes(self) -> None:
+    def check_active_routes(self, routing_session: RoutingSession = RoutingSession()) -> None:
         """Periodical check triggered by ProcessingUnit
 
         Call batch-compute to get internal session state for each active compute record
         """
         logger.critical("Checking active routes...")
         for route in self._route_index.get_all_routes():
-            self.check_active_route(route)
+            if routing_session.is_expired():
+                break
+            self.check_active_route(route, routing_session)
 
-    def check_active_route(self, route: Union[RouteID, Route]) -> None:
+    def check_active_route(self, route: Union[RouteID, Route], routing_session: RoutingSession) -> None:
         try:
             if not isinstance(route, Route):
                 route_id = route
@@ -2846,9 +2877,11 @@ class RoutingTable(BaseConstruct, ABC):
             self._lock(route_id)
             route_record = self._load(route_id)
             if route_record:
-                self._check_active_compute_records_for(route_record)
-                self._check_ready_pending_nodes_for(route, route_record)  # do this before expiration check (next), graceful
-                self._check_pending_nodes_for(route_record)
+                self._check_active_compute_records_for(route_record, routing_session)
+                self._check_ready_pending_nodes_for(
+                    route, route_record, routing_session
+                )  # do this before expiration check (next), graceful
+                self._check_pending_nodes_for(route_record, routing_session)
         except Exception as err:
             logger.critical(
                 f"Encountered error: '{str(err)}',  while checking the status of route: {route_id!r}"
@@ -2859,7 +2892,7 @@ class RoutingTable(BaseConstruct, ABC):
                 self._save(route_record, suppress_errors_and_emit=True)
             self._release(route_id)
 
-    def _check_active_compute_records_for(self, route_record: "RoutingTable.RouteRecord") -> None:
+    def _check_active_compute_records_for(self, route_record: "RoutingTable.RouteRecord", routing_session: RoutingSession) -> None:
         """Update the status of active compute records and detect completions and feed the platform
         back with trigger signals.
 
@@ -2867,6 +2900,10 @@ class RoutingTable(BaseConstruct, ABC):
         """
         inactive_records: List[RoutingTable.ComputeRecord] = []
         for active_compute_record in route_record.active_compute_records:
+            if routing_session.is_expired():
+                # get out, we will visit remaining records in another cycle
+                break
+
             if active_compute_record.slot.type == SlotType.ASYNC_BATCH_COMPUTE:
                 retry: bool = False
                 retry_session_desc = None
@@ -2980,9 +3017,7 @@ class RoutingTable(BaseConstruct, ABC):
                             logger.critical("Failure reason is TRANSIENT. Will attempt retry now...")
                             retry = True
                         else:
-                            logger.critical(
-                                "BatchCompute driver decided to defer retry for TRANSIENT error. Will check" "in the next cycle."
-                            )
+                            logger.critical("BatchCompute driver decided to defer retry for TRANSIENT error. Will check in the next cycle.")
                     else:
                         route_record.disable_trigger_on_execution_context(active_compute_record.execution_context_id)
                         # this would happen after the 1st retry (TRANSIENT -> another failure state)
@@ -3030,6 +3065,7 @@ class RoutingTable(BaseConstruct, ABC):
                     # so that in the next cycle previous session_state won't be picked up
                     # for query (get_session_state) which would cause infinite retry loops.
                     active_compute_record.session_state = None
+                    active_compute_record.last_retry_timestamp_utc = self._current_timestamp_in_utc()
             elif active_compute_record.slot.type == SlotType.SYNC_INLINED:
                 # for inlined compute, we just focus on retries here (only case when an inlined compute would
                 #   be active within this periodical check).
@@ -3050,6 +3086,7 @@ class RoutingTable(BaseConstruct, ABC):
 
                     active_compute_record.state = compute_response
                     active_compute_record.session_state = compute_session_state
+                    active_compute_record.last_retry_timestamp_utc = self._current_timestamp_in_utc()
                     # check if retryable failure, in all other cases terminate the execution.
                     #  Example: user/app code has a downstream dependency which was down during the execution.
                     if (
@@ -3138,7 +3175,7 @@ class RoutingTable(BaseConstruct, ABC):
                         for active_record in active_records:
                             active_record.last_checkpoint_mark = checkpoint.checkpoint_in_secs
 
-    def _check_pending_nodes_for(self, route_record: "RoutingTable.RouteRecord") -> None:
+    def _check_pending_nodes_for(self, route_record: "RoutingTable.RouteRecord", routing_session: RoutingSession) -> None:
         """Check the status of pending nodes of this route.
 
         - make sure that pending node checkpoints are called.
@@ -3148,6 +3185,8 @@ class RoutingTable(BaseConstruct, ABC):
         """
         if route_record.route.has_pending_node_checkpoints():
             for pending_node in route_record.route.pending_nodes:
+                if routing_session.is_expired():
+                    break
                 elapsed_time = self._current_timestamp_in_utc() - pending_node.activated_timestamp
                 checkpoints = route_record.route.get_next_pending_node_checkpoint(elapsed_time, pending_node.last_checkpoint_mark)
                 if checkpoints:
@@ -3162,8 +3201,13 @@ class RoutingTable(BaseConstruct, ABC):
                         )
                         pending_node.last_checkpoint_mark = checkpoint.checkpoint_in_secs
 
+        if routing_session.is_expired():
+            return
+
         expired_nodes: Set["RuntimeLinkNode"] = route_record.route.check_expired_nodes()
         for pending_node in expired_nodes:
+            if routing_session.is_expired():
+                break
             self._execute_pending_node_hook(
                 route_record.route.pending_node_hook.on_expiration,
                 route_record,
@@ -3171,7 +3215,9 @@ class RoutingTable(BaseConstruct, ABC):
                 RoutingHookInterface.PendingNode.IPendingNodeExpirationHook,
             )
 
-    def _check_ready_pending_nodes_for(self, route: Route, route_record: "RoutingTable.RouteRecord") -> None:
+    def _check_ready_pending_nodes_for(
+        self, route: Route, route_record: "RoutingTable.RouteRecord", routing_session: RoutingSession
+    ) -> None:
         """Check the route for pending nodes that would need 'pull' operations to check things like;
             - 'range/completion checks'
 
@@ -3181,7 +3227,7 @@ class RoutingTable(BaseConstruct, ABC):
         :param route_record: record represents the persisted version of the same route
         :return: None
         """
-        route_response: Optional[Route.Response] = route_record.route.check_new_ready_pending_nodes(self.get_platform())
+        route_response: Optional[Route.Response] = route_record.route.check_new_ready_pending_nodes(self.get_platform(), routing_session)
         self._process_route_response(route, route_record, route_response)
 
     @classmethod
@@ -3196,7 +3242,9 @@ class RoutingTable(BaseConstruct, ABC):
         try:
             # expose all of the internal params of the construct impl to client's code
             # ex: BOTO_SESSION, etc
-            args = params = self._params
+            args = params = dict(self._params)
+            dimensions = dimensions_map = create_output_dimension_map(materialized_output)
+            params.update({"dimensions": dimensions, "dimensions_map": dimensions})
             # now setup convenience local variables
             input_map: Dict[str, Signal] = {}
             for i, input_signal in enumerate(materialized_inputs):
@@ -3265,6 +3313,7 @@ class RoutingTable(BaseConstruct, ABC):
         self.metric("routing_table.receive.hook", route=route_record.route)[hook_type.__name__].emit(1)
         self.metric("routing_table.receive.hook.time_in_utc", route=route_record.route)[hook_type.__name__].emit(timestamp_in_utc)
         if slot:
+            dimensions = dimensions_map = create_output_dimension_map(execution_context.output)
             params = dict(self._params)
             params.update(
                 {
@@ -3272,6 +3321,8 @@ class RoutingTable(BaseConstruct, ABC):
                     "_route_record": route_record,
                     "_execution_context": execution_context,
                     "_current_timestamp_in_utc": timestamp_in_utc,
+                    "dimensions": dimensions,
+                    "dimensions_map": dimensions,
                 }
             )
             try:
@@ -3298,6 +3349,7 @@ class RoutingTable(BaseConstruct, ABC):
         self.metric("routing_table.receive.hook", route=route_record.route)[hook_type.__name__].emit(1)
         self.metric("routing_table.receive.hook.time_in_utc", route=route_record.route)[hook_type.__name__].emit(timestamp_in_utc)
         if slot:
+            dimensions = dimensions_map = create_output_dimension_map(materialized_output)
             params = dict(self._params)
             params.update(
                 {
@@ -3307,6 +3359,8 @@ class RoutingTable(BaseConstruct, ABC):
                     "_materialized_inputs": materialized_inputs,
                     "_materialized_output": materialized_output,
                     "_current_timestamp_in_utc": timestamp_in_utc,
+                    "dimensions": dimensions,
+                    "dimensions_map": dimensions,
                 }
             )
             try:
@@ -3331,6 +3385,7 @@ class RoutingTable(BaseConstruct, ABC):
         self.metric("routing_table.receive.hook", route=route_record.route)[hook_type.__name__].emit(1)
         self.metric("routing_table.receive.hook.time_in_utc", route=route_record.route)[hook_type.__name__].emit(timestamp_in_utc)
         if slot:
+            dimensions = dimensions_map = create_output_dimension_map(compute_record.materialized_output)
             params = dict(self._params)
             params.update(
                 {
@@ -3338,6 +3393,8 @@ class RoutingTable(BaseConstruct, ABC):
                     "_route_record": route_record,
                     "_compute_record": compute_record,
                     "_current_timestamp_in_utc": timestamp_in_utc,
+                    "dimensions": dimensions,
+                    "dimensions_map": dimensions,
                 }
             )
             try:
@@ -3363,6 +3420,7 @@ class RoutingTable(BaseConstruct, ABC):
         self.metric("routing_table.receive.hook", route=route_record.route)[hook_type.__name__].emit(1)
         self.metric("routing_table.receive.hook.time_in_utc", route=route_record.route)[hook_type.__name__].emit(timestamp_in_utc)
         if slot:
+            dimensions = dimensions_map = create_output_dimension_map(active_compute_records[0].materialized_output)
             params = dict(self._params)
             params.update(
                 {
@@ -3372,6 +3430,8 @@ class RoutingTable(BaseConstruct, ABC):
                     "_active_compute_records": active_compute_records,
                     "_checkpoint_in_secs": checkpoint_in_secs,
                     "_current_timestamp_in_utc": timestamp_in_utc,
+                    "dimensions": dimensions,
+                    "dimensions_map": dimensions,
                 }
             )
             try:
@@ -3395,6 +3455,9 @@ class RoutingTable(BaseConstruct, ABC):
         self.metric("routing_table.receive.hook", route=route_record.route)[hook_type.__name__].emit(1)
         self.metric("routing_table.receive.hook.time_in_utc", route=route_record.route)[hook_type.__name__].emit(timestamp_in_utc)
         if slot:
+            dimensions = dimensions_map = create_pending_output_dimension_map(
+                pending_node, route_record.route.output, route_record.route.output_dim_matrix
+            )
             params = dict(self._params)
             params.update(
                 {
@@ -3402,6 +3465,8 @@ class RoutingTable(BaseConstruct, ABC):
                     "_route_record": route_record,
                     "_pending_node": pending_node,
                     "_current_timestamp_in_utc": timestamp_in_utc,
+                    "dimensions": dimensions,
+                    "dimensions_map": dimensions,
                 }
             )
             try:
@@ -3426,6 +3491,9 @@ class RoutingTable(BaseConstruct, ABC):
         self.metric("routing_table.receive.hook", route=route_record.route)[hook_type.__name__].emit(1)
         self.metric("routing_table.receive.hook.time_in_utc", route=route_record.route)[hook_type.__name__].emit(timestamp_in_utc)
         if slot:
+            dimensions = dimensions_map = create_pending_output_dimension_map(
+                pending_node, route_record.route.output, route_record.route.output_dim_matrix
+            )
             params = dict(self._params)
             params.update(
                 {
@@ -3434,6 +3502,8 @@ class RoutingTable(BaseConstruct, ABC):
                     "_pending_node": pending_node,
                     "_checkpoint_in_secs": checkpoint_in_secs,
                     "_current_timestamp_in_utc": timestamp_in_utc,
+                    "dimensions": dimensions,
+                    "dimensions_map": dimensions,
                 }
             )
             try:
@@ -3521,3 +3591,21 @@ class RoutingTable(BaseConstruct, ABC):
         When 'suppress_errors_and_emit' is True, Routing is on a critical path and exception unwinding is not
         allowed. Driver is expected to swallow the error and emit Routing internal metric."""
         ...
+
+    def load_inactive_compute_record(
+        self, route_id: RouteID, materialized_output: Signal, datum: Optional[datetime] = None
+    ) -> Optional["RoutingTable.ComputeRecord"]:
+        if datum is not None:
+            datum = int(datum.timestamp())
+        inactive_records = self.load_inactive_compute_records(route_id, ascending=False)
+        if inactive_records:
+            for inactive_record in inactive_records:
+                if (datum is None or inactive_record.trigger_timestamp_utc >= datum) and DimensionFilter.check_equivalence(
+                    inactive_record.materialized_output.domain_spec.dimension_filter_spec,
+                    materialized_output.domain_spec.dimension_filter_spec,
+                ):
+                    return inactive_record
+
+    def describe_compute_record(self, compute_record: "RoutingTable.ComputeRecord") -> Optional[Dict[str, Any]]:
+        if compute_record.slot.type.is_batch_compute():
+            return self.get_platform().batch_compute.describe_compute_record(compute_record)

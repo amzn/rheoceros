@@ -4,17 +4,19 @@
 import copy
 import logging
 from abc import ABC, abstractmethod
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple, Union, cast
 from uuid import uuid4
 
 from intelliflow.core.entity import CoreData
 from intelliflow.core.platform.definitions.aws.glue import catalog as glue_catalog
+from intelliflow.core.platform.definitions.compute import ComputeSessionStateType
 from intelliflow.core.serialization import Serializable, dumps, loads
 from intelliflow.core.signal_processing import Slot
 from intelliflow.core.signal_processing.dimension_constructs import DimensionSpec, DimensionVariantMapper, DimensionVariantReader
 from intelliflow.core.signal_processing.signal import DimensionLinkMatrix, Signal, SignalIntegrityProtocol, SignalLinkNode, SignalUniqueKey
 from intelliflow.core.signal_processing.signal_source import SignalSourceType
+from intelliflow.core.signal_processing.slot import SlotType
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +46,8 @@ class _SignalAnalyzer(ABC):
 class _SignalRangeAnalyzer(_SignalAnalyzer):
     """Analyzer specialized in checking the readiness/completeness of materialized paths from a Signal."""
 
+    INTERNAL_DATA_MAX_SCAN_RANGE_IN_DAYS = 30
+
     # overrides
     @classmethod
     def analyze(
@@ -61,9 +65,10 @@ class _SignalRangeAnalyzer(_SignalAnalyzer):
         if incomplete_paths is None:
             # a brand new analysis request, setup materialized paths
             materialized_paths = signal.get_materialized_resource_paths()
-            # if reference signal, then we have to include the tip.
-            # for others tip of the range can be skipped as they represent the
-            incomplete_paths = set(materialized_paths[0 if signal.is_dependent else 1 :])
+            # for all signals, we start the search from the TIP (if signal is not dependent and have been received
+            # already then we should hit this code path, meaning that TIP already be in completed paths)
+            # incomplete_paths = set(materialized_paths[0 if is_dependent else 1 :])
+            incomplete_paths = set(materialized_paths[0:])
 
         required_resource_name: Optional[str] = None
         if signal.domain_spec.integrity_check_protocol:
@@ -75,25 +80,49 @@ class _SignalRangeAnalyzer(_SignalAnalyzer):
             )
 
         for path in incomplete_paths:
+            full_path = path
+            if required_resource_name:
+                full_path = full_path + signal.resource_access_spec.path_delimiter() + required_resource_name
+            elif signal.resource_access_spec.path_format_requires_resource_name():
+                full_path = full_path + signal.resource_access_spec.path_delimiter() + "_resource"
+
             try:
                 if completed_path_cache and path in completed_path_cache:
                     completed_paths.add(path)
                 elif signal.resource_access_spec.source == SignalSourceType.INTERNAL:
+                    internal_data_found = False
                     if required_resource_name:  # ex: _SUCCESS file/object
                         # resource_path = resource_path + signal.resource_access_spec.path_delimiter() + required_resource_name
                         # if platform.storage.check_folder(resource_path.lstrip('/')):
                         if platform.storage.check_object([path.lstrip("/")], required_resource_name):
                             completed_paths.add(path)
+                            internal_data_found = True
                     elif platform.storage.check_folder(path.lstrip("/")):
                         completed_paths.add(path)
+                        internal_data_found = True
+
+                    if not internal_data_found:
+                        # SPECIAL handling for pure INLINED executions that don't yield output.
+                        # This is also for better testing support.
+                        slot_types: Optional[List[SlotType]] = signal.resource_access_spec.slot_types
+                        if slot_types and all([slot_type.is_inlined_compute() for slot_type in slot_types]):
+                            # try to find the record in routing_table
+                            route_id = signal.resource_access_spec.route_id
+                            missing_output_signal = signal.create(signal.type, signal.resource_access_spec.source, full_path)
+                            inactive_record = platform.routing_table.load_inactive_compute_record(
+                                route_id,
+                                missing_output_signal,
+                                datetime.utcnow() - timedelta(days=cls.INTERNAL_DATA_MAX_SCAN_RANGE_IN_DAYS),
+                            )
+                            if (
+                                inactive_record
+                                and inactive_record.session_state
+                                and inactive_record.session_state.state_type == ComputeSessionStateType.COMPLETED
+                            ):
+                                completed_paths.add(path)
                 elif signal.resource_access_spec.source in [SignalSourceType.GLUE_TABLE] or (
                     signal.resource_access_spec.proxy and signal.resource_access_spec.proxy.source in [SignalSourceType.GLUE_TABLE]
                 ):
-                    full_path = path
-                    if required_resource_name:
-                        full_path = full_path + signal.resource_access_spec.path_delimiter() + required_resource_name
-                    elif signal.resource_access_spec.path_format_requires_resource_name():
-                        full_path = full_path + signal.resource_access_spec.path_delimiter() + "_resource"
                     # do path extraction using the actual spec (not the proxy)
                     dimension_values = signal.resource_access_spec.extract_source(full_path).dimension_values
 
@@ -520,7 +549,13 @@ class RuntimeLinkNode(SignalLinkNode):
                         return True
         return False
 
-    def receive(self, incoming_signal: Signal, output_for_ref_check: Signal = None, output_dim_matrix: DimensionLinkMatrix = None) -> bool:
+    def receive(
+        self,
+        incoming_signal: Signal,
+        output_for_ref_check: Signal = None,
+        output_dim_matrix: DimensionLinkMatrix = None,
+        update_ranges: bool = True,
+    ) -> bool:
         consumed: bool = False
 
         if set(incoming_signal.get_materialized_resource_paths()).issubset(self._processed_resource_paths):
@@ -552,7 +587,8 @@ class RuntimeLinkNode(SignalLinkNode):
                                     satisfied_path: str = candidate_signal.get_materialized_resource_paths()[0]
                                     if self._is_needed_within_signal_range(candidate_signal, satisfied_path):
                                         consumed = True
-                            self._update_ranges(candidate_signal)
+                            if update_ranges:
+                                self._update_ranges(candidate_signal)
                         else:
                             # this happens when the incoming signal matches the same input with different alias'
                             # let's be opportunistic and check if it is zombie using the links between those inputs.
@@ -831,6 +867,17 @@ class _ChainedHookCallback(Callable):
                     callback(*args, **kwargs)
 
 
+class RoutingSession(CoreData):
+    def __init__(self, max_duration_in_secs: Optional[int] = None) -> None:
+        self.start_time_in_utc = current_timestamp_in_utc()
+        self.max_duration_in_secs = max_duration_in_secs
+
+    def is_expired(self) -> bool:
+        if self.max_duration_in_secs is not None:
+            return (current_timestamp_in_utc() - self.start_time_in_utc) > self.max_duration_in_secs
+        return False
+
+
 class Route(Serializable):
     class ExecutionContext(CoreData):
         def __init__(self, completed_link_node: RuntimeLinkNode, output: Signal, slots: List[Slot]) -> None:
@@ -1104,7 +1151,7 @@ class Route(Serializable):
             self._pending_nodes = self._pending_nodes - expired_nodes
         return expired_nodes
 
-    def check_new_ready_pending_nodes(self, platform: "Platform") -> Response:
+    def check_new_ready_pending_nodes(self, platform: "Platform", routing_session: RoutingSession) -> Response:
         """Checks all of the pending nodes and see if there are new 'ready' ones.
 
         New ready nodes can pop up because of 'range_check's on nodes. Other than
@@ -1117,6 +1164,8 @@ class Route(Serializable):
         new_executions: List[Route.ExecutionContext] = []
         completed_nodes: Set[RuntimeLinkNode] = set()
         for pending_node in self._pending_nodes:
+            if routing_session.is_expired():
+                break
             if pending_node.is_ready(check_ranges=True, platform=platform):
                 output: Signal = pending_node.materialize_output(self._output, self._output_dim_matrix)
                 completed_nodes.add(pending_node)

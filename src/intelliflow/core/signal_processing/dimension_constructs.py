@@ -12,7 +12,7 @@ import logging
 import sys
 from abc import ABC, abstractmethod
 from collections import OrderedDict
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from enum import Enum
 from typing import Any, Callable, ClassVar, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 from typing import Type as _Type
@@ -1447,6 +1447,8 @@ class DateVariant(DimensionVariant, DimensionVariantResolver, DimensionVariantCr
     def value(self, val: Any) -> None:
         if isinstance(val, datetime):
             self.date = val
+        elif isinstance(val, date):
+            self.date = datetime(val.year, val.month, val.day)
         else:
             # see https://dateutil.readthedocs.io/en/stable/parser.html
             #
@@ -1598,6 +1600,7 @@ class DateVariant(DimensionVariant, DimensionVariantResolver, DimensionVariantCr
             else:
                 return (
                     self._value == other
+                    or (isinstance(other, date) and self.date == datetime(other.year, other.month, other.day))
                     or (isinstance(other, datetime) and self.date == other)
                     or (isinstance(other, datetime) and self._format and self._date.strftime(self._format) == other.strftime(self._format))
                     or (isinstance(other, str) and self.date == dateutil.parser.parse(other, fuzzy_with_tokens=True)[0])
@@ -1645,7 +1648,7 @@ class DateVariant(DimensionVariant, DimensionVariantResolver, DimensionVariantCr
 
     @classmethod
     def resolve(cls, raw_value: Any) -> DimensionVariantResolver.Result:
-        if isinstance(raw_value, datetime):
+        if isinstance(raw_value, (datetime, date)):
             return DimensionVariantResolver.Result(score=DimensionVariantResolverScore.MATCH, creator=cls)
 
         if isinstance(raw_value, str) and len(raw_value) >= 6:  # length check to narrow down the scope to formats such as "DDMMYY"
@@ -2504,6 +2507,17 @@ class DimensionFilter(DimensionSpec):
         if any(cast("DimensionVariant", dim).is_special_value() for dim in self.get_flattened_dimension_map().values()):
             return False
         return True
+
+    def tip(self) -> "DimensionFilter":
+        new_filter: DimensionFilter = DimensionFilter()
+
+        for dim, sub_spec in self.get_dimensions():
+            tip_dim = copy.deepcopy(dim)
+            tip_sub_spec = cast(DimensionFilter, sub_spec).tip() if sub_spec else None
+            new_filter.add_dimension(tip_dim, tip_sub_spec)
+            break
+
+        return new_filter
 
 
 if __name__ == "__main__":

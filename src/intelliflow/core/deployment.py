@@ -451,6 +451,7 @@ def _get_working_set_as_zip_stream(
             logger.error(err_msg)
             raise RuntimeError(err_msg)
 
+    zipped_set: Set[str] = set()
     with zipfile.ZipFile(buffer, "w") as zip_stream:
         # zipped_set not check in subsequent calls to allow overwrites in order of
         #   (1) dependencies (farm, virtualenv) -> (2) app source -> (3) explicit pkg or module declarations
@@ -464,7 +465,7 @@ def _get_working_set_as_zip_stream(
                     if_spec = importlib.util.find_spec("intelliflow")
                     if if_spec:
                         if_path = str(Path(if_spec.loader.path).parent)
-                        _zipdir(if_path, zip_stream, include_resources, "intelliflow")
+                        zipped_set = zipped_set | _zipdir(if_path, zip_stream, include_resources, "intelliflow")
                     elif bundle_zip_file:
                         # try to pull core framework from the bundle if not in dependencies.
                         with zipfile.ZipFile(bundle_zip_file, "r") as bundle_zip:
@@ -481,7 +482,7 @@ def _get_working_set_as_zip_stream(
                     zip_stream.writestr(if_core_package, bundle_zip.open(if_core_package).read())
 
         if source:
-            _zipdir(source, zip_stream, include_resources)
+            zipped_set = zipped_set | _zipdir(source, zip_stream, include_resources)
 
         if DeploymentConfiguration.app_extra_modules:
             for extra_module in DeploymentConfiguration.app_extra_modules:
@@ -494,7 +495,15 @@ def _get_working_set_as_zip_stream(
                     m_dir_path = str(Path(m_spec.loader.path).parent)
                     # e.g "module_root.foo.bar" will be packed with the content of 'bar' only but with an archive
                     # prefix of 'module_root/foo/bar' so that import statements will still be rooted at 'module_root'
-                    _zipdir(m_dir_path, zip_stream, include_resources, extra_module.replace(".", os.path.sep))
+                    zipped_set = zipped_set | _zipdir(m_dir_path, zip_stream, include_resources, extra_module.replace(".", os.path.sep))
+                    # make sure parent modules have "__init__.py"
+                    parent_modules = extra_module.split(".")[:-1]
+                    for i in range(len(parent_modules)):
+                        parents = parent_modules[: i + 1]
+                        archive_name = os.path.sep.join(parents + ["__init__.py"])
+                        if archive_name not in zipped_set:
+                            zip_stream.writestr(archive_name, "", compress_type=ZIP_COMPRESSION_TYPE, compresslevel=ZIP_COMPRESSION_LEVEL)
+                            zipped_set.add(archive_name.replace(os.path.sep, "/"))
                 else:
                     # see doc for 'set_deployment_conf' for the deferral of validation till actual bundling/deployment
                     raise ValueError(

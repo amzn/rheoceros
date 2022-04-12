@@ -143,6 +143,12 @@ class TestAWSApplicationAlarmingMetrics(AWSTestBase):
             threshold=1,
         )
 
+        # SERIALIZATION: inject serialize/deserialize sequence for enhanced serialization coverage
+        json_str = app.dev_context.to_json()
+        dev_context = CoreData.from_json(json_str)
+        app._dev_context = dev_context
+        #
+
         app.activate(allow_concurrent_executions=False)
 
         # yields None, external metrics cannot be emitted (note that this is not due to unmaterialized metric Name)
@@ -458,6 +464,12 @@ class TestAWSApplicationAlarmingMetrics(AWSTestBase):
             ],
         )
 
+        # SERIALIZATION: inject serialize/deserialize sequence for enhanced serialization coverage
+        json_str = app.dev_context.to_json()
+        dev_context = CoreData.from_json(json_str)
+        app._dev_context = dev_context
+        #
+
         app.activate(allow_concurrent_executions=False)
 
         # 1- Use application level references as internal signals to trigger
@@ -635,6 +647,12 @@ class TestAWSApplicationAlarmingMetrics(AWSTestBase):
             id="orchestration_failure_reactor", inputs=[orchestration_monitor[AlarmState.ALARM.value]], compute_targets=[NOOPCompute]
         )
 
+        # SERIALIZATION: inject serialize/deserialize sequence for enhanced serialization coverage
+        json_str = app.dev_context.to_json()
+        dev_context = CoreData.from_json(json_str)
+        app._dev_context = dev_context
+        #
+
         app.activate()
 
         self.patch_aws_stop()
@@ -747,6 +765,12 @@ class TestAWSApplicationAlarmingMetrics(AWSTestBase):
                 # replace with Spark, PrestoSQL, Lambda code, Email,..
             ],
         )
+
+        # SERIALIZATION: inject serialize/deserialize sequence for enhanced serialization coverage
+        json_str = app.dev_context.to_json()
+        dev_context = CoreData.from_json(json_str)
+        app._dev_context = dev_context
+        #
 
         app.activate()
 

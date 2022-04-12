@@ -76,6 +76,9 @@ class InlinedComputeRetryVerifier(IInlinedCompute):
         if AWSCommonParams.BOTO_SESSION not in params:
             raise NotImplementedError(f"{self.__class__.__name__} currently supports AWS only!")
 
+        assert params.get("dimensions", None) is not None, "Output 'dimensions' map not in InlinedCompute params"
+        assert params.get("dimensions_map", None) is not None, "Output 'dimensions_map' map not in InlinedCompute params"
+
         s3 = params[AWSCommonParams.BOTO_SESSION].resource("s3")
         bucket = get_bucket(s3, self._storage_bucket)
         retry_count_key = self.FOLDER + "/" + self._id + "/current_retry_count"

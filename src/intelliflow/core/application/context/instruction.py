@@ -106,6 +106,15 @@ class Instruction(CoreData):
                 if link.is_equivalent(self.output_node):
                     link.to_be_updated = True
 
+    def get_inbound_links(self, parent: Union[Signal, "Instruction"]) -> List[InstructionLink]:
+        parent_signal = parent.output_node.signal() if isinstance(parent, Instruction) else parent
+        links = []
+        for link in self.inbound:
+            if link.signal.resource_access_spec.get_owner_context_uuid() == parent_signal.resource_access_spec.get_owner_context_uuid():
+                if link.is_equivalent(parent_signal):
+                    links.append(link)
+        return links
+
     def is_dirty(self) -> bool:
         """Check whether one of the inbound links has been updated in a bad way, leaving this orphaned or incompatible
         Cases:

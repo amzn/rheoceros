@@ -142,6 +142,12 @@ class TestAWSApplicationComputeTargets(AWSTestBase):
 
         development_module.put_inlined_policy = MagicMock(side_effect=put_inlined_policy)
 
+        # SERIALIZATION: inject serialize/deserialize sequence for enhanced serialization coverage
+        json_str = self.app.dev_context.to_json()
+        dev_context = CoreData.from_json(json_str)
+        self.app._dev_context = dev_context
+        #
+
         # above mock / callback should be called during the activation
         self.app.activate()
         # just make sure that it was called actually (otherwise there is no point in this test :)
@@ -306,6 +312,12 @@ class TestAWSApplicationComputeTargets(AWSTestBase):
             ],
             dataset_format=DatasetSignalSourceFormat.PARQUET,
         )
+
+        # SERIALIZATION: inject serialize/deserialize sequence for enhanced serialization coverage
+        json_str = app.dev_context.to_json()
+        dev_context = CoreData.from_json(json_str)
+        app._dev_context = dev_context
+        #
 
         # during this activation RoutingTable should invalidate the active route record
         app.activate()

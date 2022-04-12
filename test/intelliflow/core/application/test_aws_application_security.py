@@ -35,6 +35,13 @@ class TestAWSApplicationSecurity(AWSTestBase):
                 processing=None,
             ),
         )
+
+        # SERIALIZATION: inject serialize/deserialize sequence for enhanced serialization coverage
+        json_str = app.dev_context.to_json()
+        dev_context = CoreData.from_json(json_str)
+        app._dev_context = dev_context
+        #
+
         app.activate()
 
         # activation is successful with a security conf
@@ -74,6 +81,11 @@ class TestAWSApplicationSecurity(AWSTestBase):
         )
         # connect them
         upstream_app.authorize_downstream("child_app", self.account_id, self.region)
+        # SERIALIZATION: inject serialize/deserialize sequence for enhanced serialization coverage
+        json_str = upstream_app.dev_context.to_json()
+        dev_context = CoreData.from_json(json_str)
+        upstream_app._dev_context = dev_context
+        #
         upstream_app.activate()
 
         app.import_upstream("parent_app", self.account_id, self.region)

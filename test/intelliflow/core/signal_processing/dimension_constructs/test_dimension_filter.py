@@ -3,7 +3,7 @@
 
 import copy
 from collections import OrderedDict
-from datetime import datetime
+from datetime import date, datetime
 from test.intelliflow.core.signal_processing.dimension_constructs.test_dimension_spec import TestDimensionSpec
 from typing import cast
 
@@ -1052,6 +1052,7 @@ class TestDimensionFilter:
         "raw_filter, date_value, date_raw_value",
         [
             ({"2020-05-06": {}}, "2020-05-06 00:00:00", datetime(2020, 5, 6)),
+            ({date(2020, 5, 6): {}}, "2020-05-06 00:00:00", datetime(2020, 5, 6)),
             ({"2020-05-06 01:00:00": {"format": "%m-%d-%Y"}}, "05-06-2020", datetime(2020, 5, 6, 1)),
             ({"2020-05-06 01:00:00": {}}, "2020-05-06 01:00:00", datetime(2020, 5, 6, 1)),
             ({"2020-05-06T01:00:00": {}}, "2020-05-06 01:00:00", datetime(2020, 5, 6, 1)),

@@ -643,7 +643,8 @@ class ApplicationExt(Application):
 
             all_data = []
             retrieved_so_far = 0
-            limit = limit if not data_header_exists else limit + 1
+            if limit is not None:
+                limit = limit if not data_header_exists else limit + 1
             for physical_path, data in data_it:
                 if not data:
                     continue

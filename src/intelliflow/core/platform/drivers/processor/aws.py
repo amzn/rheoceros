@@ -16,7 +16,7 @@ from intelliflow.core.permission import PermissionContext
 from intelliflow.core.signal_processing import DimensionFilter, Signal, Slot
 from intelliflow.core.signal_processing.analysis import INTEGRITY_CHECKER_MAP
 from intelliflow.core.signal_processing.definitions.metric_alarm_defs import AlarmState, MetricPeriod
-from intelliflow.core.signal_processing.routing_runtime_constructs import Route, RouteID
+from intelliflow.core.signal_processing.routing_runtime_constructs import Route, RouteID, RoutingSession
 from intelliflow.core.signal_processing.signal import SignalDomainSpec, SignalType
 from intelliflow.core.signal_processing.signal_source import (
     CWAlarmSignalSourceAccessSpec,
@@ -83,7 +83,12 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
     DLQ_NAME_FORMAT: ClassVar[str] = "if-{0}-{1}-{2}"
     BOOTSTRAPPER_ROOT_FORMAT: ClassVar[str] = "if-{0}-{1}-{2}-{3}"
     # Lambda specific retryables
-    CLIENT_RETRYABLE_EXCEPTION_LIST: ClassVar[Set[str]] = {"InvalidParameterValueException", "ServiceException", "503"}
+    CLIENT_RETRYABLE_EXCEPTION_LIST: ClassVar[Set[str]] = {
+        "InvalidParameterValueException",
+        "ServiceException",
+        "503",
+        "ResourceConflictException",
+    }
     MAIN_LOOP_INTERVAL_IN_MINUTES: ClassVar[int] = 1
 
     def __init__(self, params: ConstructParamsDict) -> None:
@@ -329,14 +334,48 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
     def provide_devtime_permissions(cls, params: ConstructParamsDict) -> List[ConstructPermission]:
         # dev-role permissions (things this construct would do during development)
         # dev-role should be able to do the following.
-        # TODO post-MVP narrow it down to whatever Lambda APIs we rely on within this impl (at dev-time).
+        bucket_name_format: str = cls.BOOTSTRAPPER_ROOT_FORMAT.format(
+            "awslambda".lower(), "*", params[AWSCommonParams.ACCOUNT_ID], params[AWSCommonParams.REGION]
+        )
+
+        lambda_name_format: str = cls.LAMBDA_NAME_FORMAT.format(cls.__name__, "*", params[AWSCommonParams.REGION])
+        filter_lambda_name_format: str = lambda_name_format + "-FILTER"
+        dlq_name_format: str = lambda_name_format + "-DLQ"
         return [
-            ConstructPermission(["*"], ["lambda:*"]),
+            # full permission on its own bucket
+            ConstructPermission([f"arn:aws:s3:::{bucket_name_format}", f"arn:aws:s3:::{bucket_name_format}/*"], ["s3:*"]),
+            # on everything else, still try to minimize
+            ConstructPermission(
+                ["*"],
+                [
+                    "s3:List*",
+                    "s3:Get*",
+                    "s3:Head*",
+                    # required for external S3 signal registration (from the same account)
+                    "s3:PutBucketNotificationConfiguration",
+                    "s3:PutBucketPolicy",
+                ],
+            ),
+            # full permission on its own resources
+            # 1- Lambda
+            ConstructPermission(
+                [
+                    f"arn:aws:lambda:{params[AWSCommonParams.REGION]}:{params[AWSCommonParams.ACCOUNT_ID]}:function:{lambda_name_format}",
+                    f"arn:aws:lambda:{params[AWSCommonParams.REGION]}:{params[AWSCommonParams.ACCOUNT_ID]}:function:{filter_lambda_name_format}",
+                ],
+                ["lambda:*"],
+            ),
+            # 2- DLQ (let exec-role send messages to DLQ)
+            ConstructPermission(
+                [f"arn:aws:sqs:{params[AWSCommonParams.REGION]}:{params[AWSCommonParams.ACCOUNT_ID]}:{dlq_name_format}"],
+                ["sqs:*"],
+            ),
+            # read-only on other resources
+            # 1- lambda
+            ConstructPermission(["*"], ["lambda:Get*", "lambda:List*"]),
+            # 2- SQS
+            ConstructPermission(["*"], ["sqs:Get*", "sqs:List*"]),
             ConstructPermission(["*"], ["events:*"]),
-            ConstructPermission(["*"], ["sqs:*"])
-            # TODO dev-role should have the right to do BucketNotification on external signals
-            # this would require post-MVP design change on how dev-role is used and when it is updated.
-            # probably during the activation again (switching to the admin credentails if authorization is given).
         ]
 
     # overrides
@@ -1673,7 +1712,9 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
         runtime_platform.runtime_init(runtime_platform.processor)
         return runtime_platform
 
-    def event_handler(self, runtime_platform: "Platform", event, context, filter_only: bool = False) -> List[RoutingTable.Response]:
+    def event_handler(
+        self, runtime_platform: "Platform", event, context, filter_only: bool = False, routing_session: RoutingSession = RoutingSession()
+    ) -> List[RoutingTable.Response]:
         # TODO check processor_queue
         #  - based on another CW event
         # currently we check the queue optimistically at the end of each cycle
@@ -1708,7 +1749,7 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
 
                         resource_path = resource_path + source_spec.path_delimiter() + required_resource_name
                     routing_response = runtime_platform.routing_table.receive(
-                        feed_back_signal.type, source_spec.source, resource_path, target_route_id, filter_only
+                        feed_back_signal.type, source_spec.source, resource_path, target_route_id, filter_only, routing_session
                     )
                     routing_responses.append(routing_response)
                     if processing_mode == FeedBackSignalProcessingMode.ONLY_HEAD:
@@ -1797,7 +1838,7 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
                     # reactions are expected to be put in processor queue.
                     # let router will take care of them as well.
                     routing_response = runtime_platform.routing_table.receive(
-                        signal_type, SignalSourceType.S3, resource_path, target_route_id, filter_only
+                        signal_type, SignalSourceType.S3, resource_path, target_route_id, filter_only, routing_session
                     )
                     routing_responses.append(routing_response)
 
@@ -1839,7 +1880,7 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
                         signal_type = SignalType.CW_ALARM_STATE_CHANGE
 
                     routing_response = runtime_platform.routing_table.receive(
-                        signal_type, source_type, resource_path, target_route_id, filter_only
+                        signal_type, source_type, resource_path, target_route_id, filter_only, routing_session
                     )
                     routing_responses.append(routing_response)
         elif "source" in event and event["source"] == "aws.glue":
@@ -1872,6 +1913,7 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
                         resource_path,
                         target_route_id,
                         filter_only,
+                        routing_session,
                     )
                     routing_responses.append(routing_response)
         elif "source" in event and event["source"] == "aws.events":
@@ -1886,14 +1928,14 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
                         # if timer_id is not internal poller
                         resource_path: str = TimerSignalSourceAccessSpec.create_resource_path(timer_id, event_time)
                         routing_response = runtime_platform.routing_table.receive(
-                            SignalType.TIMER_EVENT, SignalSourceType.TIMER, resource_path, target_route_id, filter_only
+                            SignalType.TIMER_EVENT, SignalSourceType.TIMER, resource_path, target_route_id, filter_only, routing_session
                         )
                         routing_responses.append(routing_response)
                     else:
                         self.metric(f"processor{'.filter' if filter_only else ''}.event.type")["NextCycle"].emit(1)
                         # TODO see the comment for '_activate_main_loop' call within 'activate'
                         # NEXT CYCLE IN MAIN LOOP
-                        runtime_platform.routing_table.check_active_routes()
+                        runtime_platform.routing_table.check_active_routes(routing_session)
                 except NameError as bad_code_path:
                     module_logger.error(
                         f"Processor failed to process resource: {resource!r} due to a missing internal "
@@ -1941,7 +1983,11 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
 
             runtime_platform = AWSLambdaProcessorBasic.runtime_bootstrap()
             routing_responses = cast("AWSLambdaProcessorBasic", runtime_platform.processor).event_handler(
-                runtime_platform, event, context, is_filter
+                runtime_platform,
+                event,
+                context,
+                is_filter,
+                RoutingSession(max_duration_in_secs=12 * 60),
             )
             if is_filter:
                 if any([response for response in routing_responses if response.routes]):

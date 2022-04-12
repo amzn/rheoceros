@@ -27,7 +27,7 @@ def init_basic_logging(log_dir=None, enable_console_logging=True, root_level=log
         # add stdout handler, with level INFO
         console = logging.StreamHandler(sys.stdout)
         console.setLevel(root_level)
-        console_formatter = logging.Formatter("%(name)-13s: %(levelname)-8s %(message)s")
+        console_formatter = logging.Formatter("%(asctime)s - %(name)-13s: %(levelname)-8s %(message)s")
         console.setFormatter(console_formatter)
         logger.addHandler(console)
 

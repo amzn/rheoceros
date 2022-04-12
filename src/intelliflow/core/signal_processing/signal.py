@@ -594,6 +594,31 @@ class Signal(Serializable["Signal"]):
                 for source_spec in self.get_materialized_access_specs()
             ]
 
+    def get_required_resource_name(self) -> Optional[str]:
+        required_resource_name: Optional[str] = None
+        if self.domain_spec.integrity_check_protocol:
+
+            integrity_checker = INTEGRITY_CHECKER_MAP[self.domain_spec.integrity_check_protocol.type]
+            required_resource_name = integrity_checker.get_required_resource_name(
+                self.resource_access_spec, self.domain_spec.integrity_check_protocol
+            )
+        return required_resource_name
+
+    def extract_dimensions(self, materialized_path: str) -> List[Any]:
+        full_path = materialized_path
+        required_resource_name = self.get_required_resource_name()
+        if required_resource_name:
+            full_path = full_path + self.resource_access_spec.path_delimiter() + required_resource_name
+        elif self.resource_access_spec.path_format_requires_resource_name():
+            full_path = full_path + self.resource_access_spec.path_delimiter() + "_resource"
+        return self.resource_access_spec.extract_source(full_path).dimension_values
+
+    def tip(self) -> "Signal":
+        """Return the TIP of the signal as a new Signal if its dimension_filter represents a range.
+        TIP here corresponds to the first branch of the dimension_filter.
+        """
+        return self.filter(new_filter=self.domain_spec.dimension_filter_spec.tip())
+
     def serialize(self) -> str:
         return dumps(self)
 

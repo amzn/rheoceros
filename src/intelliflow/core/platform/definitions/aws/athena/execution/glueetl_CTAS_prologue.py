@@ -178,13 +178,26 @@ def load_input_df(input, sc, aws_region):
 
     nearest_the_tip_index_in_range = None
     input_df = None
-    new_df = None
     for i, resource_path in enumerate(input['resource_materialized_paths']):
+        new_df = None
         if database and table_name:
             next_partitions = [input['partitions'][i]] if input['partition_keys'] else input['partitions']
+            next_partition_values = [str(d) for d in next_partitions[0]] if next_partitions else []
             # TODO catch glue exception and map retryables to ComputeRetryableInternalError
-            if not next_partitions or not (input['range_check_required'] or input['nearest_the_tip_in_range']) or glue_catalog.is_partition_present(glue, database, table_name, [str(d) for d in next_partitions[0]]):
-                new_df = spark.sql(create_query(database, table_name, input['partition_keys'], next_partitions))
+            if not next_partitions or not (input['range_check_required'] or input['nearest_the_tip_in_range']) or glue_catalog.is_partition_present(glue, database, table_name, next_partition_values):
+                if input['resource_type'] == 'S3':
+                    # keep the path as is if no partitions 
+                    if next_partition_values:
+                        resource_path = glue_catalog.get_location(glue, database, table_name, next_partition_values)
+                        if not resource_path:
+                            if not input['range_check_required']:
+                                continue
+                            else:
+                                raise RuntimeError("{{0}} path does not exist! Dimensions: {{1}}"
+                                                   "Either there is a problem with range_check mechanism or the partition has been deleted "
+                                                   "after the execution has started.".format(resource_path, next_partition_values))
+                else:
+                    new_df = spark.sql(create_query(database, table_name, input['partition_keys'], next_partitions))
             elif not input['range_check_required']:
                 logger.error("{{0}} path does not exist. Since range check is not required. Continuing with next available path".format(resource_path))
                 continue
@@ -192,7 +205,7 @@ def load_input_df(input, sc, aws_region):
                 raise RuntimeError("{{0}} path does not exist! "
                                    "Either there is a problem with range_check mechanism or the partition has been deleted "
                                    "after the execution has started.".format(resource_path))
-        else:
+        if not new_df:
             # native access via input materialized paths
             try:
                 if input['data_format'] == 'parquet':

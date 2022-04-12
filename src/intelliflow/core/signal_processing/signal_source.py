@@ -292,6 +292,36 @@ class SignalSourceAccessSpec:
             path_values: List[str] = list(current_path_values) + [str(cast(DimensionVariant, dim).value)]
             cls._create_path_from_filter(path_format, paths, path_values, sub_filter)
 
+    @classmethod
+    def get_dimensions(cls, dim_filter: DimensionFilter) -> List[List[Any]]:
+        """Interpret the dimension values using the specific context of access spec impls, so that they can
+        support different dimension filter structures and map the final dimension values."""
+        if not dim_filter:
+            return []
+        dimensions: List[List[Any]] = []
+        current_dim_values: List[Any] = []
+        cls._create_dim_from_filter(dimensions, current_dim_values, dim_filter)
+        return dimensions
+
+    @classmethod
+    def _create_dim_from_filter(cls, dimensions: List[List[Any]], current_dim_values: List[Any], dim_filter: DimensionFilter) -> None:
+        if not dim_filter:
+            if current_dim_values not in dimensions:
+                dimensions.append(current_dim_values)
+            else:
+                logger.critical(
+                    f"{cls.__name__} detected duplicate dimensions list!" f"{current_dim_values!r} already exists in {dimensions!r}!"
+                )
+            return
+
+        for dim, sub_filter in dim_filter.get_dimensions():
+            dimension_values: List[Any] = list(current_dim_values) + [cls._get_dimension_value(cast(DimensionVariant, dim))]
+            cls._create_dim_from_filter(dimensions, dimension_values, sub_filter)
+
+    @classmethod
+    def _get_dimension_value(cls, dim_variant: DimensionVariant) -> Any:
+        return dim_variant.value
+
     def check_termination(self, current: DimensionFilter, new: DimensionFilter) -> bool:
         """
         Returns True when this spec detects the end/termination of the host Signal based on its new dimension values.
@@ -527,33 +557,16 @@ class DatasetSignalSourceAccessSpec(SignalSourceAccessSpec):
 
     @classmethod
     def get_partitions(cls, dim_filter: DimensionFilter) -> List[List[Any]]:
-        if not dim_filter:
-            return []
-        partitions: List[List[Any]] = []
-        current_partition_values: List[Any] = []
-        cls._create_partition_from_filter(partitions, current_partition_values, dim_filter)
-        return partitions
+        return cls.get_dimensions(dim_filter)
 
+    # overrides
     @classmethod
-    def _create_partition_from_filter(
-        cls, partitions: List[List[Any]], current_partition_values: List[Any], dim_filter: DimensionFilter
-    ) -> None:
-        if not dim_filter:
-            if current_partition_values not in partitions:
-                partitions.append(current_partition_values)
-            else:
-                logger.critical(
-                    f"{cls.__name__} detected duplicate partitions!" f"{current_partition_values!r} already exists in {partitions!r}!"
-                )
-            return
-
-        for dim, sub_filter in dim_filter.get_dimensions():
-            partition_values: List[Any] = list(current_partition_values) + [cls._get_partition_value(cast(DimensionVariant, dim))]
-            cls._create_partition_from_filter(partitions, partition_values, sub_filter)
-
-    @classmethod
-    def _get_partition_value(cls, dim_variant: DimensionVariant) -> Any:
+    def _get_dimension_value(cls, dim_variant: DimensionVariant) -> Any:
         return dim_variant.value
+
+
+INTERNAL_DATA_ROUTE_ID_KEY = "_internal_data_route_id"
+INTERNAL_SLOT_TYPES_KEY = "_internal_data_slot_types"
 
 
 class InternalDatasetSignalSourceAccessSpec(DatasetSignalSourceAccessSpec):
@@ -601,6 +614,22 @@ class InternalDatasetSignalSourceAccessSpec(DatasetSignalSourceAccessSpec):
     @property
     def data_id(self) -> str:
         return self._data_id
+
+    @property
+    def route_id(self) -> Optional[str]:
+        return self._attrs.get(INTERNAL_DATA_ROUTE_ID_KEY, None)
+
+    @route_id.setter
+    def route_id(self, val: str) -> None:
+        self._attrs[INTERNAL_DATA_ROUTE_ID_KEY] = val
+
+    @property
+    def slot_types(self) -> Optional[List["SlotType"]]:
+        return self._attrs.get(INTERNAL_SLOT_TYPES_KEY, None)
+
+    @slot_types.setter
+    def slot_types(self, val: List["SlotType"]) -> None:
+        self._attrs[INTERNAL_SLOT_TYPES_KEY] = val
 
     @property
     def folder(self) -> str:

@@ -366,6 +366,15 @@ class AWSGlueBatchComputeBasic(AWSConstructMixin, BatchCompute):
                     f"An error occurred while trying to stop AWS Glue job run! " f"Error: {response['Errors']!r}"
                 )  # Errors will contain job name and run id.
 
+    # overrides
+    def get_max_wait_time_for_next_retry_in_secs(self) -> int:
+        """Owerwrite the maximum interval used by the default retry strategy in
+        BatchCompute::can_retry
+        """
+        # enough to get out of Glue's 'resource unavailable' cycle?
+        # retry with increasing probability as wait time gets close to this
+        return 2 * 60 * 60
+
     def dev_init(self, platform: "DevelopmentPlatform") -> None:
         super().dev_init(platform)
 
@@ -510,17 +519,24 @@ class AWSGlueBatchComputeBasic(AWSConstructMixin, BatchCompute):
                 )
             )
 
-            encryption_key_list: List[str] = [
+            encryption_key_list: Set[str] = {
                 ext_signal.resource_access_spec.encryption_key
                 for ext_signal in ext_s3_signals
                 if ext_signal.resource_access_spec.encryption_key
-            ]
+            }
 
             if encryption_key_list:
                 permissions.append(
                     ConstructPermission(
-                        encryption_key_list,
-                        ["kms:Decrypt", "kms:DescribeKey", "kms:DescribeCustomKeyStores", "kms:ListKeys", "kms:ListAliases"],
+                        list(encryption_key_list),
+                        [
+                            "kms:Decrypt",
+                            "kms:DescribeKey",
+                            "kms:GenerateDataKey",
+                            "kms:DescribeCustomKeyStores",
+                            "kms:ListKeys",
+                            "kms:ListAliases",
+                        ],
                     )
                 )
 
@@ -530,14 +546,71 @@ class AWSGlueBatchComputeBasic(AWSConstructMixin, BatchCompute):
     def provide_devtime_permissions(cls, params: ConstructParamsDict) -> List[ConstructPermission]:
         # dev-role permissions (things this construct would do during development)
         # dev-role should be able to do the following.
+        bucket_name_format: str = cls.SCRIPTS_ROOT_FORMAT.format(
+            "awsglue".lower(), "*", params[AWSCommonParams.ACCOUNT_ID], params[AWSCommonParams.REGION]
+        )
         return [
-            # TODO
-            # TODO post-MVP narrow it down to whatever S3 APIs we rely on within this impl (at dev-time).
-            # # ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:GetObjectVersion", "s3:ListBucket"]),
-            # # ["s3:GetBucketNotificationConfiguration", "s3:PutBucketNotificationConfiguration"]
-            # also specify its bucket
-            # ConstructPermission(["*"], ["s3:*"]),
-            ConstructPermission(["*"], ["glue:*"]),
+            ConstructPermission([f"arn:aws:s3:::{bucket_name_format}", f"arn:aws:s3:::{bucket_name_format}/*"], ["s3:*"]),
+            # ConstructPermission(["*"], ["glue:*"]),
+            ConstructPermission(
+                [
+                    f"arn:aws:glue:{params[AWSCommonParams.REGION]}:{params[AWSCommonParams.ACCOUNT_ID]}:catalog",
+                    f"arn:aws:glue:{params[AWSCommonParams.REGION]}:{params[AWSCommonParams.ACCOUNT_ID]}:database/*",
+                ],
+                ["glue:GetDatabases"],
+            ),
+            # Read-access into everything else in the same catalog
+            # Refer
+            #   https://docs.aws.amazon.com/glue/latest/dg/glue-specifying-resource-arns.html
+            ConstructPermission(
+                [
+                    f"arn:aws:glue:{params[AWSCommonParams.REGION]}:{params[AWSCommonParams.ACCOUNT_ID]}:catalog",
+                    f"arn:aws:glue:{params[AWSCommonParams.REGION]}:{params[AWSCommonParams.ACCOUNT_ID]}:database/default",
+                    f"arn:aws:glue:{params[AWSCommonParams.REGION]}:{params[AWSCommonParams.ACCOUNT_ID]}:database/*",
+                    f"arn:aws:glue:{params[AWSCommonParams.REGION]}:{params[AWSCommonParams.ACCOUNT_ID]}:table/*/*",
+                    # f"arn:aws:glue:{params[AWSCommonParams.REGION]}:{params[AWSCommonParams.ACCOUNT_ID]}:userDefinedFunction/*/*",
+                    # f"arn:aws:glue:{params[AWSCommonParams.REGION]}:{params[AWSCommonParams.ACCOUNT_ID]}:connection/*",
+                ],
+                [
+                    "glue:GetDatabase",
+                    "glue:GetTable",
+                    "glue:GetTables",
+                    "glue:GetPartition",
+                    "glue:GetPartitions",
+                    "glue:BatchGetPartition",
+                    "glue:Get*",
+                    "glue:BatchGet*",
+                ],
+            ),
+            # More permissive read access on other non-catalog entities
+            ConstructPermission(
+                ["*"],
+                [
+                    "glue:ListCrawlers",
+                    "glue:BatchGetCrawlers",
+                    "glue:ListDevEndpoints",
+                    "glue:BatchGetDevEndpoints",
+                    "glue:GetJob",
+                    "glue:GetJobs",
+                    "glue:ListJobs",
+                    "glue:BatchGetJobs",
+                    "glue:GetJobRun",
+                    "glue:GetJobRuns",
+                    "glue:GetJobBookmark",
+                    "glue:GetJobBookmarks",
+                    "glue:GetTrigger",
+                    "glue:GetTriggers",
+                    "glue:ListTriggers",
+                    "glue:BatchGetTriggers",
+                ],
+            ),
+            # and finally: full-authorization on activation and (local) compute time permissions (on its own resources)
+            ConstructPermission(
+                [
+                    f"arn:aws:glue:{params[AWSCommonParams.REGION]}:{params[AWSCommonParams.ACCOUNT_ID]}:job/{cls.GLUE_JOB_NAME_FORMAT.format(cls.__name__, '*', '*', params[AWSCommonParams.REGION])}"
+                ],
+                ["glue:*"],
+            ),
             # TODO dev-role should have the right to do BucketNotification on external signals
             # this would require post-MVP design change on how dev-role is used and when it is updated.
             # probably during the activation again (switching to the admin credentails if authorization is given).
@@ -980,3 +1053,48 @@ class AWSGlueBatchComputeBasic(AWSConstructMixin, BatchCompute):
 
     def _revert_security_conf(selfs, security_conf: ConstructSecurityConf, prev_security_conf: ConstructSecurityConf) -> None:
         pass
+
+    def describe_compute_record(self, active_compute_record: "RoutingTable.ComputeRecord") -> Optional[Dict[str, Any]]:
+        execution_details = dict()
+        if active_compute_record.session_state:
+            # TODO: Create presigned url. Find a way to redirect th user to jobrun
+            if active_compute_record.session_state.executions:
+                # We only check and gather details for the final execution
+                final_execution_details = active_compute_record.session_state.executions[::-1][0].details
+                details = dict()
+                details["JobId"] = final_execution_details.get("Id", None)
+                details["JobName"] = final_execution_details.get("JobName", None)
+                details[
+                    "JobURL"
+                ] = f"https://{self.region}.console.aws.amazon.com/gluestudio/home?region={self.region}#/editor/job/{details['JobName']}/details"
+                details[
+                    "JobRunURL"
+                ] = f"https://{self.region}.console.aws.amazon.com/gluestudio/home?region={self.region}#/job/{details['JobName']}/run/{details['JobId']}"
+                details["StartedOn"] = final_execution_details.get("StartedOn", None)
+                details["CompletedOn"] = final_execution_details.get("CompletedOn", None)
+                details["JobRunState"] = final_execution_details.get("JobRunState", None)
+                details["Attempt"] = final_execution_details.get("Attempt", None)
+                details["ExecutionTime"] = final_execution_details.get("ExecutionTime", None)
+                details["WorkerType"] = final_execution_details.get("WorkerType", None)
+                details["NumberOfWorkers"] = final_execution_details.get("NumberOfWorkers", None)
+                details["GlueVersion"] = final_execution_details.get("GlueVersion", None)
+
+                job_run_state = final_execution_details.get("JobRunState", None)
+                # Adding error message if the JobRun FAILED OR TIMEDOUT
+                if job_run_state == "FAILED" or job_run_state == "TIMEOUT":
+                    details["ErrorMessage"] = final_execution_details["ErrorMessage"]
+                    details["Timeout"] = final_execution_details["Timeout"]
+
+                execution_details.update({"details": details})
+
+            # Extract SLOT info
+            if active_compute_record.slot:
+                slot = dict()
+                slot["type"] = active_compute_record.slot.type
+                slot["lang"] = active_compute_record.slot.code_lang
+                slot["code"] = active_compute_record.slot.code
+                slot["code_abi"] = active_compute_record.slot.code_abi
+
+                execution_details.update({"slot": slot})
+
+            return execution_details

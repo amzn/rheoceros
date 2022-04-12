@@ -178,6 +178,12 @@ class TestAWSApplicationAdvancedInputModes(AWSTestBase):
             compute_targets=[NOOPCompute],
         )
 
+        # SERIALIZATION: inject serialize/deserialize sequence for enhanced serialization coverage
+        json_str = app.dev_context.to_json()
+        dev_context = CoreData.from_json(json_str)
+        app._dev_context = dev_context
+        #
+
         app.activate(allow_concurrent_executions=False)
 
         # now this should create an avalanche in the pipeline down to the final node
@@ -251,6 +257,12 @@ class TestAWSApplicationAdvancedInputModes(AWSTestBase):
         second_layer_ranged_data = app.create_data(
             id="ranged_internal_data", inputs=[default_selection_features["NA"][:-2].range_check(True)], compute_targets=[NOOPCompute]
         )
+
+        # SERIALIZATION: inject serialize/deserialize sequence for enhanced serialization coverage
+        json_str = app.dev_context.to_json()
+        dev_context = CoreData.from_json(json_str)
+        app._dev_context = dev_context
+        #
 
         app.activate(allow_concurrent_executions=False)
 
@@ -458,6 +470,11 @@ class TestAWSApplicationAdvancedInputModes(AWSTestBase):
             inputs={"offline_training_data": eureka_offline_training_data, "offline_data": eureka_offline_all_data[:-7].nearest()},
             compute_targets=[NOOPCompute],  # when inputs are ready, trigger the following
         )
+        # SERIALIZATION: inject serialize/deserialize sequence for enhanced serialization coverage
+        json_str = app.dev_context.to_json()
+        dev_context = CoreData.from_json(json_str)
+        app._dev_context = dev_context
+        #
 
         # happy path, system will satisfy both inputs and nearest will operate as a normal input over the same date
         # partition. no difference here.
@@ -546,6 +563,13 @@ class TestAWSApplicationAdvancedInputModes(AWSTestBase):
             ],
             compute_targets=[NOOPCompute],  # when inputs are ready, trigger the following
         )
+
+        # SERIALIZATION: inject serialize/deserialize sequence for enhanced serialization coverage
+        json_str = app.dev_context.to_json()
+        dev_context = CoreData.from_json(json_str)
+        app._dev_context = dev_context
+        #
+
         # again this trivial case should succeed as usual
         assert app.execute(default_selection_features["2020-04-01"])
         assert len(app.get_active_route(default_selection_features).route.pending_nodes) == 0
@@ -730,6 +754,12 @@ class TestAWSApplicationAdvancedInputModes(AWSTestBase):
         data2 = app.create_data(id="data_with_dims", output_dimension_spec={"day": {type: Type.DATETIME}}, compute_targets=[NOOPCompute])
 
         data2_1 = app.create_data(id="data_lvl_2", inputs=[data2], compute_targets=[NOOPCompute])
+
+        # SERIALIZATION: inject serialize/deserialize sequence for enhanced serialization coverage
+        json_str = app.dev_context.to_json()
+        dev_context = CoreData.from_json(json_str)
+        app._dev_context = dev_context
+        #
 
         app.activate()
 

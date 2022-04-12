@@ -312,6 +312,25 @@ class BasicBatchDataInputMap(CoreData):
         )
 
 
+def create_output_dimension_map(materialized_output: Signal) -> Dict[str, Any]:
+    return {
+        dimension.name: dimension.value
+        for dimension in materialized_output.domain_spec.dimension_filter_spec.get_flattened_dimension_map().values()
+    }
+
+
+def create_pending_output_dimension_map(
+    pending_node: "RuntimeLinkNode", output: "Signal", output_dim_matrix: "DimensionLinkMatrix"
+) -> Dict[str, Any]:
+    materialized_output: Signal = None
+    try:
+        # unmaterialized dimensions will like '*' (for Any) and/or ':+/-range' (for Relative) thanks to 'force'
+        materialized_output = pending_node.materialize_output(output, output_dim_matrix, force=True)
+    except:
+        pass
+    return create_output_dimension_map(materialized_output) if materialized_output else {}
+
+
 class BasicBatchDataOutput(CoreData):
     def __init__(self, output: Signal) -> None:
         self.output = output
@@ -333,9 +352,6 @@ class BasicBatchDataOutput(CoreData):
                 "delimiter": self.output.resource_access_spec.data_delimiter,
                 "if_signal_type": self.output.type.value,
                 "serialized_signal": self.output.serialize(),
-                "dimension_map": {
-                    dimension.name: dimension.value
-                    for dimension in self.output.domain_spec.dimension_filter_spec.get_flattened_dimension_map().values()
-                },
+                "dimension_map": create_output_dimension_map(self.output),
             }
         )

@@ -300,6 +300,12 @@ class TestAWSApplicationHybridCompute(AWSTestBase):
             ],
         )
 
+        # SERIALIZATION: inject serialize/deserialize sequence for enhanced serialization coverage
+        json_str = app.dev_context.to_json()
+        dev_context = CoreData.from_json(json_str)
+        app._dev_context = dev_context
+        #
+
         app.activate()
 
         def glue_driver_compute_method_impl(
@@ -470,6 +476,12 @@ class TestAWSApplicationHybridCompute(AWSTestBase):
             ],
         )
 
+        # SERIALIZATION: inject serialize/deserialize sequence for enhanced serialization coverage
+        json_str = app.dev_context.to_json()
+        dev_context = CoreData.from_json(json_str)
+        app._dev_context = dev_context
+        #
+
         app.activate()
 
         def glue_driver_compute_method_impl(
@@ -613,6 +625,12 @@ class TestAWSApplicationHybridCompute(AWSTestBase):
         app.platform.batch_compute._drivers[0].compute = MagicMock(side_effect=athena_driver_compute_method_impl)
         app.platform.batch_compute._drivers[0].get_session_state = MagicMock(side_effect=athena_driver_get_session_state_impl)
         # END patch
+
+        # SERIALIZATION: inject serialize/deserialize sequence for enhanced serialization coverage
+        json_str = app.dev_context.to_json()
+        dev_context = CoreData.from_json(json_str)
+        app._dev_context = dev_context
+        #
 
         app.execute(presto_node, wait=False)
 

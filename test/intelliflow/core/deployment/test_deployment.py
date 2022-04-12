@@ -110,6 +110,7 @@ class TestDeployment:
             assert "dummy_dependency2/__init__.py" not in archieve_index
             # extra modules
             assert "test/intelliflow/core/deployment/dummy_extra_module/__init__.py" not in archieve_index
+            assert "test/intelliflow/core/deployment/__init__.py" not in archieve_index
 
         with pytest.raises(ValueError):
             DeploymentConfiguration.app_extra_modules = "wrong type"
@@ -126,6 +127,10 @@ class TestDeployment:
             # extra modules
             # Please note that imported obeying the entire module hierarchy (major diff between extra package and module declarations)
             assert "test/intelliflow/core/deployment/dummy_extra_module/__init__.py" in archieve_index
+            assert "test/intelliflow/core/deployment/__init__.py" in archieve_index
+            assert "test/intelliflow/core/__init__.py" in archieve_index
+            assert "test/intelliflow/__init__.py" in archieve_index
+            assert "test/__init__.py" in archieve_index
 
         with pytest.raises(ValueError):
             DeploymentConfiguration.app_extra_package_paths = "bad type"

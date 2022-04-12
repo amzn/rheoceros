@@ -33,7 +33,7 @@ class _ExecutionInitHookParamExtractor(
         route_record: "RoutingTable.RouteRecord",
         execution_context: "Route.ExecutionContext",
         current_timestamp_in_utc: int,
-        **params
+        **params,
     ) -> Tuple["RoutingTable", "RoutingTable.RouteRecord", "Route.ExecutionContext", int, dict]:
         return routing_table, route_record, execution_context, current_timestamp_in_utc, params
 
@@ -52,7 +52,7 @@ class _ExecutionContextHookParamExtractor(
         materialized_inputs: List[Signal],
         materialized_output: Signal,
         current_timestamp_in_utc: int,
-        **params
+        **params,
     ) -> Tuple["RoutingTable", "RoutingTable.RouteRecord", str, List[Signal], Signal, int, dict]:
         return routing_table, route_record, execution_context_id, materialized_inputs, materialized_output, current_timestamp_in_utc, params
 
@@ -71,7 +71,7 @@ class _ComputeHookParamExtractor(
         route_record: "RoutingTable.RouteRecord",
         compute_record: "RoutingTable.ComputeRecord",
         current_timestamp_in_utc: int,
-        **params
+        **params,
     ) -> Tuple["RoutingTable", "RoutingTable.RouteRecord", "RoutingTable.ComputeRecord", int, dict]:
         return routing_table, route_record, compute_record, current_timestamp_in_utc, params
 
@@ -88,7 +88,7 @@ class _ExecutionCheckPointHookParamExtractor(RoutingHookInterface.Execution.IExe
         active_compute_records: List["RoutingTable.ComputeRecord"],
         checkpoint_in_secs: int,
         current_timestamp_in_utc: int,
-        **params
+        **params,
     ) -> Tuple["RoutingTable", "RoutingTable.RouteRecord", str, "RoutingTable.ComputeRecord", int, int, dict]:
         return (
             routing_table,
@@ -111,7 +111,7 @@ class _PendingNodeHookParamExtractor(RoutingHookInterface.PendingNode.IPendingNo
         route_record: "RoutingTable.RouteRecord",
         pending_node: "RuntimeLinkNode",
         current_timestamp_in_utc: int,
-        **params
+        **params,
     ) -> Tuple["RoutingTable", "RoutingTable.RouteRecord", "RuntimeLinkNode", int, dict]:
         return routing_table, route_record, pending_node, current_timestamp_in_utc, params
 
@@ -127,7 +127,7 @@ class _PendingNodeCheckpointHookParamExtractor(RoutingHookInterface.PendingNode.
         pending_node: "RuntimeLinkNode",
         checkpoint_in_secs: int,
         current_timestamp_in_utc: int,
-        **params
+        **params,
     ) -> Tuple["RoutingTable", "RoutingTable.RouteRecord", "RuntimeLinkNode", int, int, dict]:
         return routing_table, route_record, pending_node, checkpoint_in_secs, current_timestamp_in_utc, params
 
@@ -151,15 +151,24 @@ def _cleanup_params(params):
         del params[AWSCommonParams.IF_ADMIN_ACCESS_PAIR]
 
 
-def get_compute_record_information(compute_record) -> Dict[str, Any]:
+def get_compute_record_information(compute_record, routing_table: "RoutingTable") -> Dict[str, Any]:
+    compute_record_details = routing_table.describe_compute_record(compute_record)
     compute_record_info = {
         "trigger_timestamp_utc": compute_record.trigger_timestamp_utc,
         "deactivated_timestamp_utc": compute_record.deactivated_timestamp_utc,
         "state": repr(compute_record.state),
-        "session_state": repr(compute_record.session_state),
         "number_of_attempts_on_failure": compute_record.number_of_attempts_on_failure,
-        "slot": repr(compute_record.slot),
     }
+    if not compute_record_details:
+        message = f"Could not retrieve details for compute record from the platform! Record: {compute_record}"
+        compute_record_info.update({"slot": repr(compute_record.slot), "details": message})
+    else:
+        compute_record_info.update(
+            {
+                "slot": compute_record_details.get("slot", None),
+                "details": compute_record_details.get("details", None),
+            }
+        )
     return compute_record_info
 
 
@@ -214,7 +223,7 @@ def get_route_information_from_callback(
     input_map_OR_routing_table: Union[Dict[str, Signal], "RoutingTable"],
     materialized_output_OR_route_record: Union[Signal, "RoutingTable.RouteRecord"],
     *args,
-    **params
+    **params,
 ) -> Tuple[str, str]:
     """Returns a tuple of (RoutID <str>, repr'd Node information dict <str>)"""
     inlined_compute_args = InlinedComputeParamExtractor(input_map_OR_routing_table, materialized_output_OR_route_record, *args, **params)
@@ -260,7 +269,7 @@ def get_route_information_from_callback(
             input_map = {input.alias: input for input in materialized_inputs}
             materialized_output: Signal = compute_record.materialized_output
             node_info = get_node_information(params, input_map, materialized_output)
-            node_info.update({"COMPUTE_RECORD": get_compute_record_information(compute_record)})
+            node_info.update({"COMPUTE_RECORD": get_compute_record_information(compute_record, routing_table)})
         elif callback_type in [RoutingHookInterface.Execution.IExecutionCheckpointHook]:
             _, _, _, active_compute_records, _, _, _ = ExecutionCheckPointHookParamExtractor(
                 input_map_OR_routing_table, materialized_output_OR_route_record, *args, **params
@@ -270,7 +279,11 @@ def get_route_information_from_callback(
             materialized_output: Signal = active_compute_records[0].materialized_output
             node_info = get_node_information(params, input_map, materialized_output)
             node_info.update(
-                {"COMPUTE_RECORDS": [get_compute_record_information(compute_record) for compute_record in active_compute_records]}
+                {
+                    "COMPUTE_RECORDS": [
+                        get_compute_record_information(compute_record, routing_table) for compute_record in active_compute_records
+                    ]
+                }
             )
         elif callback_type in [
             RoutingHookInterface.PendingNode.IPendingNodeCreationHook,

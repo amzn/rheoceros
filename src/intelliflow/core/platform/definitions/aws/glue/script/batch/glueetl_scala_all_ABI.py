@@ -222,62 +222,83 @@ object {self.CLASS_NAME} {{
         }}
 
         var input_df: Dataset[Row] = null
-        var new_df: Dataset[Row] = null
-        for ((resource_path, i) <- input("resource_materialized_paths").asInstanceOf[List[String]].zipWithIndex) {{
-            breakable {{
-                if (database != null && table_name != null) {{
-                    val partition_keys = input("partition_keys").asInstanceOf[Seq[String]]
-                    var next_partitions = input("partitions").asInstanceOf[Seq[Seq[Any]]]
-                    if (partition_keys.size > 0) {{
-                        // leave the current partition only (e.g [["US", "20220206"]]
-                        next_partitions = next_partitions.zipWithIndex.filter{{case (part, index) => index == i }}.map(_._1)
-                    }}
-                    if (next_partitions.size == 0 || !(input("range_check_required").asInstanceOf[Boolean] || input("nearest_the_tip_in_range").asInstanceOf[Boolean]) || is_partition_present(glue_client, database, table_name, next_partitions(0).map(_.toString))) {{
-                        new_df = spark.sql(create_query(database, table_name, partition_keys, next_partitions))
-                    }} else if (!input("range_check_required").asInstanceOf[Boolean]) {{
-                        logger.error("%s path does not exist. Since range check is not required. Continuing with next available path".format(resource_path))
-                        break
-                    }} else {{
-                        throw new RuntimeException(s"""%s path does not exist!
-                                                   Either there is a problem with range_check mechanism or the partition has been deleted 
-                                                   after the execution has started.""".format(resource_path))
-                    }}
-                }} else {{
-                    try {{
-                            new_df = spark.read.format(input("data_format").asInstanceOf[String])
-                                               .option("delimiter", input("delimiter").asInstanceOf[String])
-                                               .option("header", "true")
-                                               .option("inferSchema", "true")
-                                               .load(resource_path)
-                    }}
-                    //Path not found exception is considered Analysis Exception within Spark code. Please check the
-                    //link below for reference.
-                    //https://github.com/apache/spark/blob/1b609c7dcfc3a30aefff12a71aac5c1d6273b2c0/sql/catalyst/src/main/scala/org/apache/spark/sql/errors/QueryCompilationErrors.scala#L977
-                    catch {{
-                        case e: AnalysisException => {{
-                            if (e.message.contains("Path does not exist") && (!input("range_check_required").asInstanceOf[Boolean])) {{
-                                logger.error("%s path does not exist. Since range check is not required. Continuing with next available path".format(resource_path))
-                                break
+        breakable {{ // for 'break' logic
+            for ((resource_path_org, i) <- input("resource_materialized_paths").asInstanceOf[List[String]].zipWithIndex) {{
+                var resource_path: String = resource_path_org
+                var new_df: Dataset[Row] = null
+                breakable {{  // for 'continue' logic
+                    if (database != null && table_name != null) {{
+                        val partition_keys = input("partition_keys").asInstanceOf[Seq[String]]
+                        var next_partitions = input("partitions").asInstanceOf[Seq[Seq[Any]]]
+                        if (partition_keys.size > 0) {{
+                            // leave the current partition only (e.g [["US", "20220206"]]
+                            next_partitions = next_partitions.zipWithIndex.filter{{case (part, index) => index == i }}.map(_._1)
+                        }}
+                        if (next_partitions.size == 0 || !(input("range_check_required").asInstanceOf[Boolean] || input("nearest_the_tip_in_range").asInstanceOf[Boolean]) || is_partition_present(glue_client, database, table_name, next_partitions(0).map(_.toString))) {{
+                            if (resource_type == "S3") {{
+                                // keep the path as is if no partitions (direct access via Spark down there)
+                                if (partition_keys.size > 0) {{
+                                    val partition = get_partition(glue_client, database, table_name, next_partitions(0).map(_.toString))
+                                    if (partition == null) {{
+                                        if (!input("range_check_required").asInstanceOf[Boolean]) {{
+                                            logger.error("%s path does not exist. Since range check is not required. Continuing with next available path".format(resource_path))
+                                            break
+                                        }} else {{
+                                            throw new RuntimeException(s"""%s path does not exist!
+                                                                       Either there is a problem with range_check mechanism or the partition has been deleted 
+                                                                       after the execution has started.""".format(resource_path))
+                                        }}
+                                    }} else {{
+                                        resource_path = partition.getPartition.getStorageDescriptor.getLocation
+                                    }}
+                                }} 
                             }} else {{
-                                throw e
+                                new_df = spark.sql(create_query(database, table_name, partition_keys, next_partitions))
                             }}
-                        }}     
+                        }} else if (!input("range_check_required").asInstanceOf[Boolean]) {{
+                            logger.error("%s path does not exist. Since range check is not required. Continuing with next available path.".format(resource_path))
+                            break
+                        }} else {{
+                            throw new RuntimeException(s"""%s path does not exist!
+                                                       Either there is a problem with range_check mechanism or the partition has been deleted 
+                                                       after the execution has started.""".format(resource_path))
+                        }}
+                    }} 
+                    if (new_df == null) {{
+                        try {{
+                                new_df = spark.read.format(input("data_format").asInstanceOf[String])
+                                                   .option("delimiter", input("delimiter").asInstanceOf[String])
+                                                   .option("header", "true")
+                                                   .option("inferSchema", "true")
+                                                   .load(resource_path)
+                        }}
+                        //Path not found exception is considered Analysis Exception within Spark code. Please check the
+                        //link below for reference.
+                        //https://github.com/apache/spark/blob/1b609c7dcfc3a30aefff12a71aac5c1d6273b2c0/sql/catalyst/src/main/scala/org/apache/spark/sql/errors/QueryCompilationErrors.scala#L977
+                        catch {{
+                            case e: AnalysisException => {{
+                                if (e.message.contains("Path does not exist") && (!input("range_check_required").asInstanceOf[Boolean])) {{
+                                    logger.error("%s path does not exist. Since range check is not required. Continuing with next available path.".format(resource_path))
+                                    break
+                                }} else {{
+                                    throw e
+                                }}
+                            }}     
+                        }}
                     }}
+                }}  //breakable
+                if (input_df == null) {{
+                    input_df = new_df
+                }} else {{
+                    input_df = input_df.unionAll(new_df)
                 }}
-            }}
-            if (input_df == null) {{
-                input_df = new_df
-            }} else {{
-                input_df = input_df.unionAll(new_df)
-            }}
-            if (input("nearest_the_tip_in_range").asInstanceOf[Boolean]) {{
-                break
+                if (input_df != null && input("nearest_the_tip_in_range").asInstanceOf[Boolean]) {{
+                    break
+                }}
             }}
         }}
         if (input_df == null) {{
-            logger.error("Looks like none of the input materialised path exist for this input: %s. Check input details below".format(JSONObject(input.toMap).toString()))
-            logger.error("Refer input materialised paths: %s".format(input("resource_materialized_paths").asInstanceOf[List[String]].mkString(" ")))
-            throw new RuntimeException("input_df is None. Couldnt find any materialised path for this input: %s".format(JSONObject(input.toMap).toString()))
+            throw new RuntimeException("input_df is None. Couldnt find any materialised path for this input: %s".format(input("resource_materialized_paths").asInstanceOf[List[String]].mkString(" ")))
         }}
         input_df
     }}

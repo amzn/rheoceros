@@ -9,14 +9,19 @@ from intelliflow.core.platform.definitions.aws.common import CommonParams as AWS
 from intelliflow.core.platform.definitions.aws.glue import catalog as glue_catalog
 from intelliflow.core.platform.definitions.aws.glue.catalog import GlueTableDesc
 from intelliflow.core.platform.development import HostPlatform
+from intelliflow.core.serialization import Serializable
 from intelliflow.core.signal_processing import DimensionFilter, DimensionSpec, Signal, SignalDomainSpec, Slot
 from intelliflow.core.signal_processing.signal import SignalType
 from intelliflow.core.signal_processing.signal_source import (
     COMPUTE_HINTS_KEY,
+    DATA_FORMAT_KEY,
+    DATASET_FORMAT_KEY,
+    DATASET_TYPE_KEY,
     DIMENSION_PLACEHOLDER_FORMAT,
     ENCRYPTION_KEY_KEY,
     PARTITION_KEYS_KEY,
     PRIMARY_KEYS_KEY,
+    DatasetSignalSourceFormat,
     GlueTableSignalSourceAccessSpec,
     S3SignalSourceAccessSpec,
     SignalSourceAccessSpec,
@@ -31,7 +36,7 @@ logger = logging.getLogger(__name__)
 class ExternalDataNode(DataNode, ABC):
     """Common base class external data providers."""
 
-    class Descriptor(ABC):
+    class Descriptor(Serializable):
         def __init__(self, **kwargs) -> None:
             self._data_kwargs: Dict[str, Any] = dict(kwargs)
             self._proxy: ExternalDataNode.Descriptor = None
@@ -297,6 +302,30 @@ class GlueTableDataNode(ExternalDataNode):
                 s3_access_spec = cast("S3SignalSourceAccessSpec", table_as_signal.resource_access_spec)
                 if s3_access_spec.encryption_key and not self._data_kwargs.get(ENCRYPTION_KEY_KEY, None):
                     raise ValueError(f"'encryption_key' should be provided for table {self._table_name!r} in database: {self._database!r}!")
+
+                data_format = s3_access_spec.attrs.get(DATA_FORMAT_KEY, None)
+                if data_format:
+                    if DATA_FORMAT_KEY in new_kwargs or DATASET_FORMAT_KEY in new_kwargs:
+                        user_data_format = new_kwargs.get(DATA_FORMAT_KEY, new_kwargs[DATASET_FORMAT_KEY])
+                        if user_data_format is not None and DatasetSignalSourceFormat(user_data_format) != data_format:
+                            raise ValueError(
+                                f"Data format does not match the value for S3 dataset {self._table_name!r}"
+                                f" in database: {self._database!r}!"
+                                f" User provided format : {user_data_format!r},"
+                                f" keys in the catalog: {data_format!r}"
+                            )
+                    else:
+                        new_kwargs.update({DATA_FORMAT_KEY: data_format})
+
+                if self._partition_keys is not None and self._partition_keys != s3_access_spec.partition_keys:
+                    raise ValueError(
+                        f"Partition keys don't match the value for S3 dataset {self._table_name!r}"
+                        f" in database: {self._database!r}!"
+                        f" User keys: {self._partition_keys!r},"
+                        f" keys in the catalog: {s3_access_spec.partition_keys!r}"
+                    )
+                self._partition_keys = s3_access_spec.partition_keys
+
                 # if the user has provided the account_id (as metadata, etc), honor it otherwise always default to
                 #  'catalog' module retrieved account_id (which does not exist for S3 datasets right now [None),
                 #  then fall back to the account_id of the current session.

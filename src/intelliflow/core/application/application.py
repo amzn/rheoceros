@@ -4,6 +4,7 @@
 import copy
 import logging
 import time
+from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Type, Union, cast
 
@@ -434,8 +435,11 @@ class Application(CoreApplication):
 
             # check whether the node exists in the current dev context. if the user pulled in an active node without
             # adding it to the dev-context, then extracting metrics and using them in downstream alarms would be
-            # a false-promise (also an obscure) bug (aka bad, broken routing) for the user.
-            if not self._is_data_updated(internal_data_node.data_id):
+            # a false-promise (also an obscure) bug (broken routing) for the user.
+            dev_version = self.get_data(
+                internal_data_node.data_id, Application.QueryApplicationScope.CURRENT_APP_ONLY, Application.QueryContext.DEV_CONTEXT
+            )
+            if not dev_version:
                 raise ValueError(
                     f"Node {internal_data_node.data_id!r} provided as 'route' parameter to "
                     f"'get_route_metrics' has not been added to new development context! Extracting"
@@ -1865,13 +1869,24 @@ class Application(CoreApplication):
         )
 
     def _is_data_updated(self, internal_data_id: str) -> bool:
-        """Checks whether the internal data has been just created or updated during this development session.
+        """Checks whether the internal data has been updated during this development session.
 
-        It is mainly used by Application::poll and Application::execute APIs.
+        It is mainly used by Application::poll, Application::kill and Application::execute APIs.
         """
-        return bool(
-            self.get_data(internal_data_id, Application.QueryApplicationScope.CURRENT_APP_ONLY, Application.QueryContext.DEV_CONTEXT)
+        active_version = self.get_data(
+            internal_data_id, Application.QueryApplicationScope.CURRENT_APP_ONLY, Application.QueryContext.ACTIVE_RUNTIME_CONTEXT
         )
+        if active_version:
+            updated_version = self.get_data(
+                internal_data_id, Application.QueryApplicationScope.CURRENT_APP_ONLY, Application.QueryContext.DEV_CONTEXT
+            )
+            if updated_version:
+                active_route = cast(InternalDataNode, active_version[0].bound).create_route()
+                dev_route = cast(InternalDataNode, updated_version[0].bound).create_route()
+                if not active_route.check_integrity(dev_route):
+                    return True
+
+        return False
 
     def poll(
         self, output: Union[MarshalingView, MarshalerNode], datum: Optional[Union["datetime", int]] = None
@@ -1943,8 +1958,6 @@ class Application(CoreApplication):
                         f" detect completions for ongoing/active executions or inactive ones."
                     )
         if datum is not None:
-            from datetime import datetime
-
             if isinstance(datum, datetime):
                 datum = int(datum.timestamp())
             elif not isinstance(datum, int):
@@ -2133,7 +2146,7 @@ class Application(CoreApplication):
             else:
                 if self._is_data_updated(internal_data_node.data_id):
                     logger.warning(
-                        f"Killing an updated data node {internal_data_node.data_id!r}"
+                        f"Kill operation on an updated data node {internal_data_node.data_id!r}"
                         f" without activation might yield unexpected results! Kill action"
                         f" might be safe if dimension spec is still consistent"
                         f" with the previous version. Similarly it might not be able to"
@@ -2170,6 +2183,134 @@ class Application(CoreApplication):
             logger.critical("No active execution on output!")
         return False
 
+    def _is_executable(self, signal: Signal) -> bool:
+        return (
+            signal.resource_access_spec.source == SignalSourceType.INTERNAL
+            and signal.resource_access_spec.get_owner_context_uuid() == self.uuid
+        )
+
+    def _execute_recursive(
+        self,
+        output_node: MarshalerNode,
+        inputs: Sequence[Union[FilteredView, MarshalerNode, Signal]],
+        wait: bool,
+    ) -> Sequence[int]:
+        """Internal executor impl designed to crawl up the dependency chain of a node given as a 'target' to
+        Application::execute API.
+
+        Once called by 'execute' API, it checks each input range and recursively do new 'execute' call for each
+        missing resource (e.g partition)
+
+        :returns indexes of 'inputs' whose TIPs are triggered. this list is then used by 'execute' API to avoid
+        redundant event injections via process API.
+        """
+        internal_data_node = cast(InternalDataNode, output_node.bound)
+        instructions: List[Instruction] = self._dev_context.get_instructions(output_node)
+        inst: Instruction = instructions[-1:][0]
+
+        input_signals = [self._get_input_signal(input) if not isinstance(input, Signal) else input for input in inputs]
+        input_signals = self._check_upstream(input_signals)
+
+        # reset alias' (otherwise RuntimeLinkNode:receive won't work)
+        input_signals = [signal.clone(None) for signal in input_signals]
+
+        signal_link_node = copy.deepcopy(internal_data_node.signal_link_node)
+        # - enable range_check (if not range_check or nearest_in_range enabled already), so that RuntimeLinkNode scans all
+        signal_link_node._signals = [
+            (signal.range_check(True) if not signal.nearest_the_tip_in_range else signal) for signal in signal_link_node._signals
+        ]
+        # create a temporary link node to take advantage of routing modules dependency check mechanism.
+        link_node = RuntimeLinkNode(signal_link_node)
+        for i, signal in enumerate(input_signals):
+            # input signal here can represent a range, we need to use ONLY_HEAD (TIP) because we want link_node to do
+            # range_check (dependency check) on trigger group represented by the TIP. We don't want link_node to
+            signal = signal.tip()
+            # update_ranges=False, otherwise link_node internally assumes the TIP of the range of the signal to be ready
+            link_node.receive(signal, update_ranges=False)
+
+        executed_input_indexes = []
+        # we keep polling here because link_node will not do an exhaustive scan of all of the incomplete paths.
+        # - therefore we preemptively loop here, knowing that particularly for 'ranged' inputs we'd need multiple passes
+        # - this also has a positive side-effect (as compared to a one-time cached list of incomplete paths). that effect
+        # is the opportunity to sync with the outcome of executions triggered by asynchronous external events in remote
+        # orchestration.
+        while not link_node.is_ready(check_ranges=True, platform=self.platform):
+            # analyze the inputs that are not ready
+            #  - if internal:
+            #     - if nearest_the_tip_in_range
+            #        - call 'execute' on the nearest only
+            #     - else
+            #        call 'execute' recursively on all missing ranges
+            #  - else
+            #      error out
+            for i, ready_signal in enumerate(link_node.ready_signals):
+                # we are just trying to access the reference of parent node, so picking the first link here is jut fine.
+                input_node: MarshalerNode = inst.get_inbound_links(ready_signal)[0].instruction.output_node
+                analysis_result: "_SignalAnalysisResult" = link_node.range_check_state.get(ready_signal.unique_key(), None)
+                if analysis_result is None:
+                    # since link_node.is_ready does not do an exhaustive scan, ready_signal might not have checked yet.
+                    # probabyly a preceding ready_signal was the reason for the False result from is_ready in the previous
+                    # iteration.
+                    continue
+                if ready_signal.nearest_the_tip_in_range:
+                    # check completion condition for nearest check is not True. if any of the completed paths are done, then
+                    # range-check for this signal is ready.
+                    if not (analysis_result and analysis_result.completed_paths):
+                        # this is enough for us to confidently say it is not ready for 'nearest_the_tip_in_range = True' case.
+                        if not self._is_executable(ready_signal):
+                            raise ValueError(
+                                f"Recursive execution on {internal_data_node.data_id!r} cannot proceed due to missing data on external "
+                                f"input {ready_signal.alias!r}! At least one path from the following list "
+                                f"should be available: {analysis_result.remaining_paths}"
+                            )
+                        input_view = input_node
+                        partitions = ready_signal.resource_access_spec.get_dimensions(ready_signal.domain_spec.dimension_filter_spec)
+                        # e.g [['NA', '2021-06-21'], ['NA', '2021-06-22']]
+                        if partitions:
+                            # special use-case for 'nearest_the_tip_in_range' just attempt to execute the TIP
+                            partition = partitions[0]
+                            # input_node -> input_node['NA']['2021-06-21']
+                            for dim_value in partition:
+                                input_view = input_view[dim_value]
+                        self.execute(target=input_view, wait=wait, recursive=True)
+                        # only add TIPs (represented by input signals), so in this case it is the TIP by default
+                        executed_input_indexes.append(i)
+                else:
+                    if analysis_result.remaining_paths:
+                        # not ready
+                        if not self._is_executable(ready_signal):
+                            raise ValueError(
+                                f"Recursive execution on {internal_data_node.data_id!r} cannot proceed due to missing data on external "
+                                f"input {ready_signal.alias!r}! The following paths should be available:"
+                                f"{analysis_result.remaining_paths}"
+                            )
+
+                        need_to_enforce_wait = False
+                        if ready_signal.get_materialized_resource_paths()[0] in analysis_result.remaining_paths:
+                            # TIP is missing, add it to executed_input_indexes if so. we do it to avoid caller execution
+                            # context (dependent/child node) calling 'process' on this input.
+                            if i not in executed_input_indexes:
+                                executed_input_indexes.append(i)
+                        else:
+                            # if the range has a gap, we should wait for the range to complete to let outer context
+                            # to inject TIP. If we don't wait then we might have premature execution in outer context because
+                            # 'execute_input_indexes' won't have the TIP (and this will cause injection/process call for it).
+                            # if we add it to 'execute_input_indexes', then injection/process call won't happen but in that
+                            # case implicit event propagation on TIP won't happen either and this would block outer context.
+                            need_to_enforce_wait = True
+
+                        for path in analysis_result.remaining_paths:
+                            # e.g ['NA', 1, '2021-06-21']
+                            dimension_values = ready_signal.extract_dimensions(path)
+
+                            input_view = input_node
+                            # input_node -> input_node['NA'][1]['2021-06-21']
+                            for dim_value in dimension_values:
+                                input_view = input_view[dim_value]
+                            self.execute(target=input_view, wait=need_to_enforce_wait or wait, recursive=True)
+
+        return executed_input_indexes
+
     def execute(
         self,
         target: Union[MarshalingView, MarshalerNode],
@@ -2177,6 +2318,7 @@ class Application(CoreApplication):
             Union[Sequence[Union[Signal, FilteredView, MarshalerNode]], Union[Signal, FilteredView, MarshalerNode]]
         ] = None,
         wait: Optional[bool] = True,
+        recursive: bool = False,
     ) -> str:
         """Activates the application and starts an execution only against the input data node using the materialized
         input signals.
@@ -2193,6 +2335,11 @@ class Application(CoreApplication):
         :param material_inputs: Materialized inputs of the input data node ('target'). This parameter can be left empty
         in cases where 'target' (as output) is trivially bound to its inputs over basic dimensional equality and also
         it is materialized. In those cases, RheocerOS can auto-generate the material versions of the inputs.
+        :param wait: convenience feature to keep polling until the execution is over. if set to False then execution
+        happens asynchronously (to hook up with the execution again, Application::poll API can be used with the same
+        target).
+        :param recursive: traverse the upstream dependency chain (ancestor nodes) and execute them (if required) to
+        make sure that desired execution on target would not fail due to missing data on inputs.
 
         :returns a materialized/physical resource path that represents the outcome of this execution on 'target'.
 
@@ -2208,7 +2355,7 @@ class Application(CoreApplication):
             raise ValueError(f"Wrong input type {type(target)} for Application::execute API.")
 
         if not isinstance(node.bound, InternalDataNode):
-            raise ValueError(f"Can only execute internal data nodes!")
+            raise ValueError(f"Can only execute internal data nodes! Following input node is non-executable : {node.bound!r}")
 
         internal_data_node = cast(InternalDataNode, node.bound)
 
@@ -2349,6 +2496,70 @@ class Application(CoreApplication):
                 if not active_route.check_integrity(dev_route):
                     logger.critical(f"Activating the application since the node/route {internal_data_node.data_id!r} is updated...")
                     self.activate()
+        # 1.2 - check upstream if 'recursive' is True, just before injecting inputs into the system
+        #
+        # technically we have to recurse with 'wait=True', otherwise here is the challenge:
+        #  - some of the inputs might actually be ready but their range might have missing data
+        #     - these inputs won't be in 'triggered_input_indexes' because only the TIPs should be there
+        #     - if we attempt to include them in that list, then they will never get satisfied (via process call below)
+        # as upstream executions are working on other resources (partitions) from the range. there will be no event
+        # propagation in the orchestration for these because they were already completed before this workflow.
+        #     - if we exclude them from the list (as suggested) BUT recurse with wait=False, they will be injected
+        # in the rest of this workflow via process API, which would cause premature execution, violating the whole
+        # purpose of 'recurse' functionality in this API. It would be premature because recursively triggered executions
+        # on other resources/paths from the problematic ranges would still be going on.
+        # Of course this consideration applies to inputs with range_check=True and with actual ranges ( paths > 1 ).
+        #
+        # So today, we will use this condition to enforce 'wait=True' in recursive execution on an input
+        # with existing TIP but a missing data in its range.
+        recursion_datum: datetime = datetime.utcnow()
+        recursively_triggered_input_indexes = self._execute_recursive(node, inputs, wait=wait) if recursive else []
+        recursively_triggered_aliases = [alias_list[i] for i in alias_list if i in recursively_triggered_input_indexes]
+        if set(recursively_triggered_input_indexes).issuperset([j for j, s in enumerate(input_signals) if not s.is_dependent]):
+            # necessary trigger condition is already satisfied and remote orchestration might have initiated it already.
+            # try to hook up with the execution that would have started after 'recursion_datum'.
+            logger.critical(f"All of the independent input signals {recursively_triggered_aliases!r} have been triggered recursively!")
+            if wait:
+                logger.critical("Execution must have started automatically.")
+                # Processor might not have picked the last independent event yet
+                path, records = self.poll(target, datum=recursion_datum)
+                if path:
+                    return path
+                elif records:
+                    failed_records = [
+                        compute_record
+                        for compute_record in records
+                        if compute_record.session_state and compute_record.session_state.state_type == ComputeSessionStateType.FAILED
+                    ]
+                    raise RuntimeError(f"Execution has failed! Failed records: {[failed_records]!r}")
+                else:
+                    logger.critical(f"Execution could not be detected yet.")
+                    logger.critical(f"Waiting for 60 seconds...")
+                    time.sleep(60)  # TODO use Processor interval
+                    path, _ = self.poll(target, datum=recursion_datum)
+                    if path:
+                        return path
+                    elif records:
+                        failed_records = [
+                            compute_record
+                            for compute_record in records
+                            if compute_record.session_state and compute_record.session_state.state_type == ComputeSessionStateType.FAILED
+                        ]
+                        raise RuntimeError(f"Execution has failed! Failed records: {[failed_records]!r}")
+
+                raise RuntimeError(
+                    f"Execution on {internal_data_node.data_id!r} "
+                    f"for output: {materialized_output.get_materialized_resource_paths()[0]} must have "
+                    f"started automatically but could not be detected!"
+                )
+            else:
+                logger.critical("Execution will start automatically once all of the inputs are satisfied.")
+                logger.critical(
+                    f"Exiting without waiting for the execution on {internal_data_node.data_id!r}. "
+                    f"You can use Application::poll API on the same output node to hook up with the execution later on."
+                )
+                # materialize and return the full physical path
+                return self._materialize_internal(materialized_output).get_materialized_resource_paths()[0]
 
         # 2- Process the inputs (feed them into the application, order does not matter)
         logger.critical(f"Sending input signals from {alias_list!r} into the system...")
@@ -2356,6 +2567,12 @@ class Application(CoreApplication):
         idempotency_check_detected: bool = False
         while not execution_context_and_records:
             for i, input in enumerate(inputs):
+                if i in recursively_triggered_input_indexes:
+                    logger.critical(
+                        f"Skipping recursively injected input signal {alias_list[i]!r} on execution of {internal_data_node.data_id!r}! "
+                        f"Path: {input_signals[i].get_materialized_resource_paths()[0]!r}"
+                    )
+                    continue
                 response: RoutingTable.Response = self.process(
                     input,
                     # use local Processor for the synchronous logic required here.
@@ -2407,13 +2624,29 @@ class Application(CoreApplication):
                         break
 
             if not execution_context_and_records:
-                if not idempotency_check_detected:
+                # either idempotency or due to recursively triggered inputs (which would require orchestration delay)
+                # we can tolerate an unsuccessful attempt. in other cases error out.
+                # reattempt on recursively triggered inputs is not desirable (with trade-off of having a redundant
+                # pending node) but we favor better UX here.
+                if not (idempotency_check_detected or recursively_triggered_input_indexes):
                     raise RuntimeError(
                         f"Execution could not be started on node: {internal_data_node.data_id!r}! "
-                        f"Check inputs to verify all conditions necessary for the executions exist."
+                        f"Check inputs to verify all conditions necessary for the executions exist (e.g range_check)."
                     )
 
-                # This is a paranoid level handling of a scenario where we would have a concurrent execution
+                if recursively_triggered_input_indexes and not wait:
+                    logger.critical(f"All of the ancestor nodes with missing data have been triggered asynchronously!")
+                    logger.critical("Execution will start automatically once all of the inputs are satisfied.")
+                    logger.critical(
+                        f"Exiting without waiting for the execution on {internal_data_node.data_id!r}. "
+                        f"You can use Application::poll API on the same output node to hook up with the execution later on."
+                    )
+                    # materialize and return the full physical path
+                    return self._materialize_internal(materialized_output).get_materialized_resource_paths()[0]
+
+                # If pending on recursive executions for the TIP of inputs, then we might have to wait for remote
+                # orchestration to interpret them.
+                # If not, then this is just handling of a scenario where we would have a concurrent execution
                 # between active compute records check (previous while loop) and this loop.
                 route_record = self.platform.routing_table.optimistic_read(internal_data_node.route_id)
                 active_records = route_record.get_active_records_of(materialized_output)

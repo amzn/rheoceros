@@ -46,6 +46,12 @@ class TestAWSApplicationExecutionChain(AWSTestBase):
             id="JOIN_NODE", inputs=[repeat_ducsi, ducsi_with_so], compute_targets="output=REPEAT_DUCSI.join(DUCSI_WITH_SO, ['customer_id])"
         )
 
+        # SERIALIZATION: inject serialize/deserialize sequence for enhanced serialization coverage
+        json_str = self.app.dev_context.to_json()
+        dev_context = CoreData.from_json(json_str)
+        self.app._dev_context = dev_context
+        #
+
         self.app.activate()
 
         assert self.app.poll(join_node[1]["2020-12-28"]) == (None, None)

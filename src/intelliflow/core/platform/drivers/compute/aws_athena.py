@@ -961,17 +961,24 @@ class AWSAthenaBatchCompute(AWSConstructMixin, BatchCompute):
                 )
             )
 
-            encryption_key_list: List[str] = [
+            encryption_key_list: Set[str] = {
                 ext_signal.resource_access_spec.encryption_key
                 for ext_signal in ext_s3_signals
                 if ext_signal.resource_access_spec.encryption_key
-            ]
+            }
 
             if encryption_key_list:
                 permissions.append(
                     ConstructPermission(
-                        encryption_key_list,
-                        ["kms:Decrypt", "kms:DescribeKey", "kms:DescribeCustomKeyStores", "kms:ListKeys", "kms:ListAliases"],
+                        list(encryption_key_list),
+                        [
+                            "kms:Decrypt",
+                            "kms:DescribeKey",
+                            "kms:GenerateDataKey",
+                            "kms:DescribeCustomKeyStores",
+                            "kms:ListKeys",
+                            "kms:ListAliases",
+                        ],
                     )
                 )
 
@@ -987,7 +994,6 @@ class AWSAthenaBatchCompute(AWSConstructMixin, BatchCompute):
             # TODO after Athena driver MVP
             #   - use params to narrow down resources,
             #   - move glue actions (from runtime here) and remove database related actions from runtime.
-            # ConstructPermission(["*"], ["glue:*"]),
             # Refer
             #  https://docs.aws.amazon.com/athena/latest/ug/fine-grained-access-to-glue-resources.html
             ConstructPermission(
@@ -1434,3 +1440,26 @@ class AWSAthenaBatchCompute(AWSConstructMixin, BatchCompute):
 
     def _revert_security_conf(selfs, security_conf: ConstructSecurityConf, prev_security_conf: ConstructSecurityConf) -> None:
         pass
+
+    def describe_compute_record(self, active_compute_record: "RoutingTable.ComputeRecord") -> Optional[Dict[str, Any]]:
+        execution_details = dict()
+        if active_compute_record.session_state and active_compute_record.session_state.executions:
+            final_execution_details = active_compute_record.session_state.executions[::-1][0].details
+            if final_execution_details["QueryExecution"]:
+                execution_details["details"] = final_execution_details["QueryExecution"]
+                query_execution_id = execution_details["details"]["QueryExecutionId"]
+                execution_details["details"][
+                    "QueryEditorURL"
+                ] = f"https://{self.region}.console.aws.amazon.com/athena/home?region={self.region}#/query-editor/history/{query_execution_id}"
+
+        # Extract SLOT info
+        if active_compute_record.slot:
+            slot = dict()
+            slot["type"] = active_compute_record.slot.type
+            slot["lang"] = active_compute_record.slot.code_lang
+            slot["code"] = active_compute_record.slot.code
+            slot["code_abi"] = active_compute_record.slot.code_abi
+
+            execution_details.update({"slot": slot})
+
+        return execution_details

@@ -2,4 +2,5 @@
 # SPDX-License-Identifier: Apache-2.0
 
 class EmrAllABIScala:
-    pass
+    def generate_emr_script(self) -> str:
+        return ""
