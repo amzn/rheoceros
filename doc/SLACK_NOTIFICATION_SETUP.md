@@ -1,4 +1,4 @@
-# Slack notification setup for IF apps
+# Slack notification setup for RheocerOS apps
 
 > **⚠ Important:**   
 This implementation relies on Slack workflow to send notifications as a DM or to a specific channel, and free Slack plans does NOT have access to Slack workflows.  
@@ -8,7 +8,7 @@ After finishing the setup, please refer to [slack_notification.py](../examples/s
 ## 1. Create new channel that will receive your push notifications
 > **Note:**   
 > 1. This is optional. You can send direct messages to a slack user. But a channel would be handy to send message to a group of people.
-> 2. One IF app can send notifications to many Slack workflows, but one workflow can only push message to one channel / DM.
+> 2. One RheocerOS app can send notifications to many Slack workflows, but one workflow can only push message to one channel / DM.
 >
 ![slack_doc_img_1](./slack/resources/slack_doc_img_1.png)  
 
@@ -39,7 +39,7 @@ Choose the People or channel to send the message to, then save the configuration
 ***Content*** variable must be part of the message text.
 >
 
-## 5. Publish the workflow and copy the URL, use it as Slack notification recipient in your IF app
+## 5. Publish the workflow and copy the URL, use it as Slack notification recipient in your RheocerOS app
 ![slack_doc_img_7](./slack/resources/slack_doc_img_7.png)
 
 ## 6. Test using Slack Webhook from your computer
