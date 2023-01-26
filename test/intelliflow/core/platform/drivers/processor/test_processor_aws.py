@@ -32,7 +32,7 @@ class TestAWSLambdaProcessorBasic(AWSTestBase, DriverTestUtils):
 
     params = {}
 
-    expected_queue_url = "https://queue.amazonaws.com/123456789012/if-AWSLambdaProcessorBasic-test123-us-east-1-DLQ"
+    expected_queue_url = "https://sqs.us-east-1.amazonaws.com/123456789012/if-AWSLambdaProcessorBasic-test123-us-east-1-DLQ"
     expected_queue_arn = "arn:aws:sqs:us-east-1:123456789012:if-AWSLambdaProcessorBasic-test123-us-east-1-DLQ"
     expected_lambda_arn = "arn:aws:lambda:us-east-1:123456789012:function:if-AWSLambdaProcessorBasic-test123-us-east-1"
     expected_lambda_name = "if-AWSLambdaProcessorBasic-test123-us-east-1"
