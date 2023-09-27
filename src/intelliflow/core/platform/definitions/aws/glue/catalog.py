@@ -109,6 +109,7 @@ def create_signal(glue_client, database_name: str, table_name: str) -> Optional[
         if ex.response["Error"]["Code"] == "EntityNotFoundException":
             return None
         raise
+
     storage_desc: str = table["Table"]["StorageDescriptor"]
     location: str = storage_desc["Location"]
     output_format: str = storage_desc["OutputFormat"]
@@ -222,7 +223,8 @@ def is_partition_present(glue_client, database_name: str, table_name: str, value
     except ClientError as ex:
         if ex.response["Error"]["Code"] == "EntityNotFoundException":
             return False
-        raise
+        else:
+            raise
 
     return partition and partition["Partition"]
 
@@ -240,7 +242,8 @@ def get_location(glue_client, database_name: str, table_name: str, values: List[
     except ClientError as ex:
         if ex.response["Error"]["Code"] == "EntityNotFoundException":
             return None
-        raise
+        else:
+            raise
 
     if partition and ("Partition" in partition) and partition["Partition"]:
         return partition["Partition"]["StorageDescriptor"]["Location"]
@@ -248,7 +251,7 @@ def get_location(glue_client, database_name: str, table_name: str, values: List[
 
 def check_table(session: boto3.Session, region: str, database: str, table_name: str) -> bool:
     """
-    Checks the Glue Catalog for existence of a within a particular database.
+    Checks the Glue Catalog for existence of a table within a particular database.
     :param glue_client: AWS Glue Client
     :param database: Glue Catalog database name
     :param table_name: Glue Catalog table name
@@ -257,10 +260,16 @@ def check_table(session: boto3.Session, region: str, database: str, table_name: 
 
     try:
         glue_client = session.client(service_name="glue", region_name=region)
-        response_get_tables = glue_client.get_tables(DatabaseName=database, MaxResults=1000)
+        response_get_tables = exponential_retry(
+            glue_client.get_tables,
+            ["AccessDeniedException"],  # IAM propagation (dev-role hits this in frontend)
+            DatabaseName=database,
+            MaxResults=1000,
+        )
+
         table_list = response_get_tables["TableList"]
         for table in table_list:
-            if table["Name"] == table_name:
+            if table["Name"] == table_name or table["Name"] == f"{database}.{table_name}":
                 return True
     except ClientError:
         logger.exception("Couldnt fetch table %s from %s database", table_name, database)

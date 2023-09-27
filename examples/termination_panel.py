@@ -31,6 +31,10 @@ for id, region in apps_to_be_removed:
     if app.state in [ApplicationState.ACTIVE, ApplicationState.PAUSED, ApplicationState.TERMINATING]:
         app.terminate()
     logger.critical("Termination complete!")
-    logger.critical("Deleting remote application data / historical data...")
+
+for id, region, account_id in apps_to_be_removed:
+    logger.critical(f"Deleting AWS Application(id={id}, region={region}, account_id={account_id}) ...")
+    app = AWSApplication(id, region, account_id, enforce_runtime_compatibility=False)
     app.delete()
+    logger.critical("Deletion complete!")
 

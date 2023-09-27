@@ -36,8 +36,8 @@ class TestAWSApplicationBuild(AWSTestBase):
         eureka_offline_training_data = app.add_external_data(
             "eureka_training_data",
             S3(
-                "427809481713",
-                "dex-ml-eureka-model-training-data",
+                "321129071393",
+                "dex-olaf-eureka-model-training-data",
                 "cradle_eureka_p3/v8_00/training-data-prod",
                 StringVariant("NA", "region"),
                 AnyDate("my_day_my_way", {"format": "%Y-%m-%d"}),
@@ -47,8 +47,8 @@ class TestAWSApplicationBuild(AWSTestBase):
 
         eureka_offline_all_data = app.marshal_external_data(
             S3Dataset(
-                "427809481713",
-                "dex-ml-eureka-model-training-data",
+                "321129071393",
+                "dex-olaf-eureka-model-training-data",
                 "cradle_eureka_p3/v8_00/all-data-prod",
                 "partition_day={}",
                 dataset_format=DataFormat.CSV,
@@ -453,6 +453,37 @@ class TestAWSApplicationBuild(AWSTestBase):
         assert slots[0].code_lang == Lang.PYTHON
         assert slots[0].code_abi == ABI.GLUE_EMBEDDED
         assert slots[0].code.find("output = input0")
+        self.patch_aws_stop()
+
+    def test_application_create_data_input_aliasing(self):
+        self.patch_aws_start()
+        app = AWSApplication("input-aliasing", self.region)
+
+        daily_timer = app.add_timer("daily_timer", "rate(1 day)", time_dimension_id="day")
+        external_data = app.add_external_data("ext_data", S3("111222333444", "bucket", "folder", AnyDate("day", {"format": "%Y-%m-%d"})))
+
+        internal_data = app.create_data(
+            id="internal_data",
+            inputs={
+                "ext_data_alias_0": external_data,
+                "ext_data_alias_1": external_data.ref,
+                "ext_data_alias_2": external_data.ref.range_check(True),
+                "ext_data_alias_3": external_data[:-7],
+                "timer_alias": daily_timer,
+            },
+            compute_targets=[
+                BatchCompute("output=ad_orders.limit(100)", WorkerType=GlueWorkerType.G_1X.value, NumberOfWorkers=50, GlueVersion="3.0")
+            ],
+        )
+
+        internal_data_node = cast("InternalDataNode", internal_data.bound)
+        assert len(internal_data_node.signal_link_node.signals) == 5
+        assert internal_data_node.signal_link_node.signals[0].alias == "ext_data_alias_0"
+        assert internal_data_node.signal_link_node.signals[1].alias == "ext_data_alias_1"
+        assert internal_data_node.signal_link_node.signals[2].alias == "ext_data_alias_2"
+        assert internal_data_node.signal_link_node.signals[3].alias == "ext_data_alias_3"
+        assert internal_data_node.signal_link_node.signals[4].alias == "timer_alias"
+
         self.patch_aws_stop()
 
     def test_application_update_data_on_nonexistent_data(self):

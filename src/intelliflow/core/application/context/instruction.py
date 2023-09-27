@@ -31,7 +31,7 @@ class InstructionLink(CoreData):
         This method is the basis of detecting links between elements of an InstructionChain.
         """
         other_signal = other if isinstance(other, Signal) else other.signal()
-        return self.signal.clone(alias=None) == other_signal.clone(alias=None)
+        return self.signal.clone(alias=None, deep=False) == other_signal.clone(alias=None, deep=False)
 
 
 class Instruction(CoreData):
@@ -123,6 +123,14 @@ class Instruction(CoreData):
         instructions' inbound references not set as expected (this is when 'link.updated == True').
         """
         return any(link.to_be_updated for link in self.inbound)
+
+    def get_dependency_set(self) -> List["Instruction"]:
+        children: List[Instruction] = []
+        for down_links in self.outbound.values():
+            down_link = down_links[0]
+            children.append(down_link.instruction)
+            children.extend(down_link.instruction.get_dependency_set())
+        return children
 
 
 InstructionChain = NewType("InstructionChain", List[Instruction])

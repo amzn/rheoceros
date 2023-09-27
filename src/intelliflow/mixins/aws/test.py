@@ -1,6 +1,10 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+# TODO
+#  - move Spark related mixins from Catalog app here as reusable mixins.
+#  - partition and migrate reusable parts of test.intelliflow.core.platform.test_commons here as mixins.
+import datetime
 import os
 import threading
 import time
@@ -8,20 +12,22 @@ from typing import Dict, Optional, Union
 from unittest.mock import MagicMock
 
 import boto3
-import mock
 import pytest
+from dateutil.tz import tzlocal
 from moto import (
     mock_applicationautoscaling,
     mock_athena,
     mock_autoscaling,
     mock_cloudwatch,
     mock_dynamodb2,
+    mock_emr,
     mock_events,
     mock_glue,
     mock_iam,
     mock_kms,
     mock_lambda,
     mock_s3,
+    mock_sagemaker,
     mock_ses,
     mock_sns,
     mock_sqs,
@@ -29,15 +35,18 @@ from moto import (
 )
 
 import intelliflow.core.application.context.node.external.nodes as external_nodes
+import intelliflow.core.platform.development as development
 import intelliflow.core.platform.drivers.compute.aws as compute_driver
 import intelliflow.core.platform.drivers.compute.aws_athena as athena_compute_driver
 import intelliflow.core.platform.drivers.compute.aws_emr as emr_compute_driver
+import intelliflow.core.platform.drivers.compute.aws_sagemaker.transform_job as sagemaker_transform_job_compute_driver
 import intelliflow.core.platform.drivers.diagnostics.aws as diagnostics_driver
 import intelliflow.core.platform.drivers.processor.aws as processor_driver
 import intelliflow.core.platform.drivers.routing.aws as routing_driver
 import intelliflow.core.platform.drivers.storage.aws as storage_driver
 import intelliflow.core.signal_processing.routing_runtime_constructs as routing_runtime_constructs
 from intelliflow.core.application.core_application import ApplicationState
+from intelliflow.core.platform.constructs import RoutingTable
 from intelliflow.mixins.aws.test_catalog import AllPassTestCatalog, AWSTestGlueCatalog
 
 
@@ -58,6 +67,7 @@ class AWSTestBase:
     """Maintain RheocerOS' platform level interface with AWS here"""
     _aws_services = [
         mock_glue(),
+        mock_emr(),
         mock_events(),
         mock_dynamodb2(),
         mock_iam(),
@@ -91,6 +101,22 @@ class AWSTestBase:
     _real_athena_create_or_update_workgroup = athena_compute_driver.create_or_update_workgroup
     _real_athena_delete_workgroup = athena_compute_driver.delete_workgroup
     _real_emr_glue_catalog = emr_compute_driver.glue_catalog
+    _real_emr_get_emr_step = emr_compute_driver.get_emr_step
+    _real_emr_describe_emr_cluster = emr_compute_driver.describe_emr_cluster
+    _real_emr_list_emr_clusters = emr_compute_driver.list_emr_clusters
+    _real_emr_start_emr_job_flow = emr_compute_driver.start_emr_job_flow
+    _real_emr_terminate_emr_job_flow = emr_compute_driver.terminate_emr_job_flow
+    _real_emr_empty_bucket = emr_compute_driver.empty_bucket
+    _real_emr_delete_bucket = emr_compute_driver.delete_bucket
+    _real_emr_delete_instance_profile = emr_compute_driver.delete_instance_profile
+    _real_describe_sagemaker_transform_job = sagemaker_transform_job_compute_driver.describe_sagemaker_transform_job
+    _real_start_batch_transform_job = sagemaker_transform_job_compute_driver.start_batch_transform_job
+    _real_stop_batch_transform_job = sagemaker_transform_job_compute_driver.stop_batch_transform_job
+    _real_create_sagemaker_model = sagemaker_transform_job_compute_driver.create_sagemaker_model
+    _real_get_data_iterator = sagemaker_transform_job_compute_driver.get_data_iterator
+    _real_get_s3_bucket = sagemaker_transform_job_compute_driver.get_s3_bucket
+    _real_get_s3_bucket_name = sagemaker_transform_job_compute_driver.get_s3_bucket_name
+    _real_get_objects_in_folder = sagemaker_transform_job_compute_driver.get_objects_in_folder
     #
     _real_auto_scaling_register_scalable_target = routing_driver.register_scalable_target
     _real_auto_scaling_deregister_scalable_target = routing_driver.deregister_scalable_target
@@ -113,6 +139,7 @@ class AWSTestBase:
     _real_diagnostics_put_composite_alarm = diagnostics_driver.put_composite_alarm
     # Application layer
     _real_external_nodes_glue_catalog = external_nodes.glue_catalog
+    _real_platform_development_attach_aws_managed_policy = development.attach_aws_managed_policy
 
     # signal_processing
     _real_routing_runtime_constructs_glue_catalog = routing_runtime_constructs.glue_catalog
@@ -164,9 +191,11 @@ class AWSTestBase:
             service.start()
 
         self._patch_glue_start(glue_job_exists)
+        self._patch_emr_start()
         self._patch_athena_start()
         self._patch_auto_scaling_start()
         self._patch_cloudwatch_start()
+        self._patch_sagemaker_start()
         if not emulate_lambda:
             self._patch_lambda_start(invoke_lambda_function_mock)
 
@@ -190,6 +219,8 @@ class AWSTestBase:
             emr_compute_driver.glue_catalog = glue_catalog
             external_nodes.glue_catalog = glue_catalog
             routing_runtime_constructs.glue_catalog = glue_catalog
+
+        development.attach_aws_managed_policy = MagicMock()
 
         # orchestration local message loop
         self._processor_thread: threading.Thread = None
@@ -235,9 +266,14 @@ class AWSTestBase:
 
         # patch Routing low-level sycnhronization to avoid concurrency issues in an impl agnostic way
         # (some of the impls for RoutingTable::_release and _lock might not be hard to emulate locally, e.g DDB locking)
-        def _lock(route_id: "RouteID") -> None:
+        def _lock(
+            route_id: "RouteID",
+            lock_duration_in_secs: int = RoutingTable.DEFAULT_LOCK_DURATION_IN_SECS,
+            retain_attempt_duration_in_secs: int = RoutingTable.DEFAULT_LOCK_RETAIN_ATTEMPT_DURATION_IN_SECS,
+        ) -> bool:
             with self._processor_thread_mutex:  # added because not sure about the atomicity of setdefault by GIL
                 self._routingtable_route_mutex_map.setdefault(route_id, threading.RLock()).acquire()
+            return True
 
         def _release(route_id: "RouteID") -> None:
             self._routingtable_route_mutex_map[route_id].release()
@@ -258,9 +294,11 @@ class AWSTestBase:
 
         self._patch_glue_stop()
         self._patch_athena_stop()
+        self._patch_emr_stop()
         self._patch_auto_scaling_stop()
         self._patch_cloudwatch_stop()
         self._patch_lambda_stop()
+        self._patch_sagemaker_stop()
 
         processor_driver.glue_catalog = AWSTestBase._real_processor_glue_catalog
         compute_driver.glue_catalog = AWSTestBase._real_compute_glue_catalog
@@ -274,6 +312,8 @@ class AWSTestBase:
 
         external_nodes.glue_catalog = AWSTestBase._real_external_nodes_glue_catalog
         routing_runtime_constructs.glue_catalog = AWSTestBase._real_routing_runtime_constructs_glue_catalog
+
+        development.attach_aws_managed_policy = AWSTestBase._real_platform_development_attach_aws_managed_policy
 
     def _patch_lambda_start(self, invoke_lambda_function_mock=None):
         def create_lambda_function(
@@ -294,6 +334,7 @@ class AWSTestBase:
         processor_driver.invoke_lambda_function = (
             MagicMock(side_effect=invoke_lambda_function_mock) if invoke_lambda_function_mock else MagicMock()
         )
+        processor_driver.get_lambda_digest = MagicMock()
         processor_driver.update_lambda_function_code = MagicMock()
         processor_driver.put_function_concurrency = MagicMock()
         processor_driver.delete_function_concurrency = MagicMock()
@@ -412,3 +453,131 @@ class AWSTestBase:
         athena_compute_driver.start_glue_job = AWSTestBase._real_athena_glue_start_glue_job
         athena_compute_driver.delete_glue_job = AWSTestBase._real_athena_glue_delete_glue_job
         athena_compute_driver.get_table_metadata = AWSTestBase._real_athena_get_table_metadata
+
+    def _patch_emr_start(self):
+        def get_emr_step(emr_client, cluster_id):
+            return {
+                "Status": {
+                    "State": "COMPLETED",
+                    "Timeline": {
+                        "CreationDateTime": datetime.datetime(2022, 3, 30, 23, 51, 34, 337000, tzinfo=tzlocal()),
+                        "StartDateTime": datetime.datetime(2022, 3, 31, 0, 6, 30, 539000, tzinfo=tzlocal()),
+                        "EndDateTime": datetime.datetime(2022, 3, 31, 0, 7, 46, 611000, tzinfo=tzlocal()),
+                    },
+                }
+            }
+
+        emr_compute_driver.get_emr_step = MagicMock(side_effect=get_emr_step)
+
+        def describe_emr_cluster(emr_client, cluster_id):
+            return {
+                "Cluster": {
+                    "Status": {
+                        "State": "TERMINATED",
+                        "StateChangeReason": {"Code": "ALL_STEPS_COMPLETED", "Message": ""},
+                        "Timeline": {
+                            "CreationDateTime": datetime.datetime(2022, 3, 30, 23, 51, 34, 337000, tzinfo=tzlocal()),
+                            "StartDateTime": datetime.datetime(2022, 3, 31, 0, 6, 30, 539000, tzinfo=tzlocal()),
+                            "EndDateTime": datetime.datetime(2022, 3, 31, 0, 7, 46, 611000, tzinfo=tzlocal()),
+                        },
+                    }
+                }
+            }
+
+        emr_compute_driver.describe_emr_cluster = MagicMock(side_effect=describe_emr_cluster)
+
+        def start_emr_job_flow(*args, **kwargs):
+            pass
+
+        emr_compute_driver.start_emr_job_flow = MagicMock(side_effect=start_emr_job_flow)
+
+        def mock_list_emr_clusters(*args, **kwargs):
+            return []
+
+        emr_compute_driver.list_emr_clusters = MagicMock(side_effect=mock_list_emr_clusters)
+
+        def mock_terminate_emr_job_flow(emr, ids):
+            return {}
+
+        emr_compute_driver.terminate_emr_job_flow = MagicMock(side_effect=mock_terminate_emr_job_flow)
+        emr_compute_driver.empty_bucket = MagicMock()
+        emr_compute_driver.delete_bucket = MagicMock()
+        emr_compute_driver.delete_instance_profile = MagicMock(side_effect=AWSTestBase._real_emr_delete_instance_profile)
+
+    def _patch_emr_stop(self):
+        emr_compute_driver.get_emr_step = AWSTestBase._real_emr_get_emr_step
+        emr_compute_driver.describe_emr_cluster = AWSTestBase._real_emr_describe_emr_cluster
+        emr_compute_driver.list_emr_clusters = AWSTestBase._real_emr_list_emr_clusters
+        emr_compute_driver.start_emr_job_flow = AWSTestBase._real_emr_start_emr_job_flow
+        emr_compute_driver.terminate_emr_job_flow = AWSTestBase._real_emr_terminate_emr_job_flow
+        emr_compute_driver.empty_bucket = AWSTestBase._real_emr_empty_bucket
+        emr_compute_driver.delete_bucket = AWSTestBase._real_emr_delete_bucket
+        emr_compute_driver.delete_instance_profile = AWSTestBase._real_emr_delete_instance_profile
+
+    def _patch_sagemaker_start(self):
+        def mock_describe_sagemaker_transform_job(sagemaker_client, job_name):
+            return {
+                "TransformJobStatus": "Completed",
+                "CreationTime": datetime.datetime(2022, 6, 22, 23, 51, 34, 337000, tzinfo=tzlocal()),
+                "TransformStartTime": datetime.datetime(2022, 6, 22, 0, 6, 30, 539000, tzinfo=tzlocal()),
+                "TransformEndTime": datetime.datetime(2022, 6, 22, 0, 7, 46, 611000, tzinfo=tzlocal()),
+            }
+
+        sagemaker_transform_job_compute_driver.describe_sagemaker_transform_job = MagicMock(
+            side_effect=mock_describe_sagemaker_transform_job
+        )
+
+        def mock_start_sagemaker_batch_transform_job(*args, **kwargs):
+            return "sagemaker_batch_transform_job_arn"
+
+        sagemaker_transform_job_compute_driver.start_batch_transform_job = MagicMock(side_effect=mock_start_sagemaker_batch_transform_job)
+
+        def mock_stop_sagemaker_batch_transform_job(*args, **kwargs):
+            return ""
+
+        sagemaker_transform_job_compute_driver.stop_batch_transform_job = MagicMock(side_effect=mock_stop_sagemaker_batch_transform_job)
+
+        def mock_create_sagemaker_model(*args, **kwargs):
+            return ""
+
+        sagemaker_transform_job_compute_driver.create_sagemaker_model = MagicMock(side_effect=mock_create_sagemaker_model)
+
+        def mock_get_s3_bucket(*args, **kwargs):
+            return "s3://test-bucket/*/model.tar.gz"
+
+        sagemaker_transform_job_compute_driver.get_s3_bucket = MagicMock(side_effect=mock_get_s3_bucket)
+
+        def mock_get_s3_bucket_name(*args, **kwargs):
+            return "test-bucket"
+
+        sagemaker_transform_job_compute_driver.get_s3_bucket_name = MagicMock(side_effect=mock_get_s3_bucket_name)
+
+        def mock_get_data_iterator(*args, **kwargs):
+            return iter(
+                [
+                    ("S3://test-bucket/*/model.tar.gz", ""),
+                ]
+            )
+
+        sagemaker_transform_job_compute_driver.get_data_iterator = MagicMock(side_effect=mock_get_data_iterator)
+
+        def mock_get_objects_in_folder(*args, **kwargs):
+            class folder_object:
+                key = "*/model.tar.gz"
+                body = ""
+
+            return [
+                folder_object(),
+            ]
+
+        sagemaker_transform_job_compute_driver.get_objects_in_folder = MagicMock(side_effect=mock_get_objects_in_folder)
+
+    def _patch_sagemaker_stop(self):
+        sagemaker_transform_job_compute_driver.describe_sagemaker_transform_job = AWSTestBase._real_describe_sagemaker_transform_job
+        sagemaker_transform_job_compute_driver.start_batch_transform_job = AWSTestBase._real_start_batch_transform_job
+        sagemaker_transform_job_compute_driver.stop_batch_transform_job = AWSTestBase._real_stop_batch_transform_job
+        sagemaker_transform_job_compute_driver.create_sagemaker_model = AWSTestBase._real_create_sagemaker_model
+        sagemaker_transform_job_compute_driver.get_s3_bucket = AWSTestBase._real_get_s3_bucket
+        sagemaker_transform_job_compute_driver.get_s3_bucket_name = AWSTestBase._real_get_s3_bucket_name
+        sagemaker_transform_job_compute_driver.get_data_iterator = AWSTestBase._real_get_data_iterator
+        sagemaker_transform_job_compute_driver.get_objects_in_folder = AWSTestBase._real_get_objects_in_folder

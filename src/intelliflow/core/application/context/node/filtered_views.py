@@ -209,7 +209,7 @@ class FilteredView(ABC, SignalProvider, metaclass=_FilterViewMeta):
         ...
 
     @classmethod
-    def get_raw_filtering_input(cls, slice_filter: Any, dimension: "Dimension") -> RawDimensionFilterInput:
+    def get_raw_filtering_input(cls, slice_filter: Any, dimension_name: str) -> RawDimensionFilterInput:
         filter_raw_input: RawDimensionFilterInput
         if isinstance(slice_filter, slice):
             # do filtering on the root level DimensionVariants
@@ -221,19 +221,11 @@ class FilteredView(ABC, SignalProvider, metaclass=_FilterViewMeta):
             # print("slice", slice_filter.start, slice_filter.stop, slice_filter.step)
             variant_values: List[Any] = []
             if not slice_filter.start or slice_filter.start == RelativeVariant.DATUM_DIMENSION_VALUE_SPECIAL_CHAR:
-                variant_values.append(RelativeVariant.build_value(int(slice_filter.stop)))
+                range_shift = None
             else:
-                params: ParamsDictType = {} if not dimension.params else dimension.params
-                step = slice_filter.step
-                if isinstance(slice_filter.step, DatetimeGranularity):
-                    params.update({DateVariant.GRANULARITY_PARAM: slice_filter.step})
-                    step = 1
-                elif DatetimeGranularity.has_value(slice_filter.step):
-                    params.update({DateVariant.GRANULARITY_PARAM: DatetimeGranularity[slice_filter.step]})
-                    step = 1
-
-                variant_range = DimensionVariantFactory.create_variant_range(slice_filter.start, slice_filter.stop, step, params)
-                variant_values.extend([variant.value for variant in variant_range])
+                range_shift = int(slice_filter.start)
+            relative_range_end = int(slice_filter.stop) if slice_filter.stop else -1
+            variant_values.append(RelativeVariant.build_value(relative_range_end, range_shift))
 
             filter_raw_input = variant_values
         elif isinstance(slice_filter, tuple):
@@ -262,7 +254,7 @@ class FilteredView(ABC, SignalProvider, metaclass=_FilterViewMeta):
     def get_signal(self, alias: str = None) -> Signal:
         if self._new_filter is None:
             # ex: MarshalerNode creates the filter only to get a reference with no extra filtering
-            return self._signal
+            return self._signal.clone(alias if alias is not None else self._signal.alias)
 
         if not self.is_complete():
             self._new_filter = self._signal.resource_access_spec.auto_complete_filter(
@@ -271,10 +263,10 @@ class FilteredView(ABC, SignalProvider, metaclass=_FilterViewMeta):
 
             if self._new_filter is None or not self.is_complete():
                 raise ValueError(
-                    f"Dimension type mismatch or premature utilization of FilteredView ({self.filtering_levels}"
+                    f"Dimension type/value mismatch or premature utilization of FilteredView ({self.filtering_levels}"
                     f" on signal (id={self._signal.alias!r}, alias={alias!r})! It is not complete yet,"
                     f" not compatible with the dimension spec of underlying Signal. "
-                    f" Right dimension types or further indexing might be required on this FilteredView: {self!r}"
+                    f" Right dimension types/values or further indexing might be required on this FilteredView: {self!r}"
                 )
 
         if self.is_complete():

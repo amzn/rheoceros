@@ -37,6 +37,7 @@ IF_EXE_ROLE_FORMAT = "arn:aws:iam::{0}:role/{1}-{2}-IntelliFlowExeRole"
 IF_DEV_POLICY_NAME_FORMAT = "{0}-DevelopmentPolicy"
 IF_EXE_POLICY_NAME_FORMAT = "{0}-ExecutionPolicy"
 IF_DEV_EXE_TRANSITION_POLICY_NAME_FORMAT = "{0}-DevToExecPolicy"
+IF_DEV_REMOVED_DRIVERS_TEMP_POLICY_NAME_FORMAT = "{0}-DevelopmentPolicy-Removed-Temp"
 
 AWS_STS_ARN_ROOT = "arn:aws:sts"
 AWS_ASSUMED_ROLE_ARN_ROOT = "arn:aws:sts::{0}:assumed-role/{1}"
@@ -45,7 +46,7 @@ AWS_ASSUMED_ROLE_ARN_ROOT = "arn:aws:sts::{0}:assumed-role/{1}"
 MAX_ASSUME_ROLE_DURATION = 43200  # 12 hours
 # Below IAM limit is in effect in the context of collaboration (assuming role of an upstream app):
 # "The requested DurationSeconds exceeds the 1 hour session limit for roles assumed by role chaining."
-MAX_CHAINED_ROLE_DURATION = 3600  # 12 hours
+MAX_CHAINED_ROLE_DURATION = 3600
 
 
 @unique
@@ -108,13 +109,21 @@ AWS_COMMON_RETRYABLE_ERRORS = [
     "InternalFailure",
     "InternalError",
     "LimitExceededException",
-    "ServiceUnavailable"
+    "ServiceUnavailable",
+    "ServiceUnavailableException",
     # TODO check https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/CommonErrors.html
+    # Now add botocore common retryable errors
+    "ConnectTimeoutError",
+    "ReadTimeoutError",
+    # We evaluate the following as retryable due to eventual consistency
+    "InvalidClientTokenId",
+    "UnrecognizedClientException",
+    "InvalidAccessKeyId",
 ]
 
 
 MAX_SLEEP_INTERVAL_PARAM = "_max_sleep_time_in_secs"
-MAX_SLEEP_INTERVAL_DEFAULT = 65
+MAX_SLEEP_INTERVAL_DEFAULT = 64 + 1
 
 
 def exponential_retry(func, service_retryable_errors, *func_args, **func_kwargs):
@@ -304,6 +313,9 @@ def _get_trust_policy(allowed_services: Sequence[str], allowed_aws_entities: Set
         account_statement = [
             {"Effect": "Allow", "Principal": {"AWS": entity}, "Action": "sts:AssumeRole"} for entity in allowed_aws_entities
         ]
+        account_statement = account_statement + [
+            {"Effect": "Allow", "Principal": {"AWS": entity}, "Action": "sts:TagSession"} for entity in allowed_aws_entities
+        ]
 
         if external_id:
             for statement in account_statement:
@@ -380,14 +392,22 @@ def create_role(
 
 
 def attach_aws_managed_policy(role_name: str, managed_policy_name: str, base_session: boto3.Session) -> None:
+    """
+    managed_policy_name: can be a full AWS managed policy arn or just the policy name
+    """
     iam = base_session.client("iam")
+    policy_arn = normalize_policy_arn(managed_policy_name)
     try:
-        iam.attach_role_policy(RoleName=role_name, PolicyArn=f"arn:aws:iam::aws:policy/{managed_policy_name}")
+        iam.attach_role_policy(RoleName=role_name, PolicyArn=policy_arn)
 
         module_logger.info(f"Attached AWS managed policy {managed_policy_name!r} to the role {role_name!r}")
     except ClientError as ex:
         module_logger.exception("Could not attach AWS managed policy to role %s. Exception: %s", role_name, str(ex))
         raise
+
+
+def normalize_policy_arn(managed_policy_name):
+    return managed_policy_name if managed_policy_name.startswith("arn:") else f"arn:aws:iam::aws:policy/{managed_policy_name}"
 
 
 def update_role(
@@ -423,7 +443,12 @@ def update_role(
                         trusted_entities.add(existing_entity)
 
     try:
-        iam.update_assume_role_policy(PolicyDocument=_get_trust_policy(allowed_services, trusted_entities, external_id), RoleName=role_name)
+        exponential_retry(
+            iam.update_assume_role_policy,
+            ["Throttling", "MalformedPolicyDocument"],  # malformed policy might be received if any of the entities is new
+            PolicyDocument=_get_trust_policy(allowed_services, trusted_entities, external_id),
+            RoleName=role_name,
+        )
         module_logger.info(f"Updated role {role_name} for new services {allowed_services} and new entities {new_allowed_aws_entities}")
 
     except ClientError:
@@ -607,7 +632,9 @@ def update_role_trust_policy(
 
     if entities_removed or entities_to_be_added:
         try:
-            iam.update_assume_role_policy(PolicyDocument=json.dumps(existing_trust_policy), RoleName=role_name)
+            exponential_retry(
+                iam.update_assume_role_policy, ["Throttling"], PolicyDocument=json.dumps(existing_trust_policy), RoleName=role_name
+            )
             module_logger.info(
                 f"Updated the trust policy for role {role_name} for new entities {new_aws_entities} and removed entities {removed_aws_entities}"
             )

@@ -3,12 +3,13 @@
 
 import copy
 from typing import cast
+import sys
+from unittest.mock import MagicMock
 
 import pytest
-from mock import MagicMock
 
 from intelliflow.api import DataFormat, S3Dataset
-from intelliflow.api_ext import HADOOP_SUCCESS_FILE
+from intelliflow.api_ext import HADOOP_SUCCESS_FILE, AWSApplication
 from intelliflow.core.application.application import Application
 from intelliflow.core.application.context.node.internal.nodes import InternalDataNode
 from intelliflow.core.application.core_application import ApplicationState
@@ -20,16 +21,19 @@ from intelliflow.core.platform.definitions.compute import (
     ComputeSuccessfulResponseType,
 )
 from intelliflow.core.platform.development import AWSConfiguration, HostPlatform
-from intelliflow.core.serialization import dumps, loads
 from intelliflow.core.signal_processing.definitions.dimension_defs import Type
-from intelliflow.core.signal_processing.dimension_constructs import DimensionVariantFactory
 from intelliflow.core.signal_processing.signal import *
 from intelliflow.mixins.aws.test import AWSTestBase
+from intelliflow.utils.test.inlined_compute import NOOPCompute
 
 
 class TestAWSApplication(AWSTestBase):
-    def _create_test_application(self, id: str):
-        return Application(id, HostPlatform(AWSConfiguration.builder().with_default_credentials().with_region(self.region).build()))
+    def _create_test_application(self, id: str, enforce_runtime_compatibility: bool = True):
+        return Application(
+            id,
+            HostPlatform(AWSConfiguration.builder().with_default_credentials().with_region(self.region).build()),
+            enforce_runtime_compatibility,
+        )
 
     def test_application_init(self):
         self.patch_aws_start()
@@ -351,6 +355,80 @@ class TestAWSApplication(AWSTestBase):
 
         self.patch_aws_stop()
 
+    def test_application_refresh(self):
+        self.patch_aws_start()
+        app = self._create_test_application("test_app")
+        app_2 = self._create_test_application("test_app")
+
+        external_data = app.marshal_external_data(
+            S3Dataset("111222333444", "bucke", "prefix", "{}", dataset_format=DataFormat.CSV),
+            "test_ext_data",
+            {"region": {"type": Type.STRING}},
+            {
+                "NA": {},
+            },
+            SignalIntegrityProtocol("FILE_CHECK", {"file": "_SUCCESS"}),
+        )
+
+        app.create_data(
+            id="test_internal_data",
+            inputs=[external_data],
+            input_dim_links=[],
+            output_dimension_spec={},
+            output_dim_links={},
+            compute_targets=[NOOPCompute],
+        )
+        app.activate()
+
+        # let's assume that app_2 instance is used in a different development environment.
+        # without a refresh, it won't able to see the changes that have just been deployed via activation above.
+        assert not app_2.get_data("test_ext_data", Application.QueryApplicationScope.ALL, Application.QueryContext.ACTIVE_RUNTIME_CONTEXT)
+        assert not app_2.get_data("test_ext_data", Application.QueryApplicationScope.ALL, Application.QueryContext.DEV_CONTEXT)
+        assert not app_2.get_data(
+            "test_internal_data", Application.QueryApplicationScope.ALL, Application.QueryContext.ACTIVE_RUNTIME_CONTEXT
+        )
+        assert not app_2.get_data("test_internal_data", Application.QueryApplicationScope.ALL, Application.QueryContext.DEV_CONTEXT)
+
+        app_2.refresh()
+        assert app_2.get_data("test_ext_data", Application.QueryApplicationScope.ALL, Application.QueryContext.ACTIVE_RUNTIME_CONTEXT)
+        assert not app_2.get_data("test_ext_data", Application.QueryApplicationScope.ALL, Application.QueryContext.DEV_CONTEXT)
+        assert app_2.get_data("test_internal_data", Application.QueryApplicationScope.ALL, Application.QueryContext.ACTIVE_RUNTIME_CONTEXT)
+        assert not app_2.get_data("test_internal_data", Application.QueryApplicationScope.ALL, Application.QueryContext.DEV_CONTEXT)
+
+        app_2.attach()
+        assert app_2.get_data("test_ext_data", Application.QueryApplicationScope.ALL, Application.QueryContext.ACTIVE_RUNTIME_CONTEXT)
+        assert app_2.get_data("test_ext_data", Application.QueryApplicationScope.ALL, Application.QueryContext.DEV_CONTEXT)
+        assert app_2.get_data("test_internal_data", Application.QueryApplicationScope.ALL, Application.QueryContext.ACTIVE_RUNTIME_CONTEXT)
+        assert app_2.get_data("test_internal_data", Application.QueryApplicationScope.ALL, Application.QueryContext.DEV_CONTEXT)
+
+        # but platform is not sync. driver instanes still don't know about the activation (new state)
+        assert len(app_2.platform.routing_table._route_index.get_all_routes()) == 0
+
+        app_2.refresh(full_stack=True)
+
+        # active context must have pulled in
+        assert app_2.get_data("test_ext_data", Application.QueryApplicationScope.ALL, Application.QueryContext.ACTIVE_RUNTIME_CONTEXT)
+        assert app_2.get_data("test_internal_data", Application.QueryApplicationScope.ALL, Application.QueryContext.ACTIVE_RUNTIME_CONTEXT)
+
+        # and routing index as well
+        assert len(app_2.platform.routing_table._route_index.get_all_routes()) == 1
+
+        # reset the other application
+        app = self._create_test_application("test_app")
+        app.activate()
+
+        # do a full stack refresh again
+        app_2.refresh(full_stack=True)
+        # everything should be wiped out
+        assert not app_2.get_data("test_ext_data", Application.QueryApplicationScope.ALL, Application.QueryContext.ACTIVE_RUNTIME_CONTEXT)
+        assert not app_2.get_data(
+            "test_internal_data", Application.QueryApplicationScope.ALL, Application.QueryContext.ACTIVE_RUNTIME_CONTEXT
+        )
+        # and routing index as well
+        assert len(app_2.platform.routing_table._route_index.get_all_routes()) == 0
+
+        self.patch_aws_stop()
+
     def test_application_pause_resume(self):
         self.patch_aws_start()
 
@@ -432,5 +510,55 @@ class TestAWSApplication(AWSTestBase):
             },
             HADOOP_SUCCESS_FILE,
         )
+
+        self.patch_aws_stop()
+
+    def test_application_incompatible_runtime(self):
+        self.patch_aws_start()
+
+        app = AWSApplication("test_app_rt_err", self.region)
+
+        # 1- setup temporary node module (with InlinedCompute and dim link mapper functions)
+        import importlib
+        from importlib.resources import path
+
+        test_resources_spec = importlib.util.find_spec("test.intelliflow.core.application.test_resources")
+        root_mod = importlib.util.module_from_spec(test_resources_spec)
+
+        file_path = None
+        with path(root_mod, "test_node.py") as resource_path:
+            file_path = resource_path
+
+        tmp_file_path = file_path.parent / "test_node_tmp.py"
+        if tmp_file_path.exists():
+            tmp_file_path.unlink()
+        tmp_file_path.symlink_to(file_path)
+        from test.intelliflow.core.application.test_resources import test_node_tmp
+
+        # 2- use the new module
+        test_node_tmp.join(app)
+
+        # serializes app and platform state implicitly
+        app.activate()
+
+        # 3- test successfuly sync while the module is still there
+        app = AWSApplication("test_app_rt_err", self.region, enforce_runtime_compatibility=True)
+
+        # 4- emulate "incompatible" change in code base by removing the node module
+        del test_node_tmp
+        tmp_file_path.unlink()
+        del sys.modules["test.intelliflow.core.application.test_resources.test_node_tmp"]
+
+        # fail due to state error (should be active or paused)
+        with pytest.raises(Application.IncompatibleRuntime):
+            app = AWSApplication("test_app_rt_err", self.region, enforce_runtime_compatibility=True)
+
+        # test successful reset of active state when compatibility is not enforced
+        app = AWSApplication("test_app_rt_err", self.region, enforce_runtime_compatibility=False)
+
+        assert app.state == ApplicationState.INACTIVE
+        # use a method that would do a traversal on the platform and underlying drivers post-reset.
+        # e.g if a driver has not been instantiated successfully (or the app is in terminated state, then it will fail).
+        assert app.get_platform_metrics(HostPlatform.MetricType.SYSTEM)
 
         self.patch_aws_stop()

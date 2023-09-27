@@ -406,7 +406,10 @@ def update_policy(s3, bucket_name, policy_with_updated_statements, removed_state
                     [current_statements] if current_statements else [] + [new_statement for new_statement in new_statements]
                 )
 
-        s3.Bucket(bucket_name).Policy().put(Policy=json.dumps(current_policy_doc))
+        if current_policy_doc["Statement"]:
+            s3.Bucket(bucket_name).Policy().put(Policy=json.dumps(current_policy_doc))
+        else:
+            s3.Bucket(bucket_name).Policy().delete()
         policy = s3.Bucket(bucket_name).Policy()
         logger.info("Put policy %s for bucket '%s'.", policy, bucket_name)
     except ClientError:

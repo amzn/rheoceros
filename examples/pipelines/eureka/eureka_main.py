@@ -25,7 +25,7 @@ from intelliflow.api import *
 import logging
 
 region = "us-east-1"
-stage = "development-yunusko"
+stage = "beta"
 app_name = f"eureka-{stage}"
 
 # or (3) provide credentials in which IF tries to get STS (assume role) credentials for IF dev Role
@@ -50,7 +50,7 @@ app = flow.create_or_update_application(app_name,
                                                                      .build()))
 
 eureka_offline_data = app.marshal_external_data(
-                S3Dataset("427809481713", "dex-ml-eureka-model-training-data", "cradle_eureka_p3/v8_00/training-data", "{}", "{}", dataset_format=DataFormat.CSV)
+                S3Dataset("<BUCKET_ACC_ID>", "eureka-model-training-data", "eureka_p3/v8_00/training-data", "{}", "{}", dataset_format=DataFormat.CSV)
                 , "eureka_training_features"
                 # DEFINE Data Signal Spec (Flow <Type> / Dimensions)
                 , {

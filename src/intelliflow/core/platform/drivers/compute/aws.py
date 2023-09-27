@@ -10,6 +10,7 @@ the internal details
 """
 import json
 import logging
+import time
 import uuid
 from typing import Any, ClassVar, Dict, List, Optional, Set, Tuple, Type, cast
 
@@ -25,10 +26,15 @@ from intelliflow.core.signal_processing.definitions.dimension_defs import Type a
 from intelliflow.core.signal_processing.routing_runtime_constructs import Route
 from intelliflow.core.signal_processing.signal import SignalDomainSpec, SignalType
 from intelliflow.core.signal_processing.signal_source import (
+    DATA_FORMAT_KEY,
+    DATA_TYPE_KEY,
+    DATASET_FORMAT_KEY,
     DATASET_HEADER_KEY,
     DATASET_SCHEMA_TYPE_KEY,
     CWMetricSignalSourceAccessSpec,
     DatasetSchemaType,
+    DatasetSignalSourceFormat,
+    DataType,
     GlueTableSignalSourceAccessSpec,
     S3SignalSourceAccessSpec,
     SignalSourceAccessSpec,
@@ -53,6 +59,7 @@ from ...definitions.aws.glue.catalog import check_table, query_table_spec
 from ...definitions.aws.glue.client_wrapper import (
     JOB_ARN_FORMAT,
     PYTHON_MODULES_TO_BE_AVOIDED_IN_GLUE_BUNDLE,
+    SPECIAL_PARAMETERS_SUPPORTED_BY_GLUE,
     GlueJobCommandType,
     GlueJobLanguage,
     GlueVersion,
@@ -67,11 +74,13 @@ from ...definitions.aws.glue.client_wrapper import (
     start_glue_job,
     update_glue_job,
 )
+from ...definitions.aws.glue.logs import LOG_GROUPS, generate_loggroup_name, generate_logstream_urls
 from ...definitions.aws.glue.script.batch.common import (
     AWS_REGION,
     BOOTSTRAPPER_PLATFORM_KEY_PARAM,
     CLIENT_CODE_BUCKET,
     CLIENT_CODE_PARAM,
+    EXECUTION_ID,
     INPUT_MAP_PARAM,
     OUTPUT_PARAM,
     USER_EXTRA_PARAMS_PARAM,
@@ -87,6 +96,7 @@ from ...definitions.compute import (
     ComputeFailedResponseType,
     ComputeFailedSessionState,
     ComputeFailedSessionStateType,
+    ComputeLogQuery,
     ComputeResourceDesc,
     ComputeResponse,
     ComputeResponseType,
@@ -132,6 +142,7 @@ class AWSGlueBatchComputeBasic(AWSConstructMixin, BatchCompute):
         super().__init__(params)
         self._glue = self._session.client("glue", region_name=self._region)
         self._s3 = self._session.resource("s3", region_name=self._region)
+        self._cw_logs = self._session.client("logs", region_name=self._region)
         self._bucket = None
         self._bucket_name = None
         self._intelliflow_python_workingset_key = None
@@ -140,17 +151,33 @@ class AWSGlueBatchComputeBasic(AWSConstructMixin, BatchCompute):
         super()._deserialized_init(params)
         self._glue = self._session.client("glue", region_name=self._region)
         self._s3 = self._session.resource("s3", region_name=self._region)
+        self._cw_logs = self._session.client("logs", region_name=self._region)
         self._bucket = get_bucket(self._s3, self._bucket_name)
 
     def _serializable_copy_init(self, org_instance: "BaseConstruct") -> None:
         AWSConstructMixin._serializable_copy_init(self, org_instance)
         self._glue = None
         self._s3 = None
+        self._cw_logs = None
         self._bucket = None
 
-    def provide_output_attributes(self, slot: Slot, user_attrs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def provide_output_attributes(self, inputs: List[Signal], slot: Slot, user_attrs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if user_attrs.get(DATA_TYPE_KEY, DataType.DATASET) != DataType.DATASET:
+            raise ValueError(
+                f"{DATA_TYPE_KEY!r} must be defined as {DataType.DATASET} or left undefined for {self.__class__.__name__} output!"
+            )
+
+        # default to CSV
+        data_format_value = user_attrs.get(DATASET_FORMAT_KEY, user_attrs.get(DATA_FORMAT_KEY, None))
+        data_format = DatasetSignalSourceFormat.CSV if data_format_value is None else DatasetSignalSourceFormat(data_format_value)
+
         # header: supports both so it is up to user input. but default to True if not set.
-        return {DATASET_HEADER_KEY: user_attrs.get(DATASET_HEADER_KEY, True), DATASET_SCHEMA_TYPE_KEY: DatasetSchemaType.SPARK_SCHEMA_JSON}
+        return {
+            DATA_TYPE_KEY: DataType.DATASET,
+            DATASET_HEADER_KEY: user_attrs.get(DATASET_HEADER_KEY, True),
+            DATASET_SCHEMA_TYPE_KEY: DatasetSchemaType.SPARK_SCHEMA_JSON,
+            DATASET_FORMAT_KEY: data_format,
+        }
 
     def query_external_source_spec(
         self, ext_signal_source: SignalSourceAccessSpec
@@ -165,6 +192,7 @@ class AWSGlueBatchComputeBasic(AWSConstructMixin, BatchCompute):
 
     def compute(
         self,
+        route: Route,
         materialized_inputs: List[Signal],
         slot: Slot,
         materialized_output: Signal,
@@ -180,7 +208,7 @@ class AWSGlueBatchComputeBasic(AWSConstructMixin, BatchCompute):
         lang = GlueJobLanguage.from_slot_lang(slot.code_lang)
         extra_params: Dict[str, Any] = dict(slot.extra_params)
         self._resolve_glue_version(extra_params, materialized_inputs)
-        user_extra_param_keys = list(set(extra_params.keys()))
+        user_extra_param_keys = list(set([key for key in extra_params.keys() if key not in SPECIAL_PARAMETERS_SUPPORTED_BY_GLUE]))
         glue_version = extra_params.get("GlueVersion")
 
         lang_spec = self._glue_job_lang_map[lang]
@@ -208,18 +236,26 @@ class AWSGlueBatchComputeBasic(AWSConstructMixin, BatchCompute):
             put_object, {"ServiceException", "TooManyRequestsException"}, self._bucket, output_param_key, output.dumps().encode("utf-8")
         )
 
-        extra_jars = self._bundle_s3_paths
-        if slot.code_lang == Lang.SCALA:
-            extra_jars = extra_jars + (code_metadata.external_library_paths if code_metadata.external_library_paths else [])
 
         extra_params.update(
             {
                 # --enable-glue-datacatalog
                 "enable-glue-datacatalog": "",
-                # --extra-jars
-                "extra-jars": ",".join(extra_jars),
             }
         )
+
+        extra_jars = extra_params.get("extra-jars", [])
+        extra_jars = extra_jars + self._bundle_s3_paths
+        if slot.code_lang == Lang.SCALA:
+            extra_jars = extra_jars + (code_metadata.external_library_paths if code_metadata.external_library_paths else [])
+
+        if extra_jars:
+            extra_params.update(
+                {
+                    # --extra-jars
+                    "extra-jars": ",".join(extra_jars),
+                }
+            )
 
         # TODO investigate why enabling this causes 'JOB_ID invalid argument failure' during glue init.
         # if glue_version == "3.0":
@@ -262,6 +298,7 @@ class AWSGlueBatchComputeBasic(AWSConstructMixin, BatchCompute):
                 f"--{AWS_REGION}": self.region,
                 f"--{OUTPUT_PARAM}": output_param_key,
                 f"--{USER_EXTRA_PARAMS_PARAM}": json.dumps(user_extra_param_keys),
+                f"--{EXECUTION_ID}": execution_ctx_id,
             }
         )
         try:
@@ -373,7 +410,7 @@ class AWSGlueBatchComputeBasic(AWSConstructMixin, BatchCompute):
         """
         # enough to get out of Glue's 'resource unavailable' cycle?
         # retry with increasing probability as wait time gets close to this
-        return 2 * 60 * 60
+        return 90 * 60
 
     def dev_init(self, platform: "DevelopmentPlatform") -> None:
         super().dev_init(platform)
@@ -435,6 +472,7 @@ class AWSGlueBatchComputeBasic(AWSConstructMixin, BatchCompute):
         # TODO comment the following, probably won't need at runtime
         self._s3 = boto3.resource("s3")
         self._bucket = get_bucket(self._s3, self._bucket_name)
+        self._cw_logs = boto3.client("logs", region_name=self._region)
 
     def provide_runtime_trusted_entities(self) -> List[str]:
         return ["glue.amazonaws.com"]
@@ -443,47 +481,69 @@ class AWSGlueBatchComputeBasic(AWSConstructMixin, BatchCompute):
         # arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
         return ["service-role/AWSGlueServiceRole"]
 
+    def _extract_used_glue_jobs(self) -> Dict[GlueJobLanguage, Set[str]]:
+        """Extract the versions used in the new version of the application"""
+        jobs = dict()
+        for route in self._pending_internal_routes:
+            for slot in route.slots:
+                if slot.type.is_batch_compute():
+                    extra_params: Dict[str, Any] = dict(slot.extra_params)
+                    self._resolve_glue_version(extra_params, route.link_node.signals)
+                    version = extra_params["GlueVersion"]
+                    lang = GlueJobLanguage.from_slot_lang(slot.code_lang)
+                    jobs.setdefault(lang, set()).add(version)
+        return jobs
+
     def provide_runtime_permissions(self) -> List[ConstructPermission]:
         # allow exec-role (post-activation, cumulative list of all trusted entities [AWS services]) to do the following;
-        permissions = [
-            ConstructPermission([f"arn:aws:s3:::{self._bucket_name}", f"arn:aws:s3:::{self._bucket_name}/*"], ["s3:*"]),
-            # TODO be more picky.
+
+        permissions = []
+        used_jobs = self._extract_used_glue_jobs()
+        if used_jobs:
+            # TODO be more picky (in terms of actions)
             # allow other service assuming our role to call the jobs here
-            ConstructPermission(
-                [
-                    f"arn:aws:glue:{self._region}:{self._account_id}:job/{self._glue_job_lang_map[lang][version]['job_name']}"
-                    for lang in self._glue_job_lang_map.keys()
-                    for version in self._glue_job_lang_map[lang].keys()
-                ],
-                ["glue:*"],
-            ),
-            # CW Logs (might look redundant, but please forget about other drivers while declaring these),
-            # deduping is handled automatically.
-            ConstructPermission([f"arn:aws:logs:{self._region}:{self._account_id}:*"], ["logs:*"]),
-            # must add a policy to allow your users the iam:PassRole permission for IAM roles to match your naming convention
-            ConstructPermission([self._params[AWSCommonParams.IF_EXE_ROLE]], ["iam:PassRole"]),
-            # TODO post-MVP evaluate External output support.
-            #  Currently we dont support it. So no write related permission should be granted for external signals.
-            #  And, for internals, it is obvious that Storage impl should have already granted our role with the
-            #  necessary permissions.
-        ]
+            permissions.append(
+                ConstructPermission(
+                    [
+                        f"arn:aws:glue:{self._region}:{self._account_id}:job/{self._glue_job_lang_map[lang][version]['job_name']}"
+                        for lang in used_jobs.keys()
+                        for version in used_jobs[lang]
+                    ],
+                    ["glue:*"],
+                )
+            )
+
+        permissions.extend(
+            [
+                ConstructPermission([f"arn:aws:s3:::{self._bucket_name}", f"arn:aws:s3:::{self._bucket_name}/*"], ["s3:*"]),
+                # CW Logs (might look redundant, but please forget about other drivers while declaring these),
+                # deduping is handled automatically.
+                ConstructPermission([f"arn:aws:logs:{self._region}:{self._account_id}:*"], ["logs:*"]),
+                # must add a policy to allow your users the iam:PassRole permission for IAM roles to match your naming convention
+                ConstructPermission([self._params[AWSCommonParams.IF_EXE_ROLE]], ["iam:PassRole"]),
+                # TODO post-MVP evaluate External output support.
+                #  Currently we dont support it. So no write related permission should be granted for external signals.
+                #  And, for internals, it is obvious that Storage impl should have already granted our role with the
+                #  necessary permissions.
+            ]
+        )
 
         external_library_resource_arns = set()
         for route in self._pending_internal_routes:
             for slot in route.slots:
                 if slot.code_metadata.external_library_paths:
-                    for s3_path in slot.code_metadata.external_library_paths:
+                    for path in slot.code_metadata.external_library_paths:
                         try:
-                            s3_spec = S3SignalSourceAccessSpec.from_url(account_id=None, url=s3_path)
+                            s3_spec = S3SignalSourceAccessSpec.from_url(account_id=None, url=path)
+                            # exact resource (JARs, zips)
+                            external_library_resource_arns.add(f"arn:aws:s3:::{s3_spec.bucket}/{path[len(f's3://{s3_spec.bucket}/'):]}")
                         except Exception:
-                            module_logger.error(
-                                f"External library path {s3_path} attached to route {route.route_id!r} "
-                                f" via slot: {(slot.type, slot.code_lang)!r} is not supported by "
-                                f" BatchCompute driver {self.__class__.__name__!r}. "
+                            module_logger.warning(
+                                f"External library path {path} attached to route {route.route_id!r} "
+                                f" via slot: {(slot.type, slot.code_lang)!r} is not an S3 path, assuming that it is just"
+                                f" a PyPI library name, BatchCompute driver {self.__class__.__name__!r} won't add it to"
+                                f" runtime permissions for exec role."
                             )
-                            raise
-                        # exact resource (JARs, zips)
-                        external_library_resource_arns.add(f"arn:aws:s3:::{s3_spec.bucket}/{s3_path[len(f's3://{s3_spec.bucket}/'):]}")
 
                 # TODO Move into <BatchCompute>
                 # TODO evalute moving is_batch_compute check even before the external library paths extraction.
@@ -614,6 +674,15 @@ class AWSGlueBatchComputeBasic(AWSConstructMixin, BatchCompute):
             # TODO dev-role should have the right to do BucketNotification on external signals
             # this would require post-MVP design change on how dev-role is used and when it is updated.
             # probably during the activation again (switching to the admin credentails if authorization is given).
+
+            # log retrieval
+            ConstructPermission(
+                [
+                    f"arn:aws:logs:{params[AWSCommonParams.REGION]}:{params[AWSCommonParams.ACCOUNT_ID]}:log-group:{generate_loggroup_name(log_group_typ)}:log-stream:*"
+                    for log_group_typ in LOG_GROUPS
+                ],
+                ["logs:FilterLogEvents"],
+            ),
         ]
 
     def _provide_route_metrics(self, route: Route) -> List[ConstructInternalMetricDesc]:
@@ -796,29 +865,34 @@ class AWSGlueBatchComputeBasic(AWSConstructMixin, BatchCompute):
             self._bucket = get_bucket(self._s3, self._bucket_name)
 
         if not is_environment_immutable():
-            # check driver specific pre-compiled dependencies
-            #
-            # call with actual job version if bundles are version specific
-            bundles: List[Tuple[str, "Path"]] = get_bundles(glue_version="2.0")
-            self._bundle_s3_keys = []
-            self._bundle_s3_paths = []
-            for bundle_name, bundle_path in bundles:
-                bundle_s3_key = build_object_key(["batch", "lib"], bundle_name)
-                self._bundle_s3_keys.append(bundle_s3_key)
-                self._bundle_s3_paths.append(f"s3://{self._bucket_name}/{bundle_s3_key}")
+            used_jobs = self._extract_used_glue_jobs()
 
-                if not object_exists(self._s3, self._bucket, bundle_s3_key):
-                    exponential_retry(
-                        put_object,
-                        {"ServiceException", "TooManyRequestsException"},
-                        self._bucket,
-                        bundle_s3_key,
-                        open(bundle_path, "rb").read(),
-                    )
+            if used_jobs:
+                # check driver specific pre-compiled dependencies
+                #
+                # call with actual job version if bundles are version specific
+                bundles: List[Tuple[str, "Path"]] = get_bundles(glue_version="2.0")
+                self._bundle_s3_keys = []
+                self._bundle_s3_paths = []
+                for bundle_name, bundle_path in bundles:
+                    bundle_s3_key = build_object_key(["batch", "lib"], bundle_name)
+                    self._bundle_s3_keys.append(bundle_s3_key)
+                    self._bundle_s3_paths.append(f"s3://{self._bucket_name}/{bundle_s3_key}")
 
+                    if not object_exists(self._s3, self._bucket, bundle_s3_key):
+                        with open(bundle_path, "rb") as bundle_file:
+                            exponential_retry(
+                                put_object,
+                                {"ServiceException", "TooManyRequestsException"},
+                                self._bucket,
+                                bundle_s3_key,
+                                bundle_file.read(),
+                            )
+
+            # even if used_jobs is empty, we still iterate over all the possible jobs so that we can clean-up unused jobs
             for lang, lang_spec in self._glue_job_lang_map.items():
                 working_set_s3_location = None
-                if lang == GlueJobLanguage.PYTHON:
+                if lang == GlueJobLanguage.PYTHON and lang in used_jobs:
                     # Upload the bundle (working set) to its own bucket.
                     exponential_retry(
                         put_object,
@@ -830,44 +904,48 @@ class AWSGlueBatchComputeBasic(AWSConstructMixin, BatchCompute):
 
                     working_set_s3_location = f"s3://{self._bucket_name}/{self._intelliflow_python_workingset_key}"
                 for version, version_spec in lang_spec.items():
-                    batch = version_spec["boilerplate"]()
-                    file_ext = version_spec["ext"]
-                    batch_script_file_key = build_object_key(["batch"], f"glueetl_{batch.__class__.__name__.lower()}.{file_ext}")
-                    exponential_retry(
-                        put_object,
-                        {"ServiceException", "TooManyRequestsException"},
-                        self._bucket,
-                        batch_script_file_key,
-                        batch.generate_glue_script().encode("utf-8"),
-                    )
+                    if lang in used_jobs and version in used_jobs[lang]:
+                        batch = version_spec["boilerplate"]()
+                        file_ext = version_spec["ext"]
+                        batch_script_file_key = build_object_key(["batch"], f"glueetl_{batch.__class__.__name__.lower()}.{file_ext}")
+                        exponential_retry(
+                            put_object,
+                            {"ServiceException", "TooManyRequestsException"},
+                            self._bucket,
+                            batch_script_file_key,
+                            batch.generate_glue_script().encode("utf-8"),
+                        )
 
-                    lang_abi_job_name = version_spec["job_name"]
-                    job_name = exponential_retry(get_glue_job, self.CLIENT_RETRYABLE_EXCEPTION_LIST, self._glue, lang_abi_job_name)
+                        lang_abi_job_name = version_spec["job_name"]
+                        job_name = exponential_retry(get_glue_job, self.CLIENT_RETRYABLE_EXCEPTION_LIST, self._glue, lang_abi_job_name)
 
-                    if lang == GlueJobLanguage.PYTHON:
-                        # it will be uploaded within "_update_bootstrapper"
-                        # only available in GlueJobLanguage.PYTHON, so in Scala 'RheocerOS' runtime and
-                        # active platform object (drivers) are not available.
-                        default_args = {f"--{BOOTSTRAPPER_PLATFORM_KEY_PARAM}": self.build_bootstrapper_object_key()}
-                    elif lang == GlueJobLanguage.SCALA:
-                        default_args = {f"--class": batch.CLASS_NAME}
+                        if lang == GlueJobLanguage.PYTHON:
+                            # it will be uploaded within "_update_bootstrapper"
+                            # only available in GlueJobLanguage.PYTHON, so in Scala 'RheocerOS' object model and
+                            # active platform object (drivers) are not available.
+                            default_args = {f"--{BOOTSTRAPPER_PLATFORM_KEY_PARAM}": self.build_bootstrapper_object_key()}
+                        elif lang == GlueJobLanguage.SCALA:
+                            default_args = {f"--class": batch.CLASS_NAME}
 
-                    description = f"RheocerOS {lang.value}, Glue Version {version} batch-compute driver for the application {self._dev_platform.context_id}"
-                    create_or_update_func = create_glue_job if not job_name else update_glue_job
-                    exponential_retry(
-                        create_or_update_func,
-                        self.CLIENT_RETRYABLE_EXCEPTION_LIST,
-                        self._glue,
-                        lang_abi_job_name,
-                        description,
-                        self._params[AWSCommonParams.IF_EXE_ROLE],
-                        GlueJobCommandType.BATCH,
-                        lang,
-                        f"s3://{self._bucket_name}/{batch_script_file_key}",
-                        glue_version=version,
-                        working_set_s3_location=working_set_s3_location,
-                        default_args=default_args,
-                    )
+                        description = f"RheocerOS {lang.value}, Glue Version {version} batch-compute driver for the application {self._dev_platform.context_id}"
+                        create_or_update_func = create_glue_job if not job_name else update_glue_job
+                        exponential_retry(
+                            create_or_update_func,
+                            self.CLIENT_RETRYABLE_EXCEPTION_LIST,
+                            self._glue,
+                            lang_abi_job_name,
+                            description,
+                            self._params[AWSCommonParams.IF_EXE_ROLE],
+                            GlueJobCommandType.BATCH,
+                            lang,
+                            f"s3://{self._bucket_name}/{batch_script_file_key}",
+                            glue_version=version,
+                            working_set_s3_location=working_set_s3_location,
+                            default_args=default_args,
+                        )
+                    else:  # delete the job if not used
+                        lang_abi_job_name = version_spec["job_name"]
+                        exponential_retry(delete_glue_job, self.CLIENT_RETRYABLE_EXCEPTION_LIST, self._glue, lang_abi_job_name)
 
         super().activate()
 
@@ -1070,6 +1148,9 @@ class AWSGlueBatchComputeBasic(AWSConstructMixin, BatchCompute):
                 details[
                     "JobRunURL"
                 ] = f"https://{self.region}.console.aws.amazon.com/gluestudio/home?region={self.region}#/job/{details['JobName']}/run/{details['JobId']}"
+                details[
+                    "JobLogURL"
+                ] = f"https://{self.region}.console.aws.amazon.com/cloudwatch/home?region={self.region}#logsV2:log-groups/log-group/$252Faws-glue$252Fjobs$252Foutput/log-events/{details['JobId']}"
                 details["StartedOn"] = final_execution_details.get("StartedOn", None)
                 details["CompletedOn"] = final_execution_details.get("CompletedOn", None)
                 details["JobRunState"] = final_execution_details.get("JobRunState", None)
@@ -1082,8 +1163,8 @@ class AWSGlueBatchComputeBasic(AWSConstructMixin, BatchCompute):
                 job_run_state = final_execution_details.get("JobRunState", None)
                 # Adding error message if the JobRun FAILED OR TIMEDOUT
                 if job_run_state == "FAILED" or job_run_state == "TIMEOUT":
-                    details["ErrorMessage"] = final_execution_details["ErrorMessage"]
-                    details["Timeout"] = final_execution_details["Timeout"]
+                    details["ErrorMessage"] = final_execution_details.get("ErrorMessage", None)
+                    details["Timeout"] = final_execution_details.get("Timeout", None)
 
                 execution_details.update({"details": details})
 
@@ -1098,3 +1179,67 @@ class AWSGlueBatchComputeBasic(AWSConstructMixin, BatchCompute):
                 execution_details.update({"slot": slot})
 
             return execution_details
+
+    def get_compute_record_logs(
+        self,
+        compute_record: "RoutingTable.ComputeRecord",
+        error_only: bool = True,
+        filter_pattern: Optional[str] = None,
+        time_range: Optional[Tuple[int, int]] = None,
+        limit: Optional[int] = None,
+        next_token: Optional[str] = None,
+    ) -> Optional[ComputeLogQuery]:
+        if compute_record.session_state:
+            if compute_record.session_state.executions:
+                final_execution_details = compute_record.session_state.executions[::-1][0].details
+                job_run_id = final_execution_details.get("Id", None)
+                start_timestamp = final_execution_details.get("StartedOn", None)
+                end_timestamp = final_execution_details.get("CompletedOn", None)
+                query = {
+                    # don't use this, there are multiple log-streams created by each executor. all share the same log stream prefix
+                    # "logStreamNames": [job_run_id],
+                    "logStreamNamePrefix": job_run_id
+                }
+                if start_timestamp:
+                    start_timestamp = int(round(start_timestamp.timestamp()))
+                    query.update({"startTime": start_timestamp})
+                if end_timestamp:
+                    end_timestamp = int(round(end_timestamp.timestamp()))
+                    query.update({"endTime": end_timestamp})
+
+                # build the filter pattern
+                # refer
+                #  https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/FilterAndPatternSyntax.html
+                pattern = None
+                if error_only:
+                    pattern = "?Error ?Exception ?Failure ?ERROR ?EXCEPTION ?FAILURE"
+
+                if filter_pattern:
+                    pattern = (pattern + " " + filter_pattern) if pattern else filter_pattern
+
+                if pattern:
+                    query.update({"filterPattern": pattern})
+
+                if next_token:
+                    query.update({"nextToken": next_token})
+
+                if limit:
+                    query.update({"limit": limit})
+
+                records = []
+                for log_group_type in LOG_GROUPS:
+                    query.update({"logGroupName": generate_loggroup_name(log_group_type)})
+                    response = self._filter_log_events(**query)
+                    # TODO observe and handle cases where events are empty but nextToken is returned
+                    # while not response["events"] and response.get("nextToken", None):
+                    #    query.update({"nextToken": response["nextToken"]})
+                    #    time.sleep(1)
+                    #    response = self._filter_log_events(**query)
+                    records.extend(response["events"])
+
+                log_stream_urls = generate_logstream_urls(self.region, job_run_id)
+                return ComputeLogQuery(records, log_stream_urls, response.get("nextToken", None))
+
+    # main reason this has been wrapped here is better testability
+    def _filter_log_events(self, **query) -> Dict[str, Any]:
+        return exponential_retry(self._cw_logs.filter_log_events, ["AccessDeniedException"], **query)

@@ -43,6 +43,17 @@ class TestSlot:
         )
         assert not self.slot_batch_compute_basic.check_integrity(Slot(other.type, other.code, other.code_lang, other.code_abi, {}, None))
 
+    def test_slot_check_integrity_complex_code(self):
+        code = SlotCode("<code>", SlotCodeMetadata(SlotCodeType.EMBEDDED_SCRIPT, external_library_paths=["a", "b", "c"]))
+        code_with_diff_library_order = SlotCode(
+            "<code>", SlotCodeMetadata(SlotCodeType.EMBEDDED_SCRIPT, external_library_paths=["c", "a", "b"])
+        )
+
+        slot1 = Slot(SlotType.SYNC_INLINED, code, None, None, None, None, [], 4)
+        slot2 = Slot(SlotType.SYNC_INLINED, code_with_diff_library_order, None, None, None, None, [], 4)
+
+        assert slot1.check_integrity(slot2)
+
     def test_slot_api(self):
         assert (
             self.slot_batch_compute_basic.type == self.slot_batch_compute_basic_clone.type

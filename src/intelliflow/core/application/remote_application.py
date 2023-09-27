@@ -3,7 +3,7 @@
 
 import copy
 import logging
-from typing import Dict, Iterable, List, Mapping, Sequence, Tuple, Type, Union, cast
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Type, Union, cast
 
 from intelliflow.core.application.context.node.base import DataNode, Node
 from intelliflow.core.application.context.node.marshaling.nodes import MarshalerNode
@@ -35,11 +35,20 @@ class RemoteApplication(Serializable["RemoteApplication"]):
 
     @property
     def platform(self) -> "DevelopmentPlatform":
+        # let it fail if explicitly called on a transitive app
         return self._remote_app.platform
 
     @property
     def remote_app(self) -> "Application":
         return self._remote_app
+
+    @property
+    def is_transitive(self) -> bool:
+        """Whether this remote app is a parent of a remote app (parent of the host/client application, i.e grand parent)?
+        Framework does not attempt to load and expose those transitive app dependencies.
+        Only the direct ancestors, one level only as can be observed in Context::_deserialized_init
+        where we load remote apps of an application if it is the host/client application."""
+        return not self._remote_app
 
     def _create_app(self, host_platform: HostPlatform) -> "Application":
         new_conf = copy.deepcopy(self._conf)
@@ -47,7 +56,7 @@ class RemoteApplication(Serializable["RemoteApplication"]):
 
         from intelliflow.core.application.application import Application
 
-        return Application(self._id, RemotePlatform(new_conf))
+        return Application(self._id, RemotePlatform(new_conf), enforce_runtime_compatibility=True)
 
     def _serializable_copy_init(self, org_instance: "RemoteApplication") -> None:
         super()._serializable_copy_init(org_instance)
@@ -70,6 +79,7 @@ class RemoteApplication(Serializable["RemoteApplication"]):
 
     @property
     def uuid(self) -> str:
+        # let it fail if explicitly called on a transitive app
         return self._remote_app.uuid
 
     def map_as_external(self, signal: Signal) -> Signal:
@@ -95,37 +105,46 @@ class RemoteApplication(Serializable["RemoteApplication"]):
 
     # overrides
     def refresh(self) -> None:
-        self._remote_app.refresh()
+        if not self.is_transitive:
+            self._remote_app.refresh()
 
     def query_data(self, query: str) -> Mapping[str, Node]:
-        return self._remote_app.query_data(
-            query, self._remote_app.QueryApplicationScope.CURRENT_APP_ONLY, self._remote_app.QueryContext.ACTIVE_RUNTIME_CONTEXT
-        )
+        if not self.is_transitive:
+            return self._remote_app.query_data(
+                query, self._remote_app.QueryApplicationScope.CURRENT_APP_ONLY, self._remote_app.QueryContext.ACTIVE_RUNTIME_CONTEXT
+            )
 
-    def query(self, query_visitors: Sequence[Node.QueryVisitor]) -> Mapping[str, Node]:
-        return self._remote_app.query(
-            query_visitors, self._remote_app.QueryApplicationScope.CURRENT_APP_ONLY, self._remote_app.QueryContext.ACTIVE_RUNTIME_CONTEXT
-        )
+    def query(self, query_visitors: Sequence[Node.QueryVisitor]) -> Optional[Mapping[str, Node]]:
+        if not self.is_transitive:
+            return self._remote_app.query(
+                query_visitors,
+                self._remote_app.QueryApplicationScope.CURRENT_APP_ONLY,
+                self._remote_app.QueryContext.ACTIVE_RUNTIME_CONTEXT,
+            )
 
-    def get_data(self, data_id: str) -> List[MarshalerNode]:
-        return self._remote_app.get_data(
-            data_id, self._remote_app.QueryApplicationScope.CURRENT_APP_ONLY, self._remote_app.QueryContext.ACTIVE_RUNTIME_CONTEXT
-        )
+    def get_data(self, data_id: str) -> Optional[List[MarshalerNode]]:
+        if not self.is_transitive:
+            return self._remote_app.get_data(
+                data_id, self._remote_app.QueryApplicationScope.CURRENT_APP_ONLY, self._remote_app.QueryContext.ACTIVE_RUNTIME_CONTEXT
+            )
 
-    def get_timer(self, timer_id: str) -> List[MarshalerNode]:
-        return self._remote_app.get_timer(
-            timer_id, self._remote_app.QueryApplicationScope.CURRENT_APP_ONLY, self._remote_app.QueryContext.ACTIVE_RUNTIME_CONTEXT
-        )
+    def get_timer(self, timer_id: str) -> Optional[List[MarshalerNode]]:
+        if not self.is_transitive:
+            return self._remote_app.get_timer(
+                timer_id, self._remote_app.QueryApplicationScope.CURRENT_APP_ONLY, self._remote_app.QueryContext.ACTIVE_RUNTIME_CONTEXT
+            )
 
-    def list(self, node_type: Type[Node] = MarshalerNode) -> Iterable[Node]:
-        return self._remote_app.list(
-            node_type, self._remote_app.QueryApplicationScope.CURRENT_APP_ONLY, self._remote_app.QueryContext.ACTIVE_RUNTIME_CONTEXT
-        )
+    def list(self, node_type: Type[Node] = MarshalerNode) -> Optional[Iterable[Node]]:
+        if not self.is_transitive:
+            return self._remote_app.list(
+                node_type, self._remote_app.QueryApplicationScope.CURRENT_APP_ONLY, self._remote_app.QueryContext.ACTIVE_RUNTIME_CONTEXT
+            )
 
-    def list_data(self) -> Sequence[MarshalerNode]:
-        return self._remote_app.list_data(
-            self._remote_app.QueryApplicationScope.CURRENT_APP_ONLY, self._remote_app.QueryContext.ACTIVE_RUNTIME_CONTEXT
-        )
+    def list_data(self) -> Optional[Sequence[MarshalerNode]]:
+        if not self.is_transitive:
+            return self._remote_app.list_data(
+                self._remote_app.QueryApplicationScope.CURRENT_APP_ONLY, self._remote_app.QueryContext.ACTIVE_RUNTIME_CONTEXT
+            )
 
     def __getitem__(self, entity_id) -> MarshalerNode:
         # FUTURE when other node types are introduced call their respective retrieval API

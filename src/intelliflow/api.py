@@ -4,11 +4,14 @@
 from typing import List
 
 from intelliflow.core.permission import Permission
+from intelliflow.core.platform.compute_targets.slack import Slack
 from intelliflow.core.platform.constructs import BatchCompute as BatchComputeDriver
 from intelliflow.core.platform.constructs import (
+    CompositeExtension,
     ConstructEncryption,
     ConstructPersistenceSecurityDef,
     ConstructSecurityConf,
+    Diagnostics,
     EncryptionKeyAllocationLevel,
     ProcessingUnit,
     ProcessorQueue,
@@ -26,12 +29,13 @@ from .core.application.application import Application, OutputDimensionNameType
 from .core.application.context.node.base import Node
 from .core.application.context.node.external.alarm.nodes import CWAlarmNode
 from .core.application.context.node.external.metric.nodes import CWMetricNode
-from .core.application.context.node.external.nodes import ExternalDataNode, GlueTableDataNode, S3DataNode
+from .core.application.context.node.external.nodes import ExternalDataNode, GlueTableDataNode, S3DataNode, SNSNode
 from .core.application.context.node.internal.nodes import InternalDataNode
 from .core.application.context.node.marshaling.nodes import MarshalerNode
 from .core.deployment import set_deployment_conf
 from .core.platform.definitions.aws.common import IF_DEV_ROLE_FORMAT
 from .core.platform.development import AWSConfiguration, HostPlatform, LocalConfiguration
+from .core.platform.drivers.extension.aws.basic.ddb_table import AWSDDBTableExtension
 from .core.platform.endpoint import DevEndpoint
 from .core.signal_processing.definitions.dimension_defs import NameType as DimensionNameType
 from .core.signal_processing.definitions.dimension_defs import Type as DimensionType
@@ -44,11 +48,13 @@ from .core.signal_processing.definitions.metric_alarm_defs import (
 )
 from .core.signal_processing.routing_runtime_constructs import Route, RouteCheckpoint, RouteExecutionHook, RouteID, RoutePendingNodeHook
 from .core.signal_processing.signal import SignalIntegrityProtocol
-from .core.signal_processing.signal_source import DatasetSignalSourceFormat, GlueTableSignalSourceAccessSpec
+from .core.signal_processing.signal_source import DataFrameFormat, DatasetSignalSourceFormat, GlueTableSignalSourceAccessSpec
 
 S3Dataset = S3DataNode.Descriptor
 GlueTable = GlueTableDataNode.Descriptor
 DataFormat = DatasetSignalSourceFormat
+
+SNS = Topic = SNSTopic = SNSNode.Descriptor
 
 CWMetric = CWMetricNode.Descriptor
 CWAlarm = CWAlarmNode.Descriptor
@@ -102,5 +108,8 @@ class BatchCompute(InternalDataNode.BatchComputeDescriptor):
         super().__init__(code, lang, abi, extra_permissions, retry_count, **kwargs)
 
 
-def create_or_update_application(id: str, platform: HostPlatform) -> Application:
-    return Application(id, platform)
+def create_or_update_application(id: str, platform: HostPlatform, enforce_runtime_compatibility: bool = True) -> Application:
+    return Application(id, platform, enforce_runtime_compatibility)
+
+# Platform Extensions typedefs
+DynamoDBTable = AWSDDBTableExtension.Descriptor

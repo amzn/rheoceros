@@ -3,7 +3,7 @@
 
 import pytest
 
-from intelliflow.core.platform.definitions.aws.common import _check_statement_field_equality
+from intelliflow.core.platform.definitions.aws.common import _check_statement_field_equality, normalize_policy_arn
 
 
 class TestPlatformCommonDefinitions:
@@ -24,3 +24,13 @@ class TestPlatformCommonDefinitions:
         assert not _check_statement_field_equality({"Resource": "resource1"}, {"Resource": ["resource1", "resource2"]}, "Resource")
 
         assert _check_statement_field_equality({"Resource": "resource1"}, {"Resource": ["resource1", "resource1"]}, "Resource")
+
+    def test_normalize_policy_arn(self):
+        assert (
+            normalize_policy_arn("service-role/AmazonElasticMapReduceEditorsRole")
+            == "arn:aws:iam::aws:policy/service-role/AmazonElasticMapReduceEditorsRole"
+        )
+        assert (
+            normalize_policy_arn("arn:aws:iam::12345678910:policy/CloudRanger/InfoSecHostMonitoringPolicy-DO-NOT-DELETE")
+            == "arn:aws:iam::12345678910:policy/CloudRanger/InfoSecHostMonitoringPolicy-DO-NOT-DELETE"
+        )

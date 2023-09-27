@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import pytest
-from mock import MagicMock
+from unittest.mock import MagicMock
 
 from intelliflow.api_ext import *
 from intelliflow.core.platform import development as development_module
@@ -85,6 +85,7 @@ class TestAWSApplicationComputeTargets(AWSTestBase):
         self.app.activate()
 
         assert custom_compute.activation_completed_called
+        assert "lambda" in custom_compute.describe_slot()["code"].lower()
 
         # now test the effect of update_data on ComputeDescriptors. Descriptors from most recently updated nodes will be
         # notified during activation, not an older version of the same node (created by create_data or updated by an
@@ -239,6 +240,7 @@ class TestAWSApplicationComputeTargets(AWSTestBase):
         # BEGIN mock BatchCompute to yield successful execution
         # mock batch_compute for instant success on batch jobs
         def compute(
+            route: Route,
             materialized_inputs: List[Signal],
             slot: Slot,
             materialized_output: Signal,
@@ -308,7 +310,15 @@ class TestAWSApplicationComputeTargets(AWSTestBase):
                     Timeout=3 * 60,  # 3 hours
                     my_param="PARAM1",
                     args1="v1",
-                )
+                ),
+                Glue(
+                    SlotCode(
+                        "<SOME Pyspark CODE>",
+                        SlotCodeMetadata(
+                            SlotCodeType.EMBEDDED_SCRIPT, external_library_paths=["python-foo-lib", "python-bar-lib", "python-lib"]
+                        ),
+                    )
+                ),
             ],
             dataset_format=DatasetSignalSourceFormat.PARQUET,
         )
@@ -331,6 +341,8 @@ class TestAWSApplicationComputeTargets(AWSTestBase):
         kickoff_route = app.get_active_route(kickoff_node).route
         # now it should give 2!
         assert len(cast(SlotCode, kickoff_route.slots[0].code).metadata.external_library_paths) == 2
+        # now it should give 3! on number of external libs for the PySpark compute
+        assert len(cast(SlotCode, kickoff_route.slots[1].code).metadata.external_library_paths) == 3
 
         self.patch_aws_stop()
 
@@ -361,6 +373,7 @@ class TestAWSApplicationComputeTargets(AWSTestBase):
         # BEGIN mock BatchCompute to yield successful execution
         # mock batch_compute for instant success on batch jobs
         def compute(
+            route: Route,
             materialized_inputs: List[Signal],
             slot: Slot,
             materialized_output: Signal,
@@ -460,5 +473,71 @@ class TestAWSApplicationComputeTargets(AWSTestBase):
 
         with pytest.raises(ValueError):
             app.activate()
+
+        self.patch_aws_stop()
+
+    def test_application_batch_compute_spark_sql(self):
+        self.patch_aws_start(glue_catalog_has_all_tables=True)
+        app = AWSApplication("sql-module", self.region)
+
+        with pytest.raises(ValueError):
+            sql_module("test.intelliflow.core.application.test_resources", "test1.sql")
+
+        sql_test = sql_module("test.intelliflow.core.application.test_resources", "test.sql")
+
+        assert sql_test == "SELECT * from o_transits"
+
+        app.create_data("test_node", compute_targets=[SparkSQL(sql_test)])
+
+        self.patch_aws_stop()
+
+    def test_application_batch_compute_user_code_dedentation(self):
+        self.patch_aws_start(glue_catalog_has_all_tables=True)
+
+        app = AWSApplication("usercode-dedent", self.region)
+
+        dummy_scala_code = """
+            this won't get executed in this unit-test, so don't matter.
+        """
+        scala_node = app.create_data(
+            id="scala_node",
+            compute_targets=[
+                BatchCompute(
+                    scala_script(
+                        dummy_scala_code,
+                        external_library_paths=["s3://if-awsglue-adex-ml-230392972774-us-east-1/batch/DexmlBladeGlue-super.jar"],
+                    ),
+                    lang=Lang.SCALA,
+                    GlueVersion="2.0",
+                    WorkerType=GlueWorkerType.G_1X.value,
+                    NumberOfWorkers=2,
+                    Timeout=3 * 60,  # 3 hours
+                    my_param="PARAM1",
+                    args1="v1",
+                )
+            ],
+            dataset_format=DatasetSignalSourceFormat.PARQUET,
+        )
+        route: Route = scala_node.bound.create_route()
+        # We don't format user Scala code, so user code should be kept intact
+        code = route.slots[0].code
+        assert isinstance(code, SlotCode)
+        assert dummy_scala_code == str(code)
+
+        dummy_python_code = """
+            PYSPARK
+                CODE WITH 4 LEADING SPACES
+            \tCODE WITH A LEADING TAB
+            HERE
+        """
+        python_node = app.create_data(
+            id="python_node",
+            compute_targets=[Glue(dummy_python_code)],
+        )
+        route: Route = python_node.bound.create_route()
+        # We only format user Python code, so user code should be reformatted
+        code = route.slots[0].code
+        assert not isinstance(code, SlotCode)
+        assert "PYSPARK\n    CODE WITH 4 LEADING SPACES\n\tCODE WITH A LEADING TAB\nHERE" == route.slots[0].code
 
         self.patch_aws_stop()

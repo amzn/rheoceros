@@ -6,6 +6,7 @@ from enum import Enum, unique
 
 @unique
 class ActivationParams(str, Enum):
+    CONTEXT_ID = "CONTEXT"
     UNIQUE_ID_FOR_CONTEXT = "UNIQUE_ID_FOR_CONTEXT"
     UNIQUE_ID_FOR_HOST_CONTEXT = "UNIQUE_ID_FOR_HOST_CONTEXT"
     # using pkg_resources terminology of workingset, which perfectly fits our general use

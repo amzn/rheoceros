@@ -12,10 +12,14 @@ class Lang(int, Enum):
     PRESTO_SQL = 4
     HIVE = 5
     PIG = 6
+    # consider entity descriptions as DSLs
+    AWS_SAGEMAKER_TRAINING_JOB = 7
+    AWS_SAGEMAKER_TRANSFORM_JOB = 8
 
 
 @unique
 class ABI(int, Enum):
+    NONE = 0
     GLUE_EMBEDDED = 1
     _AMZN_RESERVED_1 = 2
     PARAMETRIZED_QUERY = 3

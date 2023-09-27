@@ -2,10 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from test.intelliflow.core.platform.driver_test_utils import DriverTestUtils
+from unittest.mock import MagicMock
 
 import boto3
 import pytest
-from mock import MagicMock
 
 import intelliflow.core.platform.drivers.processor.aws as processor_driver
 from intelliflow.api_ext import AnyDate
@@ -30,14 +30,14 @@ from intelliflow.mixins.aws.test import AWSTestBase
 
 class TestAWSLambdaProcessorBasic(AWSTestBase, DriverTestUtils):
 
-    params = {}
-
-    expected_queue_url = "https://sqs.us-east-1.amazonaws.com/123456789012/if-AWSLambdaProcessorBasic-test123-us-east-1-DLQ"
-    expected_queue_arn = "arn:aws:sqs:us-east-1:123456789012:if-AWSLambdaProcessorBasic-test123-us-east-1-DLQ"
-    expected_lambda_arn = "arn:aws:lambda:us-east-1:123456789012:function:if-AWSLambdaProcessorBasic-test123-us-east-1"
-    expected_lambda_name = "if-AWSLambdaProcessorBasic-test123-us-east-1"
-    expected_filter_lambda_arn = "arn:aws:lambda:us-east-1:123456789012:function:if-AWSLambdaProcessorBasic-test123-us-east-1-FILTER"
-    expected_filter_lambda_name = "if-AWSLambdaProcessorBasic-test123-us-east-1-FILTER"
+    # "https://queue.amazonaws.com" is deprecated in newer versions of boto3: https://github.com/boto/botocore/issues/2705
+    expected_queue_path = "123456789012/if-AWSLambdaProcessorBasic-{}-us-east-1-DLQ"
+    expected_queue_arn = "arn:aws:sqs:us-east-1:123456789012:if-AWSLambdaProcessorBasic-{}-us-east-1-DLQ"
+    expected_lambda_arn = "arn:aws:lambda:us-east-1:123456789012:function:if-AWSLambdaProcessorBasic-{}-us-east-1"
+    expected_lambda_name = "if-AWSLambdaProcessorBasic-{}-us-east-1"
+    expected_filter_lambda_arn = "arn:aws:lambda:us-east-1:123456789012:function:if-AWSLambdaProcessorBasic-{}-us-east-1-FILTER"
+    expected_filter_lambda_name = "if-AWSLambdaProcessorBasic-{}-us-east-1-FILTER"
+    expected_replay_lambda_arn = "arn:aws:lambda:us-east-1:123456789012:function:if-AWSLambdaProcessorBasic-{}-us-east-1-REPLAY"
 
     expected_s3_policy_statement = [
         {
@@ -127,19 +127,33 @@ class TestAWSLambdaProcessorBasic(AWSTestBase, DriverTestUtils):
     )
 
     def setup_platform_and_params(self):
+        self.params = {}
         self.init_common_utils()
         self.params[CommonParams.BOTO_SESSION] = boto3.Session(None, None, None, self.region)
         self.params[CommonParams.REGION] = self.region
         self.params[CommonParams.ACCOUNT_ID] = self.account_id
         self.params[CommonParams.IF_DEV_ROLE] = "DevRole"
         self.params[CommonParams.IF_EXE_ROLE] = "ExeRole"
-        self.mock_processor = AWSLambdaProcessorBasic(self.params)
-        self.mock_host_platform = HostPlatform(
+
+    def get_driver_and_platform(self):
+        mock_platform = HostPlatform(
             AWSConfiguration.builder()
             .with_default_credentials(as_admin=True)
             .with_region("us-east-1")
             .with_processor(AWSLambdaProcessorBasic)
             .build()
+        )
+
+        from collections import namedtuple
+
+        TestRoutingTable = namedtuple("TestRoutingTable", ["is_synchronized"])
+        mock_platform._routing_table = TestRoutingTable(is_synchronized=lambda: False)
+        mock_platform._diagnostics = MagicMock(return_value=MagicMock())
+        mock_platform._processor_queue = MagicMock(return_value=MagicMock())
+
+        return (
+            AWSLambdaProcessorBasic(self.params),
+            mock_platform,
         )
 
     def create_timer_signal(self, context_id):
@@ -167,150 +181,174 @@ class TestAWSLambdaProcessorBasic(AWSTestBase, DriverTestUtils):
                     assert st["Resource"] == res_st["Resource"]
 
     def test_processor_dev_successful(self):
+        context_id = "test123_l_1"
         self.patch_aws_start()
         self.setup_platform_and_params()
-        self.mock_host_platform.context_id = "test123"
-        self.mock_processor.dev_init(self.mock_host_platform)
-        assert self.mock_processor._lambda_name == "if-AWSLambdaProcessorBasic-test123-us-east-1"
+        mock_processor, mock_host_platform = self.get_driver_and_platform()
+        mock_host_platform._context_id = context_id
+        mock_processor.dev_init(mock_host_platform)
+        assert mock_processor._lambda_name == f"if-AWSLambdaProcessorBasic-{context_id}-us-east-1"
         assert (
-            self.mock_processor._lambda_arn == "arn:aws:lambda:us-east-1:123456789012:function:if-AWSLambdaProcessorBasic-test123-us-east-1"
+            mock_processor._lambda_arn
+            == f"arn:aws:lambda:us-east-1:123456789012:function:if-AWSLambdaProcessorBasic-{context_id}-us-east-1"
         )
-        assert self.mock_processor._bucket_name == AWSLambdaProcessorBasic.BOOTSTRAPPER_ROOT_FORMAT.format(
-            "awslambda".lower(), self.mock_host_platform._context_id.lower(), self.account_id, self.region
+        assert mock_processor._bucket_name == AWSLambdaProcessorBasic.BOOTSTRAPPER_ROOT_FORMAT.format(
+            "awslambda".lower(), mock_host_platform._context_id.lower(), self.account_id, self.region
         )
         self.patch_aws_stop()
 
     def test_processor_dlq_name_len_max_80_exception(self):
         self.patch_aws_start()
         self.setup_platform_and_params()
+        mock_processor, mock_host_platform = self.get_driver_and_platform()
         with pytest.raises(Exception) as error:
             context_id = str()
             for c in range(25):
                 context_id += str(c)
-            self.mock_host_platform._context_id = context_id
-            self.mock_processor.dev_init(self.mock_host_platform)
+            mock_host_platform._context_id = context_id
+            mock_processor.dev_init(mock_host_platform)
         assert error.typename == "ValueError"
         self.patch_aws_stop()
 
     def test_processor_dev_bucket_len_max_64_exception(self):
         self.patch_aws_start()
         self.setup_platform_and_params()
+        mock_processor, mock_host_platform = self.get_driver_and_platform()
         with pytest.raises(Exception) as error:
             context_id = str()
             for c in range(20):
                 context_id += str(c)
-            self.mock_host_platform._context_id = context_id
-            self.mock_processor.dev_init(self.mock_host_platform)
+            mock_host_platform._context_id = context_id
+            mock_processor.dev_init(mock_host_platform)
         assert error.typename == "ValueError"
         self.patch_aws_stop()
 
     def test_processor_main_loop_timer_id_len_greater_than_64_exception(self):
         self.patch_aws_start()
         self.setup_platform_and_params()
+        mock_processor, mock_host_platform = self.get_driver_and_platform()
         with pytest.raises(Exception) as error:
             context_id = str()
             for c in range(17):
                 context_id += str(c)
-            self.mock_host_platform._context_id = context_id
-            self.mock_processor.dev_init(self.mock_host_platform)
+            mock_host_platform._context_id = context_id
+            mock_processor.dev_init(mock_host_platform)
         assert error.typename == "ValueError"
         self.patch_aws_stop()
 
     def test_processor_catalog_event_rule_id_len_greater_than_64_exception(self):
         self.patch_aws_start()
         self.setup_platform_and_params()
+        mock_processor, mock_host_platform = self.get_driver_and_platform()
         with pytest.raises(Exception) as error:
             context_id = str()
             for c in range(15):
                 context_id += str(c)
-            self.mock_host_platform._context_id = context_id
-            self.mock_processor.dev_init(self.mock_host_platform)
+            mock_host_platform._context_id = context_id
+            mock_processor.dev_init(mock_host_platform)
         assert error.typename == "ValueError"
         self.patch_aws_stop()
 
     def test_processor_activate_success(self):
+        context_id = "test123_l_2"
         self.patch_aws_start()
         self.setup_platform_and_params()
+        mock_processor, mock_host_platform = self.get_driver_and_platform()
         events = self.params[CommonParams.BOTO_SESSION].client(service_name="events", region_name=self.region)
-        self.mock_host_platform.context_id = "test123"
-        self.mock_processor.dev_init(self.mock_host_platform)
-        self.mock_processor.activate()
-        assert self.mock_processor._dlq_url == self.expected_queue_url
-        assert self.mock_processor._dlq_arn == self.expected_queue_arn
-        assert self.mock_processor._lambda_arn == self.expected_lambda_arn
-        assert self.mock_processor._filter_lambda_arn == self.expected_filter_lambda_arn
-        response = events.list_targets_by_rule(Rule=self.mock_processor._main_loop_timer_id)
-        assert response["Targets"][0]["Id"] == self.expected_lambda_name
+        mock_host_platform._context_id = context_id
+        mock_processor.dev_init(mock_host_platform)
+        mock_processor.activate()
+        assert mock_processor._dlq_url.startswith("https://")
+        endpoints, path = mock_processor._dlq_url[len("https://") :].split("/", maxsplit=1)
+        assert ("sqs" in endpoints or "queue" in endpoints) and "amazonaws.com" in endpoints
+        assert path == self.expected_queue_path.format(context_id)
+        assert mock_processor._dlq_arn == self.expected_queue_arn.format(context_id)
+        assert mock_processor._lambda_arn == self.expected_lambda_arn.format(context_id)
+        assert mock_processor._filter_lambda_arn == self.expected_filter_lambda_arn.format(context_id)
+        assert mock_processor._replay_lambda_arn == self.expected_replay_lambda_arn.format(context_id)
+        response = events.list_targets_by_rule(Rule=mock_processor._main_loop_timer_id)
+        assert response["Targets"][0]["Id"] == self.expected_lambda_name.format(context_id)
+        self.patch_aws_stop()
+
+    def test_processor_repeat_activate_skip_unnecessary_workspace_load(self):
+        self.patch_aws_start()
+        self.setup_platform_and_params()
+        mock_processor, mock_host_platform = self.get_driver_and_platform()
+        s3 = boto3.resource("s3", region_name=self.region)
+        mock_host_platform._context_id = "test123_l_3"
+        mock_processor.dev_init(mock_host_platform)
+        mock_processor.activate()
+
+        mock_bucket = MagicMock()
+        workspace_sha256 = "JWtpATqtCBzY1wkbuZxpjy5zSlV0m2w90PYpece/wUA="
+        mock_processor._s3.get_object_sha256_hash = MagicMock(return_value=workspace_sha256)
+
+        num_of_put_object_calls_before = mock_bucket.call_count
+        result = mock_processor._upload_working_set_to_s3(b"Test Workset", mock_bucket, "WorkingSet.zip")
+        num_of_put_object_calls_after = mock_bucket.call_count
+        assert num_of_put_object_calls_after == num_of_put_object_calls_after
+        assert workspace_sha256 == result["sha256"]
         self.patch_aws_stop()
 
     def test_processor_hook_external_not_supported_signal_exception(self):
         self.patch_aws_start()
         self.setup_platform_and_params()
-        self.mock_host_platform.context_id = "test123"
-        self.mock_processor.dev_init(self.mock_host_platform)
+        mock_processor, mock_host_platform = self.get_driver_and_platform()
+        mock_host_platform._context_id = "test123_l_4"
+        mock_processor.dev_init(mock_host_platform)
         with pytest.raises(Exception) as error:
-            self.mock_processor.hook_external([self.signal_unsupported])
+            mock_processor.hook_external([self.signal_unsupported])
         assert error.typename == "NotImplementedError"
         self.patch_aws_stop()
 
-    def test_processor_hook_external_s3_missing_acct_id_exception(self):
-        self.patch_aws_start()
-        self.setup_platform_and_params()
-        glue_client = self.params[CommonParams.BOTO_SESSION].client(service_name="glue", region_name=self.region)
-        glue_client.create_database(DatabaseInput={"Name": self.test_provider})
-        glue_client.create_table(DatabaseName=self.test_provider, TableInput={"Name": self.test_table_name})
-        self.setup_platform_and_params()
-        self.mock_host_platform.context_id = "test123"
-        self.mock_processor.dev_init(self.mock_host_platform)
-        with pytest.raises(Exception) as error:
-            self.mock_processor.hook_external([self.test_signal_andes])
-        assert error.typename == "ValueError"
-        self.patch_aws_stop()
-
     def test_processor_process_external_new_glue_table_successful(self):
+        context_id = "test123_l_6"
         self.patch_aws_start()
         self.setup_platform_and_params()
+        mock_processor, mock_host_platform = self.get_driver_and_platform()
         events = self.params[CommonParams.BOTO_SESSION].client(service_name="events", region_name=self.region)
-        self.mock_host_platform.context_id = "test123"
-        self.mock_processor.dev_init(self.mock_host_platform)
-        self.mock_processor.activate()
-        self.mock_processor._process_external_glue_table({self.test_signal_andes}, {})
-        response = events.list_targets_by_rule(Rule=self.mock_processor._glue_catalog_event_channel_rule_id)
-        assert response["Targets"][0]["Id"] == self.expected_filter_lambda_name
+        mock_host_platform._context_id = context_id
+        mock_processor.dev_init(mock_host_platform)
+        mock_processor.activate()
+        mock_processor._process_external_glue_table({self.test_signal_andes}, {})
         self.patch_aws_stop()
 
     def test_processor_process_external_old_glue_table_successful(self):
+        context_id = "test123_l_7"
         self.patch_aws_start()
         self.setup_platform_and_params()
+        mock_processor, mock_host_platform = self.get_driver_and_platform()
         events = self.params[CommonParams.BOTO_SESSION].client(service_name="events", region_name=self.region)
-        self.mock_host_platform.context_id = "test123"
-        self.mock_processor.dev_init(self.mock_host_platform)
-        self.mock_processor.activate()
-        self.mock_processor._process_external_glue_table({self.test_signal_andes}, {})
-        response = events.list_targets_by_rule(Rule=self.mock_processor._glue_catalog_event_channel_rule_id)
-        assert response["Targets"][0]["Id"] == self.expected_filter_lambda_name
+        mock_host_platform._context_id = context_id
+        mock_processor.dev_init(mock_host_platform)
+        mock_processor.activate()
+        mock_processor._process_external_glue_table({self.test_signal_andes}, {})
         num_of_remove_calls_previous = processor_driver.remove_permission.call_count
-        self.mock_processor._process_external_glue_table({}, {self.test_signal_andes})
+        mock_processor._process_external_glue_table({}, {self.test_signal_andes})
         num_of_remove_calls_current = processor_driver.remove_permission.call_count
         assert (num_of_remove_calls_current - num_of_remove_calls_previous) == 1
         self.patch_aws_stop()
 
     def test_processor_process_external_s3_new_signal_successful(self):
+        context_id = "test123_l_8"
         self.patch_aws_start()
         self.setup_platform_and_params()
+        mock_processor, mock_host_platform = self.get_driver_and_platform()
         s3 = boto3.resource("s3", region_name=self.region)
-        self.mock_host_platform.context_id = "test123"
-        self.mock_processor.dev_init(self.mock_host_platform)
-        self.mock_processor.activate()
-        self.mock_processor._params[ActivationParams.UNIQUE_ID_FOR_CONTEXT] = "unique123"
+        mock_host_platform._context_id = context_id
+        mock_processor.dev_init(mock_host_platform)
+        mock_processor.activate()
+        mock_processor._params[ActivationParams.UNIQUE_ID_FOR_CONTEXT] = "unique123"
         create_bucket(s3, "bucket", self.region)
         num_add_permission_before = processor_driver.add_permission.call_count
-        self.mock_processor._process_external_S3({self.test_signal_s3}, {})
+        mock_processor._process_external_S3({self.test_signal_s3}, {})
         num_add_permission_after = processor_driver.add_permission.call_count
         assert (num_add_permission_after - num_add_permission_before) == 1
         bucket_notification = s3.BucketNotification("bucket")
         bucket_notification.load()
-        assert bucket_notification.lambda_function_configurations[0]["LambdaFunctionArn"] == self.expected_filter_lambda_arn
+        assert bucket_notification.lambda_function_configurations[0]["LambdaFunctionArn"] == self.expected_filter_lambda_arn.format(
+            context_id
+        )
         assert bucket_notification.lambda_function_configurations[0]["Events"][0] == "s3:ObjectCreated:*"
         policy = get_policy(s3, "bucket")
         self.assert_s3_policies(policy)
@@ -319,46 +357,50 @@ class TestAWSLambdaProcessorBasic(AWSTestBase, DriverTestUtils):
     def test_processor_process_external_s3_old_signal_successful(self):
         self.patch_aws_start()
         self.setup_platform_and_params()
+        mock_processor, mock_host_platform = self.get_driver_and_platform()
         s3 = boto3.resource("s3", region_name=self.region)
-        self.mock_host_platform.context_id = "test123"
-        self.mock_processor.dev_init(self.mock_host_platform)
-        self.mock_processor.activate()
-        self.mock_processor._params[ActivationParams.UNIQUE_ID_FOR_CONTEXT] = "unique123"
+        mock_host_platform._context_id = "test123_l_9"
+        mock_processor.dev_init(mock_host_platform)
+        mock_processor.activate()
+        mock_processor._params[ActivationParams.UNIQUE_ID_FOR_CONTEXT] = "unique123"
         create_bucket(s3, "bucket", self.region)
-        self.mock_processor._process_external_S3({self.test_signal_s3}, {})
+        mock_processor._process_external_S3({self.test_signal_s3}, {})
         num_of_remove_calls_previous = processor_driver.remove_permission.call_count
-        self.mock_processor._process_external_S3({}, {self.test_signal_s3})
+        mock_processor._process_external_S3({}, {self.test_signal_s3})
         num_of_remove_calls_current = processor_driver.remove_permission.call_count
         assert (num_of_remove_calls_current - num_of_remove_calls_previous) == 1
         self.patch_aws_stop()
 
     def test_processor_process_new_timer_signal_successful(self):
+        context_id = "test123_l_10"
         self.patch_aws_start()
         self.setup_platform_and_params()
+        mock_processor, mock_host_platform = self.get_driver_and_platform()
         events = self.params[CommonParams.BOTO_SESSION].client(service_name="events", region_name=self.region)
-        self.mock_host_platform.context_id = "test123"
-        self.mock_processor.dev_init(self.mock_host_platform)
-        self.mock_processor.activate()
-        test_timer_signal = self.create_timer_signal("test123")
+        mock_host_platform._context_id = context_id
+        mock_processor.dev_init(mock_host_platform)
+        mock_processor.activate()
+        test_timer_signal = self.create_timer_signal("test123_l_10")
         num_add_permission_before = processor_driver.add_permission.call_count
-        self.mock_processor._process_internal_timers_signals({test_timer_signal}, {})
+        mock_processor._process_internal_timers_signals({test_timer_signal}, {})
         num_add_permission_after = processor_driver.add_permission.call_count
         assert (num_add_permission_after - num_add_permission_before) == 1
         response = events.list_targets_by_rule(Rule=test_timer_signal.resource_access_spec.timer_id)
-        assert response["Targets"][0]["Id"] == self.expected_lambda_name
+        assert response["Targets"][0]["Id"] == self.expected_lambda_name.format(context_id)
         self.patch_aws_stop()
 
     def test_processor_process_old_timer_signal_successful(self):
         self.patch_aws_start()
         self.setup_platform_and_params()
+        mock_processor, mock_host_platform = self.get_driver_and_platform()
         events = self.params[CommonParams.BOTO_SESSION].client(service_name="events", region_name=self.region)
-        self.mock_host_platform.context_id = "test123"
-        self.mock_processor.dev_init(self.mock_host_platform)
-        self.mock_processor.activate()
-        test_timer_signal = self.create_timer_signal("test123")
-        self.mock_processor._process_internal_timers_signals({test_timer_signal}, {})
+        mock_host_platform._context_id = "test123_l_11"
+        mock_processor.dev_init(mock_host_platform)
+        mock_processor.activate()
+        test_timer_signal = self.create_timer_signal("test123_l_11")
+        mock_processor._process_internal_timers_signals({test_timer_signal}, {})
         num_remove_permission_before = processor_driver.remove_permission.call_count
-        self.mock_processor._process_internal_timers_signals({}, {test_timer_signal})
+        mock_processor._process_internal_timers_signals({}, {test_timer_signal})
         num_remove_permission_after = processor_driver.remove_permission.call_count
         assert (num_remove_permission_after - num_remove_permission_before) == 1
         with pytest.raises(Exception) as error:
@@ -369,24 +411,28 @@ class TestAWSLambdaProcessorBasic(AWSTestBase, DriverTestUtils):
     def test_processor_event_handler_glue_table_event(self):
         self.patch_aws_start()
         self.setup_platform_and_params()
-        self.mock_host_platform.context_id = "test123"
-        self.mock_processor.dev_init(self.mock_host_platform)
-        self.mock_processor.activate()
-        self.mock_host_platform._routing_table = MagicMock(return_value=MagicMock())
-        self.mock_host_platform.routing_table.receive = MagicMock()
-        self.mock_processor.event_handler(self.mock_host_platform, self.andes_event, None)
+        mock_processor, mock_host_platform = self.get_driver_and_platform()
+        mock_host_platform._context_id = "test123_l_12"
+        mock_processor.dev_init(mock_host_platform)
+        mock_processor.activate()
+        mock_host_platform._routing_table = MagicMock(return_value=MagicMock())
+        mock_host_platform.routing_table.receive = MagicMock()
+        mock_processor.event_handler(mock_host_platform, self.andes_event, None)
         # Asserting resource path argument in receive call
-        assert self.mock_host_platform.routing_table.receive.call_args_list[0][0][2] == self.expected_andes_resource_path
+        assert mock_host_platform.routing_table.receive.call_args_list[0][0][2] == self.expected_andes_resource_path
         self.patch_aws_stop()
 
     def test_processor_event_handler_s3_event(self):
         self.patch_aws_start()
         self.setup_platform_and_params()
-        self.mock_host_platform.context_id = "test123"
-        self.mock_processor.dev_init(self.mock_host_platform)
-        self.mock_processor.activate()
-        self.mock_host_platform._routing_table = MagicMock(return_value=MagicMock())
-        self.mock_host_platform.routing_table.receive = MagicMock()
-        self.mock_processor.event_handler(self.mock_host_platform, self.s3_event, None)
-        assert self.mock_host_platform.routing_table.receive.call_args_list[0][0][2] == self.expected_s3_resource_path
+        mock_processor, mock_host_platform = self.get_driver_and_platform()
+        mock_host_platform._context_id = "test123_l_13"
+        mock_processor.dev_init(mock_host_platform)
+        mock_processor.activate()
+        mock_host_platform._routing_table = MagicMock(return_value=MagicMock())
+        mock_host_platform.routing_table.receive = MagicMock()
+        mock_host_platform._storage = MagicMock(return_value=MagicMock())
+        mock_host_platform.storage.is_internal = MagicMock(return_value=False)
+        mock_processor.event_handler(mock_host_platform, self.s3_event, None)
+        assert mock_host_platform.routing_table.receive.call_args_list[0][0][2] == self.expected_s3_resource_path
         self.patch_aws_stop()

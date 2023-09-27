@@ -7,6 +7,7 @@ import logging
 import random
 import time
 import zipfile
+from typing import Dict, Optional
 
 import boto3
 from botocore.exceptions import ClientError
@@ -38,7 +39,7 @@ def create_lambda_function(
     deployment_package,
     python_major_ver,
     python_minor_ver,
-    dead_letter_target_arn,
+    dead_letter_target_arn: Optional[str] = None,
     **kwargs,
 ):
     """
@@ -48,24 +49,31 @@ def create_lambda_function(
     :param handler_name: The fully qualified name of the handler function. This
                          must include the file name and the function name.
     :param iam_role: The IAM role to use for the function.
-    :param deployment_package: The deployment package that contains the function
-                               code in ZIP format.
+    :param deployment_package: dictionary object contains S3 path, bucket name that points to the deployment package
+                               uploaded to S3. The dictionary must contains key "S3Bucket", "S3Key"
+                               with string as value.
+    :param python_major_ver: Python major version as '3' in '3.7',
+    :param python_minor_ver Python major version as '7' in '3.7',
+    :param dead_letter_target_arn: DLQ to be used by Async queue of this lambda for failed requests
     :return: The Amazon Resource Name (ARN) of the newly created function.
     """
+    args = {
+        "FunctionName": function_name,
+        "Description": description,
+        "Timeout": 900,
+        "MemorySize": 512,
+        "Runtime": "python{}.{}".format(python_major_ver, python_minor_ver),
+        "Role": iam_role_arn,
+        "Handler": handler_name,
+        "Code": {"S3Bucket": deployment_package["S3Bucket"], "S3Key": deployment_package["S3Key"]},
+        "Environment": {"Variables": {key: value for key, value in kwargs.items()}},
+        # do not publish a version, use the $LATEST
+        "Publish": False,
+    }
+    if dead_letter_target_arn:
+        args.update({"DeadLetterConfig": {"TargetArn": dead_letter_target_arn}})
     try:
-        response = lambda_client.create_function(
-            FunctionName=function_name,
-            Description=description,
-            Timeout=900,
-            MemorySize=512,
-            Runtime="python{}.{}".format(python_major_ver, python_minor_ver),
-            Role=iam_role_arn,
-            Handler=handler_name,
-            Code={"ZipFile": deployment_package},
-            DeadLetterConfig={"TargetArn": dead_letter_target_arn},
-            Environment={"Variables": {key: value for key, value in kwargs.items()}},
-            Publish=True,
-        )
+        response = lambda_client.create_function(**args)
 
         # support wide-range of boto versions by checking the existence
         if "function_exists" in lambda_client.waiter_names:
@@ -86,12 +94,19 @@ def update_lambda_function_code(lambda_client, function_name, deployment_package
     Updates the code of an existing AWS Lambda function.
     :param lambda_client: The Boto3 AWS Lambda client object.
     :param function_name: The name of the AWS Lambda function.
-    :param deployment_package: The deployment package that contains the function
-                               code in ZIP format.
+    :param deployment_package: dictionary object contains S3 path, bucket name that points to the deployment package
+                               uploaded to S3. The dictionary must contains key "S3Bucket", "S3Key"
+                               with string as value.
     :return: The Amazon Resource Name (ARN) of the newly updated function.
     """
     try:
-        response = lambda_client.update_function_code(FunctionName=function_name, ZipFile=deployment_package, Publish=True)
+        response = lambda_client.update_function_code(
+            # do not publish, use $LATEST version
+            FunctionName=function_name,
+            S3Bucket=deployment_package["S3Bucket"],
+            S3Key=deployment_package["S3Key"],
+            Publish=False,
+        )
         function_arn = response["FunctionArn"]
         if "function_updated" in lambda_client.waiter_names:
             lambda_client.get_waiter("function_updated").wait(FunctionName=function_name)
@@ -113,7 +128,7 @@ def update_lambda_function_conf(
     iam_role_arn,
     python_major_ver,
     python_minor_ver,
-    dead_letter_target_arn,
+    dead_letter_target_arn: Optional[str] = None,
     **kwargs,
 ):
     """
@@ -126,18 +141,20 @@ def update_lambda_function_conf(
     :param kwargs: keyword args that would be passed in as Environment variables.
     :return: The Amazon Resource Name (ARN) of the newly updated function.
     """
+    args = {
+        "FunctionName": function_name,
+        "Description": description,
+        "Timeout": 900,
+        "MemorySize": 512,
+        "Runtime": "python{}.{}".format(python_major_ver, python_minor_ver),
+        "Role": iam_role_arn,
+        "Handler": handler_name,
+        "Environment": {"Variables": {key: value for key, value in kwargs.items()}},
+    }
+    if dead_letter_target_arn:
+        args.update({"DeadLetterConfig": {"TargetArn": dead_letter_target_arn}})
     try:
-        response = lambda_client.update_function_configuration(
-            FunctionName=function_name,
-            Description=description,
-            Timeout=900,
-            MemorySize=512,
-            Runtime="python{}.{}".format(python_major_ver, python_minor_ver),
-            Role=iam_role_arn,
-            Handler=handler_name,
-            DeadLetterConfig={"TargetArn": dead_letter_target_arn},
-            Environment={"Variables": {key: value for key, value in kwargs.items()}},
-        )
+        response = lambda_client.update_function_configuration(**args)
         function_arn = response["FunctionArn"]
         if "function_updated" in lambda_client.waiter_names:
             lambda_client.get_waiter("function_updated").wait(FunctionName=function_name)
@@ -185,15 +202,26 @@ def invoke_lambda_function(lambda_client, function_name, function_params, is_asy
     return response
 
 
-def get_lambda_arn(lambda_client, function_name):
-    try:
-        response = lambda_client.get_function(FunctionName=function_name)
-        return response["Configuration"]["FunctionArn"]
-    except ClientError as ex:
-        if ex.response["Error"]["Code"] == "ResourceNotFoundException":
-            return None
-        logger.error("Couldn't check lambda '%s'! Error: %s", function_name, str(ex))
-        raise
+def get_lambda_digest(lambda_client, function_name: str) -> Optional[str]:
+    """
+    Get AWS Lambda function's SHA256 digest, if exist.
+    :param lambda_client: The Boto3 AWS Lambda client object.
+    :param function_name: The name of the function to query.
+    :return: SHA256 of the lambda as str, None if such lambda cannot be found.
+    """
+    lambda_detail = _get_lambda_function_details(lambda_client, function_name)
+    return lambda_detail["Configuration"]["CodeSha256"] if lambda_detail else None
+
+
+def get_lambda_arn(lambda_client, function_name: str) -> Optional[str]:
+    """
+    Get AWS Lambda function's ARN using function name, if such lambda exist in that region.
+    :param lambda_client: The Boto3 AWS Lambda client object.
+    :param function_name: The name of the function to find.
+    :return: ARN of the lambda as str, None if such lambda cannot be found.
+    """
+    lambda_detail = _get_lambda_function_details(lambda_client, function_name)
+    return lambda_detail["Configuration"]["FunctionArn"] if lambda_detail else None
 
 
 def add_permission(lambda_client, function_name, statement_id, action, principal, source_arn, source_account=None):
@@ -246,4 +274,23 @@ def delete_function_concurrency(lambda_client, function_name):
         lambda_client.delete_function_concurrency(FunctionName=function_name)
     except ClientError:
         logger.exception(f"Couldn't delete concurrency of function {function_name!r}!")
+        raise
+
+
+def _get_lambda_function_details(lambda_client, function_name: str) -> Optional[Dict]:
+    """
+    Get details about an AWS Lambda function.
+    :param lambda_client: The Boto3 AWS Lambda client object.
+    :param function_name: The name of the function to invoke.
+    :param function_params: The parameters of the function as a dict. This dict
+                            is serialized to JSON before it is sent to AWS Lambda.
+    :return: The response from the function invocation. dictionary contains details about the lambda or None if no such
+             lambda is found
+    """
+    try:
+        return lambda_client.get_function(FunctionName=function_name)
+    except ClientError as ex:
+        if ex.response["Error"]["Code"] == "ResourceNotFoundException":
+            return None
+        logger.error("Couldn't check lambda '%s'! Error: %s", function_name, str(ex))
         raise

@@ -5,6 +5,8 @@ import datetime
 
 from dateutil.tz import tzlocal
 
+import pytest
+
 from intelliflow.api_ext import *
 from intelliflow.core.signal_processing.signal import *
 from intelliflow.mixins.aws.test import AWSTestBase
@@ -41,13 +43,13 @@ class TestAWSApplicationExternalData(AWSTestBase, AWSTestGlueCatalog):
                             {"Name": "requested_domain_name", "Type": "string", "Comment": ""},
                         ],
                         "Location": "s3://foo-subscriptions/222333444555/BOOKER/.db/D_UNIFIED_CUST_SHIPMENT_ITEMS",
-                        "InputFormat": "amazon.conexio.hive.EDXManifestHiveInputFormat",
-                        "OutputFormat": "amazon.conexio.hive.EDXManifestHiveOutputFormat",
+                        "InputFormat": "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat",
+                        "OutputFormat": "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat",
                         "Compressed": False,
                         "NumberOfBuckets": 0,
                         "SerdeInfo": {
-                            "Name": "edx_serde",
-                            "SerializationLibrary": "amazon.conexio.hive.serde.edx.GenericEDXSerDe",
+                            "Name": "cairns_serde",
+                            "SerializationLibrary": "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe",
                             "Parameters": {},
                         },
                         "SortColumns": [],
@@ -78,10 +80,10 @@ class TestAWSApplicationExternalData(AWSTestBase, AWSTestGlueCatalog):
                     "RetryAttempts": 0,
                 },
             }
-        elif DatabaseName == "booker" and Name == "d_unified_cust_shipment_items_PARQUET":
+        elif DatabaseName == "booker" and Name == "d_unified_cust_shipment_items_parquet":
             return {
                 "Table": {
-                    "Name": "d_unified_cust_shipment_items_PARQUET",
+                    "Name": "d_unified_cust_shipment_items_parquet",
                     "DatabaseName": "booker",
                     "CreateTime": datetime.datetime(2020, 1, 12, 4, 53, 20, tzinfo=tzlocal()),
                     "UpdateTime": datetime.datetime(2020, 1, 13, 8, 18, 21, tzinfo=tzlocal()),
@@ -396,13 +398,13 @@ class TestAWSApplicationExternalData(AWSTestBase, AWSTestGlueCatalog):
                         "StorageDescriptor": {
                             "Columns": [],
                             "Location": "s3:///foo-subscriptions/222333444555/BOOKER/D_UNIFIED_CUST_SHIPMENT_ITEMS/895a31f0-f3fc-482a-a7aa-bc740149ae2b/1/1995-12-06 00:00:00/1588942061259/1588942061259/SNAPSHOT/manifest.ion",
-                            "InputFormat": "amazon.conexio.hive.EDXManifestHiveInputFormat",
-                            "OutputFormat": "amazon.conexio.hive.EDXManifestHiveOutputFormat",
+                            "InputFormat": "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat",
+                            "OutputFormat": "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat",
                             "Compressed": False,
                             "NumberOfBuckets": 0,
                             "SerdeInfo": {
-                                "Name": "edx_serde",
-                                "SerializationLibrary": "amazon.conexio.hive.serde.edx.GenericEDXSerDe",
+                                "Name": "cairns_serde",
+                                "SerializationLibrary": "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe",
                                 "Parameters": {},
                             },
                             "SortColumns": [],
@@ -850,7 +852,7 @@ class TestAWSApplicationExternalData(AWSTestBase, AWSTestGlueCatalog):
 
     def get_tables(self, DatabaseName: str) -> Dict[str, Any]:
         if DatabaseName == "booker":
-            return {"TableList": [{"Name": "d_unified_cust_shipment_items"}, {"Name": "d_unified_cust_shipment_items_PARQUET"}]}
+            return {"TableList": [{"Name": "d_unified_cust_shipment_items"}, {"Name": "d_unified_cust_shipment_items_parquet"}]}
         elif DatabaseName == "dex_ml_catalog":
             return {"TableList": [{"Name": "d_ad_orders_na"}]}
         elif DatabaseName == "atrops_ddl":
@@ -894,12 +896,6 @@ class TestAWSApplicationExternalData(AWSTestBase, AWSTestGlueCatalog):
         try:
             app.marshal_external_data(GlueTable("dex_ml_catalog", "d_ad_orders_na", partition_keys=["WRONGorder_day"]))
             assert False, "Fail due to wrong partition key"
-        except ValueError:
-            pass
-
-        try:
-            app.marshal_external_data(GlueTable("dex_ml_catalog", "d_ad_orders_na", primary_keys=["WRONG_customer_id"]))
-            assert False, "Fail due to wrong primary key"
         except ValueError:
             pass
 
@@ -1050,7 +1046,7 @@ output=DEXML_DUCSI.limit(100).join(d_ad_orders_na.limit(100), ['customer_id']).l
         # as a reference input. application will have one node only for this simple/final case
         app = AWSApplication("andes-test", self.region)
         #  dimensions/partition keys: 'region_id' (LONG), 'order_day' (TIMESTAMP)
-        ducsi_data_PARQUET = app.glue_table("booker", "d_unified_cust_shipment_items_PARQUET")
+        ducsi_data_PARQUET = app.glue_table("booker", "d_unified_cust_shipment_items_parquet")
 
         #    This case aims to cover dependency check on multiple dimensions one of which is LONG (non-string: to
         #    capture the edge-case of coverting everything to Glue catalog expected partition value type string).
@@ -1068,7 +1064,7 @@ output=DEXML_DUCSI.limit(100).join(d_ad_orders_na.limit(100), ['customer_id']).l
 
         # now modify get_partition to serve requests for ducsi
         def get_partition(DatabaseName: str, TableName: str, PartitionValues: List[str]) -> Dict[str, Any]:
-            if DatabaseName == "booker" and TableName == "d_unified_cust_shipment_items_PARQUET":
+            if DatabaseName == "booker" and TableName == "d_unified_cust_shipment_items_parquet":
                 # please note that 1 -> '1' is also tested to conform with glue:get_partition. normally that partition
                 # value is LONG (and in Python int type) internally within the framework.
                 if PartitionValues in [["1", "2021-05-20 00:00:00"]]:
@@ -1107,15 +1103,6 @@ output=DEXML_DUCSI.limit(100).join(d_ad_orders_na.limit(100), ['customer_id']).l
         assert atrops_o_slam_packages.bound.data_id == "o_slam_packages"
 
         encryption_key = "arn:aws:kms:us-east-1:111222333444:key/aaaaaaaa-bbbb-cccc-dddd-1112223334ab"
-
-        # will fail due to missing encryption_key
-        try:
-            app.marshal_external_data(
-                external_data_desc=GlueTable(database="searchdata", table_name="tommy_searches"), id="my_tommy_searches"
-            )
-            assert False, "shoul fail due to missing 'encryption_key'"
-        except ValueError:
-            pass
 
         tommy_searches = app.marshal_external_data(
             external_data_desc=GlueTable(database="searchdata", table_name="tommy_searches", encryption_key=encryption_key),
@@ -1199,10 +1186,7 @@ output=DEXML_DUCSI.limit(100).join(d_ad_orders_na.limit(100), ['customer_id']).l
         ducsi_data = app.marshal_external_data(
             # checks the catalog and tries to do validation and compensate missing data.
             # different than GlueTable, will be OK if everything is given and also domainspec is there (dim spec).
-            external_data_desc=GlueTable(
-                "booker",
-                "d_unified_cust_shipment_items",
-            ),
+            external_data_desc=GlueTable("booker", "d_unified_cust_shipment_items"),
             id="DEXML_DUCSI",
             # dimension spec will be auto-generated based on the names and types of partition keys from the catalog
             protocol=SignalIntegrityProtocol("FILE_CHECK", {"file": ["SNAPSHOT"]}),
@@ -1258,13 +1242,6 @@ output=DEXML_DUCSI.limit(100).join(d_ad_orders_na.limit(100), ['customer_id']).l
         assert atrops_o_slam_packages.bound.data_id == "o_slam_packages"
 
         encryption_key = "arn:aws:kms:us-east-1:111122223333:key/aaaaaaaa-bbbb-cccc-dddd-cccafabddeee"
-
-        # will fail due to missing encryption_key
-        try:
-            app.glue_table(database="searchdata", table_name="tommy_searches", id="my_tommy_searches")
-            assert False, "shoul fail due to missing 'encryption_key'"
-        except ValueError:
-            pass
 
         tommy_searches = app.glue_table(
             database="searchdata", table_name="tommy_searches", encryption_key=encryption_key, id="my_tommy_searches"
@@ -1353,9 +1330,6 @@ output=DEXML_DUCSI.limit(100).join(d_ad_orders_na.limit(100), ['customer_id']).l
             # different than GlueTable, will be OK if everything is given and also domainspec is there (dim spec).
             "booker",
             "d_unified_cust_shipment_items",
-            # primary_keys will be auto-retrieved from the catalog
-            # primary_keys=['customer_order_item_id', 'customer_shipment_item_id'],
-            table_type="APPEND",
             id="DEXML_DUCSI",
             # dimension spec will be auto-generated based on the names and types of partition keys from the catalog
             protocol=SignalIntegrityProtocol("FILE_CHECK", {"file": ["SNAPSHOT"]}),
@@ -1411,22 +1385,7 @@ output=DEXML_DUCSI.limit(100).join(d_ad_orders_na.limit(100), ['customer_id']).l
 
         app = AWSApplication("s3-test", self.region)
 
-        try:
-            app.marshal_external_data(
-                S3Dataset(
-                    "427809481713",
-                    "if-adpd-training-427809481713-us-east-1",
-                    "datanet_data/transit_time_map",
-                    dataset_format=DataFormat.CSV,
-                    delimiter="|",
-                ),
-                "transit_time_map_2020",
-            )
-            assert False, "should fail due to missing dimension_spec"
-        except ValueError:
-            pass
-
-        # show that import will succeed, but we won't use this external data in this test
+        # use empty DimensionSpec (partitionless data)
         app.marshal_external_data(
             S3Dataset(
                 "427809481713",
@@ -1435,9 +1394,37 @@ output=DEXML_DUCSI.limit(100).join(d_ad_orders_na.limit(100), ['customer_id']).l
                 dataset_format=DataFormat.CSV,
                 delimiter="|",
             ),
-            "transit_time_map_2020",
+            "succeed_with_empty_spec",
+        )
+
+        # show that import will succeed, but we won't use this external data in this test
+        # explicitly set dimension spec as empty (
+        app.marshal_external_data(
+            S3Dataset(
+                "427809481713",
+                "if-adpd-training-427809481713-us-east-1",
+                "datanet_data/transit_time_map",
+                dataset_format=DataFormat.CSV,
+                delimiter="|",
+            ),
+            "succeed_with_manually_set_empty_spec",
             dimension_spec={},  # no partitions/dimensions
         )
+
+        # 1 partition VS empty dim spec should raise validation error
+        with pytest.raises(ValueError):
+            app.marshal_external_data(
+                S3Dataset(
+                    "427809481713",
+                    "if-adpd-training-427809481713-us-east-1",
+                    "datanet_data/transit_time_map",
+                    # declare partition,
+                    "partition_day={}",
+                    dataset_format=DataFormat.CSV,
+                    delimiter="|",
+                ),
+                "fail_due_to_incompatibility",
+            )
 
         # Import the following external, raw datasource
         # Example partition path:

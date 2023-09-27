@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Tuple, Union
 
 from intelliflow.core.platform.constructs import ConstructParamsDict, RoutingComputeInterface, RoutingHookInterface
 from intelliflow.core.platform.definitions.aws.common import CommonParams as AWSCommonParams
+from intelliflow.core.serialization import dumps
 from intelliflow.core.signal_processing import Signal
 
 
@@ -151,7 +152,7 @@ def _cleanup_params(params):
         del params[AWSCommonParams.IF_ADMIN_ACCESS_PAIR]
 
 
-def get_compute_record_information(compute_record, routing_table: "RoutingTable") -> Dict[str, Any]:
+def get_compute_record_information(compute_record, routing_table: "RoutingTable", with_state: bool = False) -> Dict[str, Any]:
     compute_record_details = routing_table.describe_compute_record(compute_record)
     compute_record_info = {
         "trigger_timestamp_utc": compute_record.trigger_timestamp_utc,
@@ -159,9 +160,21 @@ def get_compute_record_information(compute_record, routing_table: "RoutingTable"
         "state": repr(compute_record.state),
         "number_of_attempts_on_failure": compute_record.number_of_attempts_on_failure,
     }
+    if with_state:
+        compute_record_info.update({"state_state": dumps(compute_record.state)})
+        compute_record_info.update({"session_state": dumps(compute_record.session_state)})
     if not compute_record_details:
-        message = f"Could not retrieve details for compute record from the platform! Record: {compute_record}"
-        compute_record_info.update({"slot": repr(compute_record.slot), "details": message})
+        generic_details = None
+        if compute_record.session_state and compute_record.session_state.executions:
+            generic_details = compute_record.session_state.executions[::-1][0].details
+        else:
+            generic_details = f"Could not retrieve details for compute record from the platform!"
+        generic_slot = dict()
+        generic_slot["type"] = compute_record.slot.type
+        generic_slot["lang"] = compute_record.slot.code_lang
+        generic_slot["code"] = compute_record.slot.code
+        generic_slot["code_abi"] = compute_record.slot.code_abi
+        compute_record_info.update({"slot": compute_record.slot, "details": generic_details})
     else:
         compute_record_info.update(
             {

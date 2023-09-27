@@ -353,6 +353,13 @@ class TestSignal:
         assert clone1.resource_access_spec == self.signal_internal_1.resource_access_spec
         assert clone1.domain_spec == self.signal_internal_1.domain_spec
 
+        shallow = self.signal_internal_1.clone("new_alias2", deep=False)
+        assert shallow.alias == "new_alias2"
+        assert clone1.alias == "new_alias"
+        assert shallow.type == self.signal_internal_1.type
+        assert shallow.resource_access_spec == self.signal_internal_1.resource_access_spec
+        assert shallow.domain_spec == self.signal_internal_1.domain_spec
+
     def test_signal_apply(self):
         # heavily relies on DimensionFilter::apply which is extensively tested in dimension_constructs/test_dimension_filter.py
 
@@ -394,6 +401,33 @@ class TestSignal:
             result = self.signal_internal_with_string_and_date_dims.filter({"EU": {"_:-2": {}}}).apply(
                 self.signal_internal_with_string_and_date_dims.filter({"EU": {"_:-3": {}}})
             )
+
+    def test_signal_shift(self):
+        """Slightly modified version of test_signal_apply to show the effects of transformations (such as range shift)
+        on a signal"""
+        # shift EU dimension by 2 days into the past (from NOW at runtime)
+        result: Signal = self.signal_internal_with_string_and_date_dims.filter(
+            DimensionFilter.load_raw({"NA": {"*": {}}, "EU": {"_:-3:-2": {}}}), transfer_spec=True
+        ).apply(self.signal_internal_with_string_and_date_dims.filter({"EU": {"2020-11-29": {}}}))
+
+        # show that underlying values are agnostic from transformations
+        assert DimensionFilter.check_equivalence(
+            DimensionFilter.load_raw({"EU": {"2020-11-29": {}, "2020-11-28": {}, "2020-11-27": {}}}),
+            result.domain_spec.dimension_filter_spec,
+        )
+
+        # show low-evel dimension filter exhibits the effect of transformations when needed
+        assert DimensionFilter.check_equivalence(
+            DimensionFilter.load_raw({"EU": {"2020-11-27": {}, "2020-11-26": {}, "2020-11-25": {}}}),
+            result.domain_spec.dimension_filter_spec.transform(),
+        )
+
+        paths = result.get_materialized_resource_paths()
+        assert paths[0].endswith("2020-11-27")
+        assert paths[1].endswith("2020-11-26")
+        assert paths[2].endswith("2020-11-25")
+
+        assert result.dimension_values("dim_1_2") == ["2020-11-27", "2020-11-26", "2020-11-25"]
 
     def test_signal_create_from_spec(self):
         from test.intelliflow.core.signal_processing.signal_source.test_internal_data_spec import TestInternalDataAccessSpec
@@ -579,3 +613,41 @@ class TestSignal:
             self.signal_internal_with_string_and_date_dims.filter({"EU": {"*": {}}})
         )
         assert DimensionFilter.check_equivalence(DimensionFilter.load_raw({"EU": {"_:-3": {}}}), result.domain_spec.dimension_filter_spec)
+
+    def test_signal_dimension_value_access(self):
+        assert self.signal_internal_with_string_and_date_dims.dimension_values("dim_1_1") == ["*"]
+        assert self.signal_internal_with_string_and_date_dims.dimension_values("dim_1_2") == ["*"]
+        assert self.signal_internal_with_string_and_date_dims.dimension_values_map() == {"dim_1_1": ["*"], "dim_1_2": ["*"]}
+        assert self.signal_internal_with_string_and_date_dims.tip_value("dim_1_1") == "*"
+        assert self.signal_internal_with_string_and_date_dims.tip_value("dim_1_2") == "*"
+        assert self.signal_internal_with_string_and_date_dims["dim_1_1"] == "*"
+        assert self.signal_internal_with_string_and_date_dims["dim_1_2"] == "*"
+
+        with pytest.raises(ValueError):
+            self.signal_internal_with_string_and_date_dims.dimension_values("WRONG_DIM_NAME")
+        with pytest.raises(ValueError):
+            self.signal_internal_with_string_and_date_dims.tip_value("WRONG_DIM_NAME")
+        with pytest.raises(ValueError):
+            self.signal_internal_with_string_and_date_dims["WRONG_DIM_NAME"]
+
+        new_filter = DimensionFilter.load_raw({"NA": {"*": {}}, "EU": {"_:-3": {}}})
+        new_filter.set_spec(self.signal_internal_with_string_and_date_dims.domain_spec.dimension_spec)
+        filtered_signal = self.signal_internal_with_string_and_date_dims.filter(new_filter)
+
+        assert filtered_signal.dimension_values("dim_1_1") == ["NA", "EU"]
+        assert filtered_signal.dimension_values("dim_1_2") == ["*", "_:-3"]
+        assert filtered_signal.dimension_values_map() == {"dim_1_1": ["NA", "EU"], "dim_1_2": ["*", "_:-3"]}
+        assert filtered_signal.tip_value("dim_1_1") == "NA"
+        assert filtered_signal.tip_value("dim_1_2") == "*"
+        assert filtered_signal["dim_1_1"] == "NA"
+        assert filtered_signal["dim_1_2"] == "*"
+
+        # mimic what would happen at runtime against and incoming signal (from a raw event)
+        materialized_signal = filtered_signal.chain(self.signal_internal_with_string_and_date_dims.filter({"EU": {"2020-11-29": {}}}))
+        assert materialized_signal.dimension_values("dim_1_1") == ["EU"]
+        assert materialized_signal.dimension_values("dim_1_2") == ["2020-11-29", "2020-11-28", "2020-11-27"]
+        assert materialized_signal.dimension_values_map() == {"dim_1_1": ["EU"], "dim_1_2": ["2020-11-29", "2020-11-28", "2020-11-27"]}
+        assert materialized_signal.tip_value("dim_1_1") == "EU"
+        assert materialized_signal.tip_value("dim_1_2") == "2020-11-29"
+        assert materialized_signal["dim_1_1"] == "EU"
+        assert materialized_signal["dim_1_2"] == "2020-11-29"

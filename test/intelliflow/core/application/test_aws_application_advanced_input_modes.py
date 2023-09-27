@@ -3,7 +3,7 @@
 
 # TODO see the integ-test version and patch / decorate it for unit-tests.
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -231,6 +231,138 @@ class TestAWSApplicationAdvancedInputModes(AWSTestBase):
 
         self.patch_aws_stop()
 
+    def test_application_reference_inputs_in_different_layers_3(self):
+        """In this test, we test a scenario where the reference input is not linked to the independent input (timer)
+        but that reference is auto-linked with the output over dimension "day".
+
+        In this scenario, the reference input does not seem to be "dangling" (SignalLinkNode::check_dangling_references)
+        would not catch it but it is actually "unsatisfied" for runtime execution, meaning that incoming indepedent
+        timer signal will not be able to materialize it. We show that create_data API
+
+        LINKING VISUALIZATION:
+        -----------
+
+           INPUT 1: daily_timer ("time")
+
+           INPUT 2 (ref): filtering_data ("day")   <---->  OUTPUT("day")
+
+        -----------
+
+        At runtime input 1 will be received but input 2 (as described by the user) has a risk of not receiving events
+        and due to missing linking from "time" to "day" it will be impossible for framework to infer and materialize
+        that input.
+        """
+        app = self._create_app()
+
+        smart_filtering_data = app.marshal_external_data(
+            S3Dataset(
+                "111222333444",
+                "filtering-data-bucket",
+                "output",
+                "{}",  # partition 1
+                "filtering-data-with-header-v1.2-{}",  # partition 2
+                "{}",  # partition 3
+                dataset_format=DataFormat.CSV,
+                delimiter=",",
+            ),
+            id="filtering_data",
+            dimension_spec={
+                "region": {
+                    "type": DimensionType.STRING,
+                    "day": {"type": DimensionType.DATETIME, "format": "%Y-%m-%d", "index": {"type": DimensionType.LONG}},
+                }
+            },
+            dimension_filter={"*": {"*": {7: {}}}},
+            protocol=SignalIntegrityProtocol("FILE_CHECK", {"file": "_SUCCESS"}),
+        )
+
+        daily_timer = app.add_timer(
+            "daily_timer",
+            "rate(1 day)",
+            # DO NOT SET dimension_id and leave it as "time" (default timer dimension id)
+            # time_dimension_id="day",
+            time_dimension_granularity=DatetimeGranularity.DAY,
+        )
+
+        # final analysis in Application::_create_data_node will capture this problem
+        pre_process_single_date_core_1 = app.create_data(
+            id=f"pre_process_single_date_core_1",
+            inputs={"daily_data": smart_filtering_data["NA"]["*"][:-8].ref.range_check(True), "timer": daily_timer},
+            output_dimension_spec={
+                "dataset": {
+                    type: DimensionType.STRING,
+                    "modelName": {
+                        type: DimensionType.STRING,
+                        "modelVersion": {
+                            type: DimensionType.STRING,
+                            "region": {
+                                type: DimensionType.STRING,
+                                "day": {type: DimensionType.DATETIME, "granularity": DatetimeGranularity.DAY, "format": "%Y-%m-%d"},
+                            },
+                        },
+                    },
+                }
+            },
+            output_dim_links=[
+                ("dataset", EQUALS, "prod"),
+                ("modelName", EQUALS, "DORE"),
+                ("modelVersion", EQUALS, "1.1"),
+                ("region", EQUALS, "NA"),
+            ],
+            compute_targets=[NOOPCompute],
+        )
+
+        # should SUCCEED now as we provide the link from timer to data and now at runtime the framework will be
+        # able to materialize the reference
+        pre_process_single_date_core_2 = app.create_data(
+            id=f"pre_process_single_date_core_2",
+            inputs={"daily_data": smart_filtering_data["NA"]["*"][:-8].ref.range_check(True), "timer": daily_timer},
+            # INPUT LINKING from timer to daily_data reference
+            input_dim_links=[(smart_filtering_data("day"), EQUALS, daily_timer("time"))],
+            output_dimension_spec={
+                "dataset": {
+                    type: DimensionType.STRING,
+                    "modelName": {
+                        type: DimensionType.STRING,
+                        "modelVersion": {
+                            type: DimensionType.STRING,
+                            "region": {
+                                type: DimensionType.STRING,
+                                "day": {type: DimensionType.DATETIME, "granularity": DatetimeGranularity.DAY, "format": "%Y-%m-%d"},
+                            },
+                        },
+                    },
+                }
+            },
+            output_dim_links=[
+                ("dataset", EQUALS, "prod"),
+                ("modelName", EQUALS, "DORE"),
+                ("modelVersion", EQUALS, "1.1"),
+                ("region", EQUALS, "NA"),
+            ],
+            compute_targets=[NOOPCompute],
+        )
+
+        with pytest.raises(ValueError):
+            app.validate(pre_process_single_date_core_1)
+
+        # here timer cannot be inferred from the output
+        with pytest.raises(ValueError):
+            app.validate(pre_process_single_date_core_1["prod"]["DORE"]["1.1"]["NA"]["2023-02-08"])
+
+        # even with the materialize values should fail due to "dangling reference" that cannot be materialized at runtime
+        with pytest.raises(ValueError):
+            app.validate(pre_process_single_date_core_1["prod"]["DORE"]["1.1"]["NA"]["2023-02-08"], daily_timer["2023-02-08"])
+
+        # even the analysis on the second one should FAIL due to unmaterialized dimensions
+        with pytest.raises(ValueError):
+            app.validate(pre_process_single_date_core_2)
+
+        app.validate(pre_process_single_date_core_2["prod"]["DORE"]["1.1"]["NA"]["2023-02-08"])
+        app.validate(pre_process_single_date_core_2["prod"]["DORE"]["1.1"]["NA"]["2023-02-08"], daily_timer["2023-02-08"])
+
+        self.patch_aws_stop()
+
     def test_application_range_check_succeeds_via_event_ingestion(self):
         app = self._create_app()
 
@@ -348,6 +480,15 @@ class TestAWSApplicationAdvancedInputModes(AWSTestBase):
             compute_targets=[NOOPCompute],  # when inputs are ready, trigger the following
         )
 
+        app.validate(default_selection_features2["NA"]["2020-03-18"])
+        # second input will fail the analysis due to hardcoded condition on day dimension
+        with pytest.raises(ValueError):
+            app.validate(default_selection_features2["NA"]["2020-03-19"])
+
+        # both of them will reject the execution at runtime with incompatible region dimension, let's capture it early
+        with pytest.raises(ValueError):
+            app.validate(default_selection_features2["EU"]["2020-03-18"])
+
         app.activate(allow_concurrent_executions=False)
 
         # Simulate a typical scenario where events are received chronologically sorted.
@@ -434,6 +575,72 @@ class TestAWSApplicationAdvancedInputModes(AWSTestBase):
         path, _ = app.poll(default_selection_features["NA"]["2020-03-18"])
         # DONE!
         assert path
+
+        self.patch_aws_stop()
+
+    def test_application_range_shift(self):
+        app = self._create_app()
+
+        daily_timer = app.add_timer("daily_timer", "rate(1 day)", time_dimension_id="day")
+
+        offline_training_data = app.marshal_external_data(
+            S3Dataset(
+                "111222333444",
+                "bucket",
+                "training_data",
+                "partition_day={}",
+                dataset_format=DataFormat.CSV,
+            ),
+            "external_data",
+            {"day": {"type": DimensionType.DATETIME, "format": "%Y-%m-%d"}},
+            {"*": {}},
+            SignalIntegrityProtocol("FILE_CHECK", {"file": "_SUCCESS"}),
+        )
+
+        preprocess = app.create_data(
+            id="preprocess_data",
+            inputs={
+                "offline_training_data": offline_training_data[:-3].ref.range_check(True),
+                # starting from "the day before"
+                "offline_training_data_shifted_range": offline_training_data[-1:-3].ref.range_check(True),
+                "offline_training_data_yesterday": offline_training_data[-1:].ref.range_check(True),
+                "timer": daily_timer,
+            },
+            compute_targets=[NOOPCompute],  # when inputs are ready, trigger the following
+        )
+
+        add_test_data(app, offline_training_data["2022-06-01"], "_SUCCESS", "")
+        add_test_data(app, offline_training_data["2022-05-31"], "_SUCCESS", "")
+        add_test_data(app, offline_training_data["2022-05-30"], "_SUCCESS", "")
+        add_test_data(app, offline_training_data["2022-05-29"], "_SUCCESS", "")
+
+        app.activate()
+
+        # should trigger execution on "preprocess"
+        app.process(daily_timer["2022-06-01"])
+
+        # execution must have completed immediately (thanks to NOOPCompute) without any async workflow
+        path, records = app.poll(preprocess["2022-06-01"])
+        assert path
+        success_record: RoutingTable.ComputeRecord = records[0]
+        offline_training_data = [input for input in success_record.materialized_inputs if input.alias == "offline_training_data"][0]
+        offline_training_data_shifted_range = [
+            input for input in success_record.materialized_inputs if input.alias == "offline_training_data_shifted_range"
+        ][0]
+        offline_training_data_yesterday = [
+            input for input in success_record.materialized_inputs if input.alias == "offline_training_data_yesterday"
+        ][0]
+
+        assert offline_training_data.get_materialized_resource_paths()[0].endswith("2022-06-01")
+        assert offline_training_data.get_materialized_resource_paths()[1].endswith("2022-05-31")
+        assert offline_training_data.get_materialized_resource_paths()[2].endswith("2022-05-30")
+
+        assert len(offline_training_data_shifted_range.get_materialized_resource_paths()) == 3
+        assert offline_training_data_shifted_range.get_materialized_resource_paths()[0].endswith("2022-05-31")
+        assert offline_training_data_shifted_range.get_materialized_resource_paths()[1].endswith("2022-05-30")
+        assert offline_training_data_shifted_range.get_materialized_resource_paths()[2].endswith("2022-05-29")
+
+        assert offline_training_data_yesterday.get_materialized_resource_paths()[0].endswith("2022-05-31")
 
         self.patch_aws_stop()
 
@@ -638,42 +845,57 @@ class TestAWSApplicationAdvancedInputModes(AWSTestBase):
         with pytest.raises(ValueError):
             app.create_data(id="should_fail", inputs=[eureka_offline_all_data[:-7].nearest()], compute_targets=[NOOPCompute])
 
-        # 2- Output dimension should not depend on the dimension of a dependent signal.
-        #   Another restriction to promote good practice in RheocerOS app development.
-
         daily_timer = app.add_timer(id="pipeline_dailyly_timer", schedule_expression="rate(1 day)", time_dimension_id="day")
-        with pytest.raises(ValueError):
-            # manually link output to 'nearest' signal
-            app.create_data(
-                id="should_fail2",
-                inputs=[daily_timer, eureka_offline_all_data[:-7].nearest()],
-                compute_targets=[NOOPCompute],
-                output_dim_links=[
-                    # eureka_offline_all_data::day ==> output::my_day
-                    "my_day",
-                    lambda dim: dim,
-                    eureka_offline_all_data("day"),
-                ],
-            )
 
-        with pytest.raises(ValueError):
-            # 'nearest' signal is unlinked. has no links with other inputs or the output.
-            app.create_data(
-                id="should_fail2",
-                inputs=[daily_timer, eureka_offline_all_data[:-7].nearest()],
-                compute_targets=[NOOPCompute],
-                output_dim_links=[
+        # dependents are force-linked over same dimension names, so here even if input linking is False, second input
+        # is not dangling
+        app.create_data(
+            id="will_force_link_dependents",
+            inputs=[daily_timer, eureka_offline_all_data[:-7].nearest()],
+            compute_targets=[NOOPCompute],
+            output_dim_links=[
+                (
                     # daily_timer::day ==> output::my_day
                     "my_day",
                     lambda dim: dim,
                     daily_timer("day"),
-                ],
-            )
+                )
+            ],
+            output_dimension_spec={"my_day": {type: DimensionType.DATETIME}},
+            auto_input_dim_linking_enabled=False,
+        )
 
         # 3- now fail because 'nearest' signal has a dim that cannot be mapped from other inputs.
         # this is generally a rule for a runtime condition where dependent signals block execution
         # due to unmapped dimensions requiring an incoming event. this eliminates the meaning of nearest
         # and reference signals (where for the latter it basically means 'zombie' node creation.
+
+        # 3-1
+        daily_timer = app.add_timer(id="timer_with_different_dim_name", schedule_expression="rate(1 day)", time_dimension_id="day_tona")
+        with pytest.raises(ValueError):
+            # output and nearest (dependent) signals will never be materialized at runtime
+            app.create_data(
+                id="should_fail3_1",
+                inputs=[eureka_offline_all_data.nearest(), daily_timer],
+                compute_targets=[NOOPCompute],
+            )
+
+        daily_timer = app.add_timer(id="daily_timer", schedule_expression="rate(1 day)", time_dimension_id="day")
+
+        # TODO enable after "graph analyzer" for input/output links is implemented
+        # with pytest.raises(ValueError):
+        #    # output and nearest (dependent) signals will never be materialized at runtime
+        #    app.create_data(
+        #        id="should_fail3_2",
+        #        inputs=[eureka_offline_all_data.nearest(), daily_timer],
+        #        compute_targets=[NOOPCompute],
+        #        output_dimension_spec={
+        #            "day": {
+        #                type: DimensionType.DATETIME,
+        #            }
+        #        }
+        #    )
+
         eureka_offline_training_data = app.add_external_data(
             data_id="eureka_training_data",
             s3_dataset=S3(
@@ -792,5 +1014,199 @@ class TestAWSApplicationAdvancedInputModes(AWSTestBase):
         assert not app.poll(data2_1["2020-12-29"])[0]
         # should not have any side-effects on other nodes either
         assert not app.poll(data2["2020-12-29"])[0]
+
+        self.patch_aws_stop()
+
+    def test_application_range_expansion_over_materialized_dimension_filter(self):
+        """Test scenario:
+        - Signal has a materialized value in dimension filter already in its "external data declaration"
+        - When inputted to a data-node a range is defined
+        - Range expansion should use the materialized (hard-coded) value from its dimension filter as the TIP for the
+        desired range. Range expansion should occur based on the depth defined by the user. So the input should represent
+        multiple resource paths (partitions) starting from the hardcoded value up/down to the end of the range.
+        """
+        app = self._create_app()
+        daily_timer = app.add_timer(
+            "daily_timer", "rate(1 day)", time_dimension_id="day", time_dimension_granularity=DatetimeGranularity.DAY
+        )
+
+        # - define the signal
+        smart_filtering_data = app.marshal_external_data(
+            S3Dataset(
+                self.account_id,
+                "bucket",
+                "folder",
+                "{}",  # partition #1
+                "smart-defaulting-data-{}",  # partition #2
+                "{}",  # partition #3
+                dataset_format=DataFormat.CSV,
+                delimiter=",",
+            ),
+            id="smart_filtering_external_data",
+            dimension_spec={
+                "region": {
+                    "type": DimensionType.STRING,
+                    "day": {"type": DimensionType.DATETIME, "format": "%Y-%m-%d", "index": {"type": DimensionType.LONG}},
+                }
+            },
+            # HARDCODED (prefiltered) value of 7 on partition "index"
+            dimension_filter={"*": {"*": {7: {}}}},
+            protocol=SignalIntegrityProtocol("FILE_CHECK", {"file": "_SUCCESS"}),
+        )
+
+        # define links from/to timer to the other input
+        def timer_to_pre_process_data_day(timer_date: datetime) -> datetime:
+            return timer_date - timedelta(days=1)
+
+        def pre_process_data_day_to_timer(pre_process_date: datetime) -> datetime:
+            return pre_process_date + timedelta(days=1)
+
+        region = "NA"
+        pre_process_single_date_core_NA = app.create_data(
+            id=f"pre_process_single_date_core_{region}",
+            inputs={"daily_data": smart_filtering_data[region]["*"][:-8].reference(), "timer": daily_timer},
+            input_dim_links=[
+                (smart_filtering_data("day"), timer_to_pre_process_data_day, daily_timer("day")),
+                (daily_timer("day"), pre_process_data_day_to_timer, smart_filtering_data("day")),
+            ],
+            output_dimension_spec={
+                "dataset": {
+                    type: DimensionType.STRING,
+                    "modelName": {
+                        type: DimensionType.STRING,
+                        "modelVersion": {
+                            type: DimensionType.STRING,
+                            "region": {
+                                type: DimensionType.STRING,
+                                "day": {type: DimensionType.DATETIME, "granularity": DatetimeGranularity.DAY, "format": "%Y-%m-%d"},
+                            },
+                        },
+                    },
+                }
+            },
+            output_dim_links=[
+                ("dataset", EQUALS, "prod"),
+                ("modelName", EQUALS, "DORE"),
+                ("modelVersion", EQUALS, "1.1"),
+                ("region", EQUALS, region),  # Declaration is unnecessary - adding for better readability
+                ("day", timer_to_pre_process_data_day, daily_timer("day")),
+                (daily_timer("day"), pre_process_data_day_to_timer, "day"),  # Not required for runtime - Used for execute API
+                (smart_filtering_data("day"), EQUALS, "day"),
+            ],
+            compute_targets=[NOOPCompute],
+        )
+        # do an early check even without activation. even in the interpreted node data daily_data input should have the range already.
+        node_route: Route = pre_process_single_date_core_NA.bound.create_route()
+        daily_data_signal: Signal = [signal for signal in node_route.link_node.signals if signal.alias == "daily_data"][0]
+        materialized_resource_paths = daily_data_signal.get_materialized_resource_paths()
+        assert len(materialized_resource_paths) == 8
+        assert materialized_resource_paths[0].endswith("7")
+        assert materialized_resource_paths[7].endswith("0")
+
+        app.execute(pre_process_single_date_core_NA["prod"]["DORE"]["1.1"][region]["2022-09-13"])
+
+        path, compute_records = app.poll(pre_process_single_date_core_NA["prod"]["DORE"]["1.1"][region]["2022-09-13"])
+        assert path
+        compute_record = compute_records[0]
+
+        # this is the signal that would be received by batch-compute drivers or InlinedCompute code
+        daily_data_signal_from_execution: Signal = [
+            signal for signal in compute_record.materialized_inputs if signal.alias == "daily_data"
+        ][0]
+        materialized_resource_paths = daily_data_signal_from_execution.get_materialized_resource_paths()
+        assert len(materialized_resource_paths) == 8
+        assert materialized_resource_paths[0].endswith("7")
+        assert materialized_resource_paths[7].endswith("0")
+
+        # extra sanity-check on both inputs and the output to make sure that links have worked well too
+        timer_signal: Signal = [signal for signal in compute_record.materialized_inputs if signal.alias == "timer"][0]
+        DimensionFilter.check_equivalence(
+            timer_signal.domain_spec.dimension_filter_spec, DimensionFilter.load_raw({"2022-09-14": {}})  # one day ahead
+        )
+
+        DimensionFilter.check_equivalence(
+            daily_data_signal_from_execution.domain_spec.dimension_filter_spec,
+            DimensionFilter.load_raw(
+                {
+                    "NA": {
+                        "2022-09-13": {  # same as the output
+                            7: {},
+                            6: {},
+                            5: {},
+                            4: {},
+                            3: {},
+                            2: {},
+                            1: {},
+                            0: {},
+                        }
+                    }
+                }
+            ),
+        )
+        # and finally the output
+        DimensionFilter.check_equivalence(
+            compute_record.materialized_output.domain_spec.dimension_filter_spec,
+            DimensionFilter.load_raw({"prod": {"DORE": {"1.1": {region: {"2022-09-13"}}}}}),  # as provided in "execute" call
+        )
+
+        self.patch_aws_stop()
+
+    def test_application_date_range_on_input_events(self):
+        app = self._create_app()
+
+        training_data = app.marshal_external_data(
+            S3Dataset("12345678901", "bucket", "data_folder", "partition_day={}", dataset_format=DataFormat.CSV),
+            "trainin_all",
+            dimension_spec={
+                "day": {
+                    "type": DimensionType.DATETIME,
+                    "format": "%Y-%m-%d",
+                    # LIMIT !!! block events from this S3 source with partitions earlier than this
+                    "min": "2021-01-01",
+                }
+            },
+            dimension_filter={"*": {}},
+        )
+
+        verification = app.add_external_data(
+            data_id="verification",
+            s3_dataset=S3("111222333444", "bucket", "folder", AnyDate("day", {"format": "%Y-%m-%d"})),
+            completion_file="_SUCCESS",
+        )
+
+        internal_node = app.create_data(
+            id="internal_data",
+            inputs=[training_data, verification],
+            compute_targets=[NOOPCompute],
+        )
+
+        path = app.materialize(internal_node["2021-01-01"])
+        assert path
+
+        # rejected due to "min" date being violated
+        with pytest.raises(ValueError):
+            app.materialize(internal_node["2020-12-01"])
+
+        internal_node_with_link = app.create_data(
+            id="internal_data2",
+            inputs=[verification, training_data],
+            input_dim_links=[(training_data("day"), lambda ver_date: ver_date - timedelta(days=5), verification("day"))],
+            compute_targets=[NOOPCompute],
+        )
+
+        app.activate()
+
+        with pytest.raises(ValueError):
+            app.process(training_data[datetime(2020, 12, 28)])
+
+        app.process(training_data[datetime(2021, 1, 2)])  # > "min" date
+
+        # now show that due to input link above even if verification (hence the output as it adapts the first input's spec by default here)
+        # has a date greater than "min" date training_data input will raise due to its mapped date value being earlier than "min" date
+        with pytest.raises(ValueError):
+            app.execute(internal_node_with_link[datetime(2021, 1, 3)])
+
+        # this will ok because training_data("day") will map to a date greater than its "min" date
+        app.execute(internal_node_with_link[datetime(2021, 1, 6)], wait=False)
 
         self.patch_aws_stop()

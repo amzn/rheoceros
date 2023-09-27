@@ -58,6 +58,7 @@ class SignalSourceType(str, Enum):
     _AMZN_RESERVED_1 = "EDX"
     LOCAL_FS = "LOCAL_FS"
     SAGEMAKER = "SAGEMAKER"
+    SNS = "SNS"
 
     INTERNAL_METRIC = "INTERNAL_METRIC"  # depending on Platform::MetricStore impl
     CW_METRIC = "CW_METRIC"
@@ -97,6 +98,46 @@ DIMENSION_PLACEHOLDER_FORMAT = "{}"
 ENCRYPTION_KEY_KEY = "encryption_key"
 
 COMPUTE_HINTS_KEY = "COMPUTE_HINTS"
+
+DATA_TYPE_KEY = "data_type"
+
+
+@unique
+class DataType(str, Enum):
+    MODEL_ARTIFACT = "model"
+    DATASET = "dataset"
+    RAW_CONTENT = "content"
+
+
+CONTENT_TYPE_KEY = "content_type"
+
+
+@unique
+class ContentType(str, Enum):
+    """Refer
+    https://docs.aws.amazon.com/sagemaker/latest/dg/cdf-training.html
+    """
+
+    X_IMAGE = "application/x-image"
+    X_RECORDIO = "application/x-recordio"
+    X_RECORDIO_PROTOBUF = "application/x-recordio-protobuf"
+    JSONLINES = "application/jsonlines"
+    PARQUET = "application/x-parquet"
+    JPEG = "image/jpeg"
+    PNG = "image/png"
+    CSV = "text/csv"
+    LIBSVM = "text/libsvm"
+
+
+MODEL_FORMAT_KEY = "model_format"
+
+
+@unique
+class ModelSignalSourceFormat(str, Enum):
+    SAGEMAKER_TRAINING_JOB = "sagemaker_training_job"
+
+
+MODEL_METADATA = "model_metadata"
 
 
 class SignalSource(CoreData):
@@ -139,8 +180,17 @@ class SignalSourceAccessSpec:
         return self._attrs
 
     @property
+    def data_type(self) -> Optional[DataType]:
+        return DataType(self.attrs[DATA_TYPE_KEY]) if DATA_TYPE_KEY in self.attrs else None
+
+    @property
     def encryption_key(self) -> Optional[str]:
         return self._attrs.get(ENCRYPTION_KEY_KEY, None)
+
+    @property
+    def content_type(self) -> Optional[ContentType]:
+        c_type = self._attrs.get(CONTENT_TYPE_KEY, None)
+        return ContentType(c_type) if c_type else None
 
     @property
     def proxy(self) -> "SignalSourceAccessSpec":
@@ -182,7 +232,12 @@ class SignalSourceAccessSpec:
 
          Sub-classes are expected to do checks on relevant keys within the '_attrs' metadata dict.
         """
-        return self._source == other.source and self._path_format == other.path_format
+        return (
+            self._source == other.source
+            and self._path_format == other.path_format
+            and ((not self.proxy and not other.proxy) or (self.proxy and other.proxy and self.proxy.check_integrity(other.proxy)))
+            and self.encryption_key == other.encryption_key
+        )
 
     def link(self, proxy: "SignalSourceAccessSpec") -> None:
         """Link another source access spec to this one.
@@ -200,16 +255,16 @@ class SignalSourceAccessSpec:
     def path_format_requires_resource_name(cls) -> bool:
         return True
 
-    def extract_source(self, materialized_resource_path: str) -> Optional[SignalSource]:
+    def extract_source(self, materialized_resource_path: str, required_resource_name: Optional[str] = None) -> Optional[SignalSource]:
         """Extract dimensions (i.e partition keys) from a full/physical resource path using this spec and also
         the entire chain of proxy specs attached to it.
         """
-        source = self._extract_source(materialized_resource_path)
+        source = self._extract_source(materialized_resource_path, required_resource_name)
         if not source and getattr(self, "_proxy", None):
-            source = self._proxy.extract_source(materialized_resource_path)
+            source = self._proxy.extract_source(materialized_resource_path, required_resource_name)
         return source
 
-    def _extract_source(self, materialized_resource_path: str) -> Optional[SignalSource]:
+    def _extract_source(self, materialized_resource_path: str, required_resource_name: Optional[str] = None) -> Optional[SignalSource]:
         """Extract dimensions (i.e partition keys) from a full/physical resource path.
 
         Can be specialized in sub-classes if this impl cannot satisfy a particular source type.
@@ -219,9 +274,10 @@ class SignalSourceAccessSpec:
         path_format_partitioned = self.path_format.split(self.path_delimiter())
         resource_path_partitioned = materialized_resource_path.split(self.path_delimiter())
         if self.path_format_requires_resource_name():
+            required_resource_name_parts_len = len(required_resource_name.split(self.path_delimiter())) if required_resource_name else 1
             # drop the actual resource name (i.e partition name for datasets) from the resource path
-            resource_name = resource_path_partitioned[-1]
-            resource_path_partitioned = resource_path_partitioned[:-1]
+            resource_name = self.path_delimiter().join(resource_path_partitioned[-required_resource_name_parts_len:])
+            resource_path_partitioned = resource_path_partitioned[:-required_resource_name_parts_len]
         else:
             resource_name = None
             resource_path_partitioned = resource_path_partitioned
@@ -238,7 +294,8 @@ class SignalSourceAccessSpec:
         for path_part in path_format_partitioned:
             if DIMENSION_PLACEHOLDER_FORMAT not in path_part:
                 # parts should match
-                if path_part != next(resource_iterator):
+                # TODO regex here (currently the whole compartment should be '*')
+                if path_part != "*" and path_part != next(resource_iterator):
                     return None
             else:
                 start = path_part.find("{")
@@ -289,7 +346,7 @@ class SignalSourceAccessSpec:
         # this logic suits datasets, for other resource type dimensions from the same level can contribute together,
         # with different schemes to materialize a path.
         for dim, sub_filter in dim_filter.get_dimensions():
-            path_values: List[str] = list(current_path_values) + [str(cast(DimensionVariant, dim).value)]
+            path_values: List[str] = list(current_path_values) + [str(cast(DimensionVariant, dim).transform().value)]
             cls._create_path_from_filter(path_format, paths, path_values, sub_filter)
 
     @classmethod
@@ -320,7 +377,7 @@ class SignalSourceAccessSpec:
 
     @classmethod
     def _get_dimension_value(cls, dim_variant: DimensionVariant) -> Any:
-        return dim_variant.value
+        return dim_variant.transform().value
 
     def check_termination(self, current: DimensionFilter, new: DimensionFilter) -> bool:
         """
@@ -426,6 +483,24 @@ class DatasetSignalSourceFormat(str, Enum):
     ORC = "orc"
     JSON = "json"
     AVRO = "avro"
+    LIBSVM = "libsvm"
+
+    @classmethod
+    def from_content_type(cls, content_type: ContentType) -> Optional["DatasetSignalSourceFormat"]:
+        return {
+            ContentType.CSV: DatasetSignalSourceFormat.CSV,
+            ContentType.LIBSVM: DatasetSignalSourceFormat.LIBSVM,
+            ContentType.PARQUET: DatasetSignalSourceFormat.PARQUET,
+            ContentType.JSONLINES: DatasetSignalSourceFormat.JSON,
+        }.get(content_type, None)
+
+    def to_content_type(self) -> Optional[ContentType]:
+        return {
+            DatasetSignalSourceFormat.CSV: ContentType.CSV,
+            DatasetSignalSourceFormat.LIBSVM: ContentType.LIBSVM,
+            DatasetSignalSourceFormat.PARQUET: ContentType.PARQUET,
+            DatasetSignalSourceFormat.JSON: ContentType.JSONLINES,
+        }.get(self, None)
 
 
 DATASET_FORMAT_KEY = "dataset_format"
@@ -447,12 +522,21 @@ PARTITION_KEYS_KEY = "partition_keys"
 PRIMARY_KEYS_KEY = "primary_keys"
 
 
+@unique
+class DataFrameFormat(str, Enum):
+    SPARK = "SPARK"
+    PANDAS = "PANDAS"
+    ORIGINAL = "ORIGINAL"
+
+
+# TODO extract core data spec into a base class (DataSignalSourceAccessSpec)
 class DatasetSignalSourceAccessSpec(SignalSourceAccessSpec):
     def __init__(self, source: SignalSourceType, path_format: str, attrs: Dict[str, Any]) -> None:
         super().__init__(source, path_format, attrs)
         data_format_value = self.attrs.get(DATASET_FORMAT_KEY, self.attrs.get(DATA_FORMAT_KEY, None))
+        # TODO remove this defaulting after "DataSignalSourceAccessSpec"
         self._data_format = DatasetSignalSourceFormat(data_format_value) if data_format_value else DEFAULT_DATASET_FORMAT
-        self._data_type = DatasetType(self.attrs[DATASET_TYPE_KEY]) if DATASET_TYPE_KEY in attrs else DEFAULT_DATASET_TYPE
+        self._dataset_type = DatasetType(self.attrs[DATASET_TYPE_KEY]) if DATASET_TYPE_KEY in attrs else DEFAULT_DATASET_TYPE
         self._partition_keys = attrs.get(PARTITION_KEYS_KEY, [])
         self._primary_keys = attrs.get(PRIMARY_KEYS_KEY, [])
 
@@ -465,6 +549,9 @@ class DatasetSignalSourceAccessSpec(SignalSourceAccessSpec):
             not isinstance(other, DatasetSignalSourceAccessSpec)
             or self.data_format != other.data_format
             or self.dataset_type != other.dataset_type
+            or self.data_delimiter != other.data_delimiter
+            or self.data_compression != other.data_compression
+            or self.data_header_exists != other.data_header_exists
             or self.partition_keys != other.partition_keys
             or self.primary_keys != other.primary_keys
         ):
@@ -472,13 +559,22 @@ class DatasetSignalSourceAccessSpec(SignalSourceAccessSpec):
 
         return True
 
+    # overrides
+    @property
+    def content_type(self) -> Optional[ContentType]:
+        c_type = super().content_type
+        if not c_type and self.data_format:
+            c_type = self.data_format.to_content_type()
+        return c_type
+
     @property
     def data_format(self) -> DatasetSignalSourceFormat:
         return self._data_format
 
     @property
     def dataset_type(self) -> DatasetType:
-        return self._data_type
+        # TODO remove in the future. added for backwards compatibility
+        return getattr(self, "_dataset_type", getattr(self, "_data_type", None))
 
     @property
     def data_delimiter(self) -> str:
@@ -562,7 +658,7 @@ class DatasetSignalSourceAccessSpec(SignalSourceAccessSpec):
     # overrides
     @classmethod
     def _get_dimension_value(cls, dim_variant: DimensionVariant) -> Any:
-        return dim_variant.value
+        return dim_variant.transform().value
 
 
 INTERNAL_DATA_ROUTE_ID_KEY = "_internal_data_route_id"
@@ -583,7 +679,8 @@ class InternalDatasetSignalSourceAccessSpec(DatasetSignalSourceAccessSpec):
             path_format = self.create_path_format_from_spec(data_id, dimension_spec_or_key)
         if DATASET_SCHEMA_TYPE_KEY not in kwargs:
             kwargs[DATASET_SCHEMA_TYPE_KEY] = self.SCHEMA_FILE_DEFAULT_TYPE
-        kwargs[DATASET_SCHEMA_FILE_KEY] = self.build_schema_file_name(kwargs[DATASET_SCHEMA_TYPE_KEY])
+        if DATASET_SCHEMA_FILE_KEY not in kwargs or kwargs[DATASET_SCHEMA_FILE_KEY] is not None:
+            kwargs[DATASET_SCHEMA_FILE_KEY] = self.build_schema_file_name(kwargs[DATASET_SCHEMA_TYPE_KEY])
         super().__init__(SignalSourceType.INTERNAL, path_format, kwargs)
         self._data_id = data_id
 
@@ -599,7 +696,10 @@ class InternalDatasetSignalSourceAccessSpec(DatasetSignalSourceAccessSpec):
             data_id_and_partitions = converted_spec.path_format[len(f"/{cls.FOLDER}/") :].split("/")
             data_id = data_id_and_partitions[0]
             partitions = data_id_and_partitions[1:]
-            return InternalDatasetSignalSourceAccessSpec(data_id, *partitions, **other.attrs)
+            if partitions:
+                return InternalDatasetSignalSourceAccessSpec(data_id, *partitions, **other.attrs)
+            else:
+                return InternalDatasetSignalSourceAccessSpec(data_id, DimensionSpec(), **other.attrs)
 
     # overrides
     def check_integrity(self, other: SignalSourceAccessSpec) -> bool:
@@ -933,6 +1033,82 @@ class TimerSignalSourceAccessSpec(SignalSourceAccessSpec):
         return parts[-1]
 
 
+class SNSSignalSourceAccessSpec(SignalSourceAccessSpec):
+    # needed to conform with IF's resource_path expectation
+    TOPIC_RESOURCE_SUFFIX: ClassVar[str] = "topic"
+
+    def __init__(self, topic: str, account_id: str, region: str, retain_ownership: bool, **kwargs: Dict[str, Any]) -> None:
+        self._topic = topic
+        self._account_id = account_id
+        self._region = region
+        self._retain_ownership = retain_ownership
+        path_format = self.create_path_format(self._topic, account_id, region)
+        super().__init__(SignalSourceType.SNS, path_format, kwargs)
+
+    def __eq__(self, other) -> bool:
+        return super().__eq__(other) and self.retain_ownership == other.retain_ownership
+
+    def __ne__(self, other):
+        return not self == other
+
+    # overrides
+    def check_integrity(self, other: "SignalSourceAccessSpec") -> bool:
+        if not super().check_integrity(other):
+            return False
+
+        # other fields are already as part of the path_format (checked by super above),
+        # we just need to check extra fields that are not part of the path_format
+        if not isinstance(other, SNSSignalSourceAccessSpec) or self.retain_ownership != other.retain_ownership:
+            return False
+
+        return True
+
+    @property
+    def topic(self) -> str:
+        return self._topic
+
+    @property
+    def topic_arn(self) -> str:
+        return f"arn:aws:sns:{self.region}:{self.account_id}:{self.topic}"
+
+    @property
+    def account_id(self) -> str:
+        return self._account_id
+
+    @property
+    def region(self) -> str:
+        return self._region
+
+    @property
+    def retain_ownership(self) -> bool:
+        return self._retain_ownership
+
+    @classmethod
+    def create_path_format(cls, topic_id: str, account_id: str, region: str) -> str:
+        return (
+            "sns://"
+            + account_id
+            + cls.path_delimiter()
+            + region
+            + cls.path_delimiter()
+            + topic_id
+            + cls.path_delimiter()
+            + DIMENSION_PLACEHOLDER_FORMAT
+        )
+
+    @classmethod
+    def create_resource_path(cls, topic_id: str, account_id: str, region: str, time: str) -> str:
+        return cls.create_path_format(topic_id, account_id, region).format(time) + cls.path_delimiter() + cls.TOPIC_RESOURCE_SUFFIX
+
+    @classmethod
+    def extract_time(cls, materialized_resource_path: str) -> str:
+        parts = materialized_resource_path.rsplit(cls.path_delimiter(), 2)
+        if parts[-1] == cls.TOPIC_RESOURCE_SUFFIX:
+            return parts[-2]
+
+        return parts[-1]
+
+
 METRIC_VISUALIZATION_TYPE_HINT: str = "__metric_vis_view_hint"
 METRIC_VISUALIZATION_STAT_HINT: MetricStatistic = "__metric_vis_stat_hint"
 METRIC_VISUALIZATION_PERIOD_HINT: MetricPeriod = "__metric_vis_period_hint"
@@ -1038,7 +1214,7 @@ class MetricSignalSourceAccessSpec(SignalSourceAccessSpec):
         # this logic suits datasets, for other resource type dimensions from the same level can contribute together,
         # with different schemes to materialize a path.
         for dim, sub_filter in dim_filter.get_dimensions():
-            metric_dim_values: List[str] = list(current_metric_dim_values) + [str(cast(DimensionVariant, dim).value)]
+            metric_dim_values: List[str] = list(current_metric_dim_values) + [str(cast(DimensionVariant, dim).transform().value)]
             self._create_stats_from_filter(stats, metric_dim_values, sub_filter)
 
     # overrides

@@ -3,19 +3,14 @@
 
 import random
 import string
-import threading
 import time
 from datetime import datetime, timedelta
+from unittest.mock import MagicMock
 
 import pytest
-from mock import MagicMock
 
-import intelliflow.api_ext as flow
 from intelliflow.api_ext import *
-from intelliflow.core.application.application import Application
 from intelliflow.core.platform.definitions.compute import (
-    ComputeFailedSessionState,
-    ComputeFailedSessionStateType,
     ComputeResourceDesc,
     ComputeResponse,
     ComputeSessionDesc,
@@ -28,6 +23,65 @@ from intelliflow.core.signal_processing.routing_runtime_constructs import Runtim
 from intelliflow.core.signal_processing.signal import *
 from intelliflow.mixins.aws.test import AWSTestBase
 from intelliflow.utils.test.inlined_compute import NOOPCompute
+
+
+def compute_processing_response(
+    route: Route,
+    materialized_inputs: List[Signal],
+    slot: Slot,
+    materialized_output: Signal,
+    execution_ctx_id: str,
+    retry_session_desc: Optional[ComputeSessionDesc] = None,
+) -> ComputeResponse:
+    return ComputeSuccessfulResponse(
+        ComputeSuccessfulResponseType.PROCESSING,
+        ComputeSessionDesc(f"job_{materialized_output.get_materialized_resource_paths()[0]}", ComputeResourceDesc("job_name", "job_arn")),
+    )
+
+
+def compute_completed_response(
+    route: Route,
+    materialized_inputs: List[Signal],
+    slot: Slot,
+    materialized_output: Signal,
+    execution_ctx_id: str,
+    retry_session_desc: Optional[ComputeSessionDesc] = None,
+) -> ComputeResponse:
+    return ComputeSuccessfulResponse(
+        ComputeSuccessfulResponseType.COMPLETED,
+        ComputeSessionDesc(f"job_{materialized_output.get_materialized_resource_paths()[0]}", ComputeResourceDesc("job_name", "job_arn")),
+    )
+
+
+def get_completed_session_state(
+    session_desc: ComputeSessionDesc, active_compute_record: "RoutingTable.ComputeRecord"
+) -> ComputeSessionState:
+    return ComputeSessionState(
+        ComputeSessionDesc(
+            f"job_{active_compute_record.materialized_output.get_materialized_resource_paths()[0]}",
+            ComputeResourceDesc("job_name", "job_arn"),
+        )
+        if not session_desc
+        else session_desc,
+        # COMPLETED !!!
+        ComputeSessionStateType.COMPLETED,
+        [ComputeExecutionDetails("<start_time>", "<end_time>", dict())],
+    )
+
+
+def get_processing_session_state(
+    session_desc: ComputeSessionDesc, active_compute_record: "RoutingTable.ComputeRecord"
+) -> ComputeSessionState:
+    return ComputeSessionState(
+        ComputeSessionDesc(
+            f"job_{active_compute_record.materialized_output.get_materialized_resource_paths()[0]}",
+            ComputeResourceDesc("job_name", "job_arn"),
+        )
+        if not session_desc
+        else session_desc,
+        ComputeSessionStateType.PROCESSING,
+        [ComputeExecutionDetails("<start_time>", "<end_time>", dict())],
+    )
 
 
 class TestAWSApplicationRoutingInternals(AWSTestBase):
@@ -191,34 +245,8 @@ class TestAWSApplicationRoutingInternals(AWSTestBase):
         self.activate_event_propagation(app, cycle_time_in_secs=orchestration_cycle_time_in_secs)
 
         # patch BatchCompute for persistent ACR on node1 (otherwise ACR will be consumed immediately)
-        def compute(
-            materialized_inputs: List[Signal],
-            slot: Slot,
-            materialized_output: Signal,
-            execution_ctx_id: str,
-            retry_session_desc: Optional[ComputeSessionDesc] = None,
-        ) -> ComputeResponse:
-            return ComputeSuccessfulResponse(
-                ComputeSuccessfulResponseType.PROCESSING,
-                ComputeSessionDesc(
-                    f"job_{materialized_output.get_materialized_resource_paths()[0]}", ComputeResourceDesc("job_name", "job_arn")
-                ),
-            )
-
-        def get_session_state(session_desc: ComputeSessionDesc, active_compute_record: "RoutingTable.ComputeRecord") -> ComputeSessionState:
-            return ComputeSessionState(
-                ComputeSessionDesc(
-                    f"job_{active_compute_record.materialized_output.get_materialized_resource_paths()[0]}",
-                    ComputeResourceDesc("job_name", "job_arn"),
-                )
-                if not session_desc
-                else session_desc,
-                ComputeSessionStateType.PROCESSING,
-                [ComputeExecutionDetails("<start_time>", "<end_time>", dict())],
-            )
-
-        app.platform.batch_compute.compute = MagicMock(side_effect=compute)
-        app.platform.batch_compute.get_session_state = MagicMock(side_effect=get_session_state)
+        app.platform.batch_compute.compute = MagicMock(side_effect=compute_processing_response)
+        app.platform.batch_compute.get_session_state = MagicMock(side_effect=get_processing_session_state)
 
         # create pending nodes for 60 days
         for i in range(experiment_partition_count):
@@ -269,20 +297,7 @@ class TestAWSApplicationRoutingInternals(AWSTestBase):
         assert not app.get_active_route(node_sink)
 
         # All SUCCESS (patch BatchCompute to return COMPLETED for all ACRs to RoutingTable query in the next cycle of orchestation)
-        def get_session_state(session_desc: ComputeSessionDesc, active_compute_record: "RoutingTable.ComputeRecord") -> ComputeSessionState:
-            return ComputeSessionState(
-                ComputeSessionDesc(
-                    f"job_{active_compute_record.materialized_output.get_materialized_resource_paths()[0]}",
-                    ComputeResourceDesc("job_name", "job_arn"),
-                )
-                if not session_desc
-                else session_desc,
-                # COMPLETED !!!
-                ComputeSessionStateType.COMPLETED,
-                [ComputeExecutionDetails("<start_time>", "<end_time>", dict())],
-            )
-
-        app.platform.batch_compute.get_session_state = MagicMock(side_effect=get_session_state)
+        app.platform.batch_compute.get_session_state = MagicMock(side_effect=get_completed_session_state)
 
         # when an ACR is done, it is moved out as a historical/inactive CR
         # we will use the following routine in the rest of the test for checking all of node_sink activations are moved/
@@ -320,5 +335,113 @@ class TestAWSApplicationRoutingInternals(AWSTestBase):
                 assert path
 
         assert not app.get_active_routes()
+
+        self.patch_aws_stop()
+
+    def test_application_route_inactive_compute_record_search(self):
+        """
+        Test searching the compute record history table by different parameters.
+
+        First creating two nodes, one with completed session state result, one with failed session state result.
+        Then query on the table using parameters including trigger_range, deactivated_range, session_state, or slot_type.
+        """
+        self.patch_aws_start()
+
+        app_name = "test-history"
+        app = AWSApplication(app_name, self.region)
+        test_time = datetime.now()
+
+        dummy_input_signal1 = app.add_timer("timer1", "rate(1 day)")
+        dummy_input_signal2 = app.add_timer("timer2", "rate(1 day)")
+
+        node1 = app.create_data("test_node1", inputs=[dummy_input_signal1], compute_targets=[Glue("SPARK CODE")])
+
+        node2 = app.create_data("test_node2", inputs=[dummy_input_signal2], compute_targets=[Glue("SPARK CODE")])
+
+        app.activate()
+
+        # inject input1 to create a completed compute record
+        app.platform.batch_compute.compute = MagicMock(side_effect=compute_completed_response)
+        app.platform.batch_compute.get_session_state = MagicMock(side_effect=get_completed_session_state)
+
+        app.process(dummy_input_signal1["2022-08-01"])
+
+        while len(list(app.get_inactive_compute_records(node1))) < 1:
+            time.sleep(1)
+
+        # Check record is saved to history table
+        inactive_records1 = list(app.get_inactive_compute_records(node1))
+        assert len(inactive_records1) == 1
+
+        # Inject input2 create another failed compute record
+        app.platform.batch_compute.compute = MagicMock(side_effect=Exception("Test"))
+        app.process(dummy_input_signal2["2022-08-01"])
+
+        while len(list(app.get_inactive_compute_records(node2))) < 1:
+            time.sleep(1)
+
+        # Check record is saved to history table
+        inactive_records2 = list(app.get_inactive_compute_records(node2))
+        assert len(inactive_records2) == 1
+
+        test_time_int = int(test_time.timestamp())
+        test_time_plus_1_day = int((test_time + timedelta(days=1)).timestamp())
+        test_time_plus_2_day = int((test_time + timedelta(days=2)).timestamp())
+
+        # Node 1 return a completed record
+        assert len(list(app.get_inactive_compute_records(node1, session_state=ComputeSessionStateType.COMPLETED))) == 1
+        # Node 2 does not have any completed record
+        assert len(list(app.get_inactive_compute_records(node2, session_state=ComputeSessionStateType.COMPLETED))) == 0
+
+        # Return result when trigger range is correct
+        assert len(list(app.get_inactive_compute_records(node1, trigger_range=(test_time_int, test_time_plus_1_day)))) == 1
+
+        # Return no result when trigger range is incorrect
+        assert len(list(app.get_inactive_compute_records(node1, trigger_range=(test_time_plus_1_day, test_time_plus_2_day)))) == 0
+
+        # Return result when deactivated_range is correct
+        assert len(list(app.get_inactive_compute_records(node1, deactivated_range=(test_time_int, test_time_plus_1_day)))) == 1
+
+        # Return no result when deactivated_range is incorrect
+        assert len(list(app.get_inactive_compute_records(node1, deactivated_range=(test_time_plus_1_day, test_time_plus_2_day)))) == 0
+
+        # Return result for slot type ASYNC_BATCH_COMPUTE
+        assert len(list(app.get_inactive_compute_records(node1, slot_type=SlotType.ASYNC_BATCH_COMPUTE))) == 1
+
+        # Return no result for slot type SYNC_INLINED
+        assert len(list(app.get_inactive_compute_records(node1, slot_type=SlotType.SYNC_INLINED))) == 0
+
+        # Test using all parameters
+        assert (
+            len(
+                list(
+                    app.get_inactive_compute_records(
+                        node1,
+                        session_state=ComputeSessionStateType.COMPLETED,
+                        trigger_range=(test_time_int, test_time_plus_1_day),
+                        deactivated_range=(test_time_int, test_time_plus_1_day),
+                        slot_type=SlotType.ASYNC_BATCH_COMPUTE,
+                        ascending=True,
+                    ),
+                )
+            )
+            == 1
+        )
+
+        assert (
+            len(
+                list(
+                    app.get_inactive_compute_records(
+                        node2,
+                        session_state=ComputeSessionStateType.COMPLETED,
+                        trigger_range=(test_time_int, test_time_plus_1_day),
+                        deactivated_range=(test_time_int, test_time_plus_1_day),
+                        slot_type=SlotType.ASYNC_BATCH_COMPUTE,
+                        ascending=True,
+                    ),
+                )
+            )
+            == 0
+        )
 
         self.patch_aws_stop()

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import pytest
-from mock import MagicMock
+from unittest.mock import MagicMock
 
 from intelliflow.api_ext import *
 from intelliflow.core.application.application import Application
@@ -58,6 +58,7 @@ class TestAWSApplicationExecutionChain(AWSTestBase):
 
         # mock batch_compute for instant success on batch jobs
         def compute(
+            route: Route,
             materialized_inputs: List[Signal],
             slot: Slot,
             materialized_output: Signal,
@@ -100,6 +101,7 @@ class TestAWSApplicationExecutionChain(AWSTestBase):
 
         # mock batch_compute again for instant success on batch jobs
         def compute(
+            route: Route,
             materialized_inputs: List[Signal],
             slot: Slot,
             materialized_output: Signal,

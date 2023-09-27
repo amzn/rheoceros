@@ -5,7 +5,7 @@ import json
 import logging
 import uuid
 from datetime import datetime
-from typing import ClassVar, Dict, Iterator, List, Optional, Sequence, Set, Tuple, Type, Union, cast
+from typing import Any, ClassVar, Dict, Iterator, List, Optional, Sequence, Set, Tuple, Type, Union, cast
 
 import boto3
 from botocore.exceptions import ClientError
@@ -101,6 +101,7 @@ module_logger = logging.getLogger(__name__)
 class AWSCloudWatchDiagnostics(AWSConstructMixin, Diagnostics):
     INTERNAL_ALARM_NAME_PREFIX: ClassVar[str] = "if-{0}-"
     TOPIC_NAME_FORMAT: ClassVar[str] = "if-{0}-{1}"
+    CUSTOM_DASHBOARD_NAME_FORMAT: ClassVar[str] = "IntelliFlow-{0}-{1}"
     """Diagnostics hub impl based on CloudWatch.
 
     Trade-offs:
@@ -364,6 +365,8 @@ class AWSCloudWatchDiagnostics(AWSConstructMixin, Diagnostics):
     @classmethod
     def provide_devtime_permissions(cls, params: ConstructParamsDict) -> List[ConstructPermission]:
         # dev-role should be able to do the following.
+        # TODO make permissions here finer granular
+        unique_context_id = params[ActivationParams.UNIQUE_ID_FOR_CONTEXT]
         return [
             ConstructPermission(["*"], ["sns:*"]),
             ConstructPermission(
@@ -377,7 +380,9 @@ class AWSCloudWatchDiagnostics(AWSConstructMixin, Diagnostics):
                     "cloudwatch:PutMetricData",  # particular for testing (integ-tests, etc)
                     "cloudwatch:GetMetricData",
                     "cloudwatch:TagResource",
+                    # TODO move to a different block as use dashboard arn format (for both default and custom dashboards)
                     "cloudwatch:PutDashboard",
+                    "cloudwatch:DeleteDashboards",
                 ],
             ),
         ]
@@ -650,12 +655,50 @@ class AWSCloudWatchDiagnostics(AWSConstructMixin, Diagnostics):
                 self._remove_internal_alarm(int_signal)
 
         # 2 - SURVIVORS + NEW ONES (always doing the check/update even against the existing [common] signals)
-        for int_signal in new_alarms:
-            internal_alarm_name = self.get_unique_internal_alarm_name(int_signal.resource_access_spec.alarm_id)
-            # 1- add permission to publish to this SNS topic
-            # TODO replace the following (acc based) permission control code with a more granular policy based version.
-            # similar to what we do in '_setup_event_channel' using 'self._topic_root_policy', and then
-            # calling 'self._sns.set_topic_attributes'
+        # TODO SNS policy has size limit, the following code might be modified to create a single statement to
+        #  represent all of the alarms.
+        #    similar to what we do in '_setup_event_channel' using 'self._topic_root_policy', and then
+        #    calling 'self._sns.set_topic_attributes'
+        # for int_signal in new_alarms:
+        #    internal_alarm_name = self.get_unique_internal_alarm_name(int_signal.resource_access_spec.alarm_id)
+        #    # 1- add permission to publish to this SNS topic
+        #    permission_label: str = self._generate_cw_alarm_to_sns_publish_permissin_label(
+        #        self.account_id, self.region, internal_alarm_name
+        #    )
+        #    try:
+        #        exponential_retry(self._sns.remove_permission, {"InternalErrorException"}, TopicArn=self._topic_arn, Label=permission_label)
+        #    except self._sns.exceptions.NotFoundException:
+        #        pass
+
+        #    exponential_retry(
+        #        self._sns.add_permission,
+        #        {"InternalErrorException"},
+        #        TopicArn=self._topic_arn,
+        #        Label=permission_label,
+        #        AWSAccountId=[self.account_id],  # this is redundant but kept here until the policy based update (above TODO is handled)
+        #        ActionName=["Publish"],
+        #    )
+
+        if new_alarms:
+            # TODO / FUTURE remove
+            #  BACKWARDS_COMPATIBILITY, clean up SNS policy for existing alarms, remove duplicate account root
+            #  statements.
+            for int_signal in new_alarms:
+                internal_alarm_name = self.get_unique_internal_alarm_name(int_signal.resource_access_spec.alarm_id)
+                permission_label: str = self._generate_cw_alarm_to_sns_publish_permissin_label(
+                    self.account_id, self.region, internal_alarm_name
+                )
+                try:
+                    exponential_retry(
+                        self._sns.remove_permission, {"InternalErrorException"}, TopicArn=self._topic_arn, Label=permission_label
+                    )
+                except self._sns.exceptions.NotFoundException:
+                    pass
+            # end BACKWARDS_COMPATIBILITY
+
+            # crate one statement for all of the alarms (register the root account)
+            internal_alarm_name = self.get_unique_internal_alarm_name("INTERNAL_ALARMS")
+            # - add permission to publish to this SNS topic
             permission_label: str = self._generate_cw_alarm_to_sns_publish_permissin_label(
                 self.account_id, self.region, internal_alarm_name
             )
@@ -1175,7 +1218,7 @@ class AWSCloudWatchDiagnostics(AWSConstructMixin, Diagnostics):
         """
         platform = self.get_platform()
         unique_context_id = self._params[ActivationParams.UNIQUE_ID_FOR_CONTEXT]
-        dashboard_name = f"RheocerOS-{unique_context_id}-Default-Dashboard"
+        dashboard_name = self._build_default_dashboard_name()
         module_logger.critical(f"Creating default diagnostics dashboard {dashboard_name!r} ...")
         dashboard = {
             "start": "-PT2W",  # two weeks by default. parametrize for non-default
@@ -1370,6 +1413,111 @@ Layout of the dashboard:
             )
             logging.critical(f"By-passing the error as it has no direct impact on the runtime of this application.")
 
+    # dashboard editing funcs
+    def create_dashboard(self, **kwargs) -> Dict[str, Any]:
+        return {
+            "start": kwargs.get("start", "-PT2W"),  # two weeks by default.
+            "periodOverride": kwargs.get("periodOverride", "inherit"),
+        }
+
+    def add_text_widget(self, current_data: Dict[str, Any], markdown: str, **kwargs) -> None:
+        widget = create_text_widget(markdown=markdown, width=kwargs.get("width", CW_DASHBOARD_WIDTH_MAX), height=kwargs.get("height", 4))
+
+        current_data.setdefault("widgets", []).append(widget)
+
+    def add_alarm_status_widget(self, current_data: Dict[str, Any], title: str, alarms: List[Signal], **kwargs) -> None:
+        widget = create_alarm_status_widget(
+            platform=self.get_platform(),
+            title=title,
+            alarms=alarms,
+            width=kwargs.get("width", CW_DASHBOARD_WIDTH_MAX),
+            height=kwargs.get("height", 6),
+        )
+        current_data.setdefault("widgets", []).append(widget)
+
+    def add_metric_widget(
+        self, current_data: Dict[str, Any], metric_signals_or_alarm: List[Signal], title: Optional[str] = None, **kwargs
+    ) -> None:
+        if title is None:
+            if any(signal.type.is_alarm() for signal in metric_signals_or_alarm):
+                title = f"Graph for alarm {metric_signals_or_alarm[0].alias!r}"
+            elif len(metric_signals_or_alarm) == 1:
+                metric_signal = metric_signals_or_alarm[0]
+                title = f"Graph for metrics {metric_signal.alias!r} " f"({metric_signal.resource_access_spec.sub_dimensions!r})"
+            else:
+                title = f"Graph for metrics {','.join([metric_signal.alias for metric_signal in metric_signals_or_alarm])!r}"
+
+        widget = create_metric_widget(
+            platform=self.get_platform(),
+            title=title,
+            metrics_or_alarm=metric_signals_or_alarm,
+            width=kwargs.get("width", 8),
+            height=kwargs.get("height", 6),
+        )
+        current_data.setdefault("widgets", []).append(widget)
+
+    # end bashboard editing
+
+    def _build_custom_dashboard_name(self, dashboard_id):
+        unique_context_id = self._params[ActivationParams.UNIQUE_ID_FOR_CONTEXT]
+        return self.CUSTOM_DASHBOARD_NAME_FORMAT.format(unique_context_id, dashboard_id)
+
+    def _build_default_dashboard_name(self):
+        return self._build_custom_dashboard_name("Default-Dashboard")
+
+    def _revert_dashboards(selfs, dashboards: Dict[str, Any], prev_dashboards: Dict[str, Any]) -> None:
+        pass
+        # TODO
+
+    def _process_dashboards(self, new_dashboards: Dict[str, Any], current_dashboards: Dict[str, Any]) -> None:
+        """Now it is time to delete/create dashboards"""
+        # removals
+        removed_dashboard_ids = set(current_dashboards.keys()) - set(new_dashboards.keys())
+        if removed_dashboard_ids:
+            removed_dashboard_names = [self._build_custom_dashboard_name(d_id) for d_id in removed_dashboard_ids]
+            for removed_dashboard_name in removed_dashboard_names:
+                try:
+                    response = exponential_retry(
+                        self._cw.delete_dashboards, {"InternalServiceFault"}, DashboardNames=[removed_dashboard_name]
+                    )
+                except ClientError as err:
+                    if err.response["Error"]["Code"] not in ["DashboardNotFoundError"]:
+                        raise
+
+            # create/update
+        for dashboard_id, dashboard in new_dashboards.items():
+            dashboard_name = self._build_custom_dashboard_name(dashboard_id)
+            try:
+                module_logger.critical(f"Creating custom dashboard {dashboard_id} with name {dashboard_name!r}...")
+                response = exponential_retry(
+                    self._cw.put_dashboard, {"InternalServiceFault"}, DashboardName=dashboard_name, DashboardBody=json.dumps(dashboard)
+                )
+                validation_messages = response["DashboardValidationMessages"]
+                if validation_messages:
+                    module_logger.warning(f"Dashboard has been generated with validation errors: {validation_messages!r}")
+                else:
+                    module_logger.critical(f"Custom diagnostics CW dashboard {dashboard_name!r} has been created successfully!")
+            except Exception as error:
+                logging.critical(f"Custom diagnostics CW dashboard {dashboard_name!r} could not be created due to error: {error!r}!")
+                raise error
+
+    def _terminate_dashboards(self) -> None:
+        """Delete custom or default dashboards"""
+
+        dashboards_to_be_removed = {self._build_default_dashboard_name()}
+        if self._processed_dashboards:
+            dashboards_to_be_removed = dashboards_to_be_removed.union(
+                set([self._build_custom_dashboard_name(d_id) for d_id in self._processed_dashboards.keys()])
+            )
+
+        for dashboard_name in dashboards_to_be_removed:
+            module_logger.critical(f"Deleting custom dashboard {dashboard_name!r}...")
+            try:
+                exponential_retry(self._cw.delete_dashboards, {"InternalServiceFault"}, DashboardNames=[dashboard_name])
+            except ClientError as err:
+                if err.response["Error"]["Code"] not in ["DashboardNotFoundError"]:
+                    raise
+
     def rollback(self) -> None:
         # roll back activation, something bad has happened (probably in another Construct) during app launch
         super().rollback()
@@ -1412,6 +1560,8 @@ Layout of the dashboard:
         for int_signal in self._processed_internal_signals:
             if int_signal.resource_access_spec.source == SignalSourceType.INTERNAL_ALARM:
                 self._remove_internal_alarm(int_signal, is_terminating=True)
+
+        self._terminate_dashboards()
 
         super().terminate()
 

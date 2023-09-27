@@ -11,7 +11,7 @@ from typing import List
 
 from intelliflow.core.serialization import Serializable, dumps, loads
 
-from .constructs import BatchCompute, Diagnostics, ProcessingUnit, ProcessorQueue, RoutingTable, Storage
+from .constructs import BatchCompute, CompositeExtension, Diagnostics, ProcessingUnit, ProcessorQueue, RoutingTable, Storage
 
 
 class Platform(Serializable, ABC):
@@ -31,6 +31,7 @@ class Platform(Serializable, ABC):
         self._batch_compute: BatchCompute
         self._routing_table: RoutingTable
         self._diagnostics: Diagnostics
+        self._extensions: CompositeExtension
 
     def _serializable_copy_init(self, org_instance: "Platform") -> None:
         self._storage = org_instance._storage.serializable_copy()
@@ -39,6 +40,7 @@ class Platform(Serializable, ABC):
         self._batch_compute = org_instance._batch_compute.serializable_copy()
         self._routing_table = org_instance._routing_table.serializable_copy()
         self._diagnostics = org_instance._diagnostics.serializable_copy()
+        self._extensions = org_instance._extensions.serializable_copy()
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(context_id={self._context_id}, {self.get_arch()})"
@@ -51,6 +53,7 @@ class Platform(Serializable, ABC):
             + repr(self._batch_compute)
             + repr(self._routing_table)
             + repr(self._diagnostics)
+            + repr(self._extensions)
         )
 
     @property
@@ -83,6 +86,10 @@ class Platform(Serializable, ABC):
 
     @property
     def diagnostics(self) -> Diagnostics:
+        return self._diagnostics
+
+    @property
+    def extensions(self) -> CompositeExtension:
         # backwards compatibility
-        # TODO remove before release
-        return getattr(self, "_diagnostics", None)
+        # TODO change after full release
+        return getattr(self, "_extensions", None)

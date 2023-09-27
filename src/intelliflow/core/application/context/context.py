@@ -6,8 +6,9 @@
    - Context:
 
 """
+import copy
 import logging
-from typing import Dict, List, NewType, Optional, Set, Type
+from typing import Any, Dict, List, NewType, Optional, Set, Type
 
 from intelliflow.core.application.context.traversal import ContextVisitor
 from intelliflow.core.platform.constructs import BaseConstruct, ConstructSecurityConf
@@ -25,6 +26,7 @@ _SymbolTable = NewType("_SymbolTable", Dict[str, Node])
 _ImportedData = NewType("_ImportedData", Set[RemoteApplication])
 _DownstreamApps = NewType("_DownstreamApps", Set[DownstreamApplication])
 _SecurityConf = NewType("_SecurityConf", Dict[Type[BaseConstruct], ConstructSecurityConf])
+_Dashboards = NewType("_Dashboards", Dict[str, Any])
 
 
 class Context(Serializable["Context"]):
@@ -45,18 +47,23 @@ class Context(Serializable["Context"]):
             self._downstream_apps = _DownstreamApps(set())
 
             self._security_conf = _SecurityConf(dict())
+
+            self._dashboards = _Dashboards(dict())
         else:
-            self._instruction_chain = InstructionChain(list(other.instruction_chain))
+            # make sure cloned instruction chain will be decoupled from other's topological changes
+            self._instruction_chain = InstructionChain([copy.deepcopy(inst) for inst in other.instruction_chain])
             self._internal_data = _SymbolTable(dict(other.internal_data))
 
             self._imported_data = _ImportedData(set(other.external_data))
             self._downstream_apps = _DownstreamApps(set(other.downstream_dependencies))
 
-            # TODO remove after v1.0 release (temporary backwards compatibility)
-            if getattr(other, "_security_conf ", None):
-                self._security_conf = _SecurityConf(dict(other.security_conf))
+            self._security_conf = _SecurityConf(dict(other.security_conf))
+
+            # TODO remove custom dashboards release (temporary backwards compatibility)
+            if getattr(other, "_dashboards", None):
+                self._dashboards = _Dashboards(dict(other.dashboards))
             else:
-                self._security_conf = _SecurityConf(dict())
+                self._dashboards = _Dashboards(dict())
 
     def _serializable_copy_init(self, org_instance: "Context") -> None:
         super()._serializable_copy_init(org_instance)
@@ -95,6 +102,10 @@ class Context(Serializable["Context"]):
     def security_conf(self) -> _SecurityConf:
         return self._security_conf
 
+    @property
+    def dashboards(self) -> _Dashboards:
+        return self._dashboards
+
     def add_instruction(self, instruction: Instruction) -> None:
         self.insert_instruction(len(self._instruction_chain), instruction)
 
@@ -107,6 +118,11 @@ class Context(Serializable["Context"]):
 
     def get_instructions(self, output_node: "Node") -> List[Instruction]:
         return [inst for inst in self._instruction_chain if inst.output_node == output_node]
+
+    def get_dependency_set(self, output_node: "Node") -> List[Instruction]:
+        instructions = self.get_instructions(output_node)
+        latest_inst: Instruction = instructions[-1:][0]
+        return latest_inst.get_dependency_set()
 
     def remove_instruction(self, output_node: "Node") -> int:
         removed_index: int = None
@@ -167,6 +183,12 @@ class Context(Serializable["Context"]):
     def add_security_conf(self, construct: Type[BaseConstruct], conf: ConstructSecurityConf):
         self._security_conf[construct] = conf
 
+    def add_dashboard(self, dashboard_id: str, data: Dict[str, Any]):
+        self._dashboards[dashboard_id] = data
+
+    def get_dashboard(self, dashboard_id: str) -> Optional[Dict[str, Any]]:
+        return self._dashboards.get(dashboard_id, None)
+
     def clone(self) -> "Context":
         return Context(self)
 
@@ -195,6 +217,7 @@ class Context(Serializable["Context"]):
             host_platform.connect_downstream(downstream_app.id, downstream_app.conf)
 
         host_platform.add_security_conf(self._security_conf)
+        host_platform.add_dashboards(self._dashboards)
 
     def accept(self, visitor: ContextVisitor) -> None:
         for instruction in self._instruction_chain:

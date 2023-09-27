@@ -5,6 +5,7 @@ import intelliflow.api_ext as flow
 from intelliflow.api_ext import *
 from intelliflow.core.platform.compute_targets.email import EMAIL
 from intelliflow.core.platform.constructs import BatchCompute as BatchComputeDriver
+from intelliflow.core.platform.definitions.aws.cw.dashboard import CW_DASHBOARD_WIDTH_MAX, LegendPosition
 
 flow.init_basic_logging()
 
@@ -340,6 +341,45 @@ output = spark.createDataFrame(sc.emptyRDD(), schema)
                                         WorkerType=GlueWorkerType.G_1X.value,
                                         NumberOfWorkers=5,
                                         GlueVersion="2.0")])
+
+# CUSTOM DASHBOARD
+dashboard_id = "dashboard_with_defaults"
+
+app.create_dashboard(dashboard_id)
+app.create_text_widget(dashboard_id, markdown="Custom dashboard (with default widget attributes) to present all of the alarming and metrics stuff from this example app. ")
+app.create_metric_widget(dashboard_id, [ routing_table_metric_signal['WriteThrottleEvents'][MetricStatistic.SUM][MetricPeriod.MINUTES(15)] ])
+app.create_metric_widget(dashboard_id, [ system_failure_alarm ])
+app.create_metric_widget(dashboard_id, [ generic_internal_alarm ])
+app.create_alarm_status_widget(dashboard_id, "Status widget for all of the alarms together", [generic_internal_alarm, system_failure_alarm, composite_alarm])
+# the dashboard will be auto-created during the activation
+
+dashboard_id = "dashboard_with_params"
+app.create_dashboard(dashboard_id,
+                     # pass CW params to underlying driver
+                     start="-PT2W",
+                     periodOverride="inherit")
+
+app.create_text_widget(dashboard_id, markdown="Custom dashboard (with parametrized widget attributes) to present all of the alarming and metrics stuff from this example app. ",
+                       width=CW_DASHBOARD_WIDTH_MAX,
+                       height=4,
+                       # x=None,  # CW will fit automatically on the same row if possible (if left undefined or as None)
+                       # y=None
+                       )
+app.create_metric_widget(dashboard_id, [ routing_table_metric_signal['WriteThrottleEvents'][MetricStatistic.SUM][MetricPeriod.MINUTES(15)] ],
+                         legend_pos = LegendPosition.RIGHT,
+                         width=8,
+                         height=6,
+                         x= None,
+                         y = None,
+                         )
+app.create_metric_widget(dashboard_id, [ system_failure_alarm ])
+app.create_metric_widget(dashboard_id, [ generic_internal_alarm ])
+app.create_alarm_status_widget(dashboard_id, "Status widget for all of the alarms together", [generic_internal_alarm, system_failure_alarm, composite_alarm],
+                               width=CW_DASHBOARD_WIDTH_MAX,
+                               height=6,
+                               # x=None,
+                               # y=None,
+                               )
 
 app.activate(allow_concurrent_executions=False)
 

@@ -102,6 +102,8 @@ schema = StructType([ \
     StructField("pdexcount",LongType(),True), \
     StructField("xdfcount",LongType(),True)
   ])
+  
+logger.info("Onboarding...")
 
 output = spark.createDataFrame(data=data,schema=schema)
                                    """,
@@ -120,3 +122,8 @@ app.execute(hello_world['NA']['2021-08-01'])
 
 # You will see the data in the S3 bucket under the path
 # s3://if-onboarding-427809481713-us-east-1/internal_data/hello_world/NA/2021-07-30
+
+query_results = app.get_compute_record_logs(hello_world['NA']['2021-08-01'], error_only=True)
+assert len(query_results) == 1 # because there is one compute record (above BatchCompute object in compute_targets), in the most recent execution
+query_result = query_results[0]
+assert query_result.resource_urls

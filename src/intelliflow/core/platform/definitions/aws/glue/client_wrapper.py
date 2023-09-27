@@ -19,6 +19,29 @@ logger = logging.getLogger(__name__)
 
 JOB_ARN_FORMAT = "arn:aws:glue:{}:{}:job/{}"
 
+# Refer
+#  https://docs.aws.amazon.com/glue/latest/dg/aws-glue-programming-etl-glue-arguments.html
+SPECIAL_PARAMETERS_SUPPORTED_BY_GLUE: Set[str] = {
+    "job-language",
+    "class",
+    "scriptLocation",
+    "extra-jars",
+    "additional-python-modules",
+    "extra-py-files",
+    "extra-files",
+    "disable-proxy",
+    "user-jars-first",
+    "TempDir",
+    "enable-auto-scaling",
+    "enable-glue-datacatalog",
+    "enable-metrics",
+    "enable-continuous-cloudwatch-log",
+    "enable-continuous-log-filter",
+    "continuous-log-logGroup",
+    "enable-spark-ui",
+    "conf",
+}
+
 
 # refer for this list
 #  https://docs.aws.amazon.com/glue/latest/dg/reduced-start-times-spark-etl-jobs.html#reduced-start-times-limitations
@@ -66,6 +89,11 @@ PYTHON_MODULES_TO_BE_AVOIDED_IN_GLUE_BUNDLE: Set[str] = {
     "scikit-learn",
     "tbats",
 }
+
+# AWS default service quotas (as of mid 2022), so it should be fine to tune job creation with these
+MAX_CONCURRENT_JOB_RUNS_PER_ACCOUNT = 200
+# MAX_CONCURRENT_JOB_RUNS_PER_JOB = 1000
+DEFAULT_CONCURRENT_JOB_RUNS_PER_JOB = MAX_CONCURRENT_JOB_RUNS_PER_ACCOUNT
 
 
 @unique
@@ -123,7 +151,7 @@ def _create_job_params(
     job_command_type: GlueJobCommandType,
     job_language: GlueJobLanguage,
     script_s3_location,
-    max_concurrent_runs=20,
+    max_concurrent_runs=DEFAULT_CONCURRENT_JOB_RUNS_PER_JOB,
     max_capacity_in_DPU=None,
     # https://docs.aws.amazon.com/glue/latest/dg/add-job.html
     glue_version=None,
@@ -135,14 +163,7 @@ def _create_job_params(
     if default_args:
         default_arguments.update(default_args)
     capacity_params = dict()
-    if glue_version == "1.0":
-        if not max_capacity_in_DPU:
-            max_capacity_in_DPU = 20 if job_command_type == GlueJobCommandType.BATCH else 0.0625
-        capacity_params.update({"MaxCapacity": max_capacity_in_DPU})
-        if job_language == GlueJobLanguage.PYTHON:
-            default_arguments.update({"--extra-py-files": working_set_s3_location})
-    elif glue_version in ["2.0", "3.0"]:
-        # with 2.0 cannot even use MaxCapacity
+    if glue_version in ["1.0", "2.0", "3.0"]:
         capacity_params.update({"WorkerType": GlueWorkerType.G_1X.value})
         if job_command_type == GlueJobCommandType.BATCH:
             capacity_params.update({"NumberOfWorkers": 100})
@@ -179,7 +200,7 @@ def create_glue_job(
     job_command_type: GlueJobCommandType,
     job_language: GlueJobLanguage,
     script_s3_location,
-    max_concurrent_runs=20,
+    max_concurrent_runs=DEFAULT_CONCURRENT_JOB_RUNS_PER_JOB,
     max_capacity_in_DPU=None,
     # https://docs.aws.amazon.com/glue/latest/dg/add-job.html
     glue_version=None,
@@ -233,7 +254,7 @@ def update_glue_job(
     job_command_type: GlueJobCommandType,
     job_language: GlueJobLanguage,
     script_s3_location,
-    max_concurrent_runs=20,
+    max_concurrent_runs=DEFAULT_CONCURRENT_JOB_RUNS_PER_JOB,
     max_capacity_in_DPU=None,
     # https://docs.aws.amazon.com/glue/latest/dg/add-job.html
     glue_version=None,

@@ -7,6 +7,7 @@ import pytest
 
 from intelliflow.api_ext import *
 from intelliflow.core.signal_processing.signal import *
+from intelliflow.core.signal_processing.signal_source import DatasetSignalSourceAccessSpec
 from intelliflow.mixins.aws.test import AWSTestBase
 from intelliflow.utils.test.inlined_compute import NOOPCompute
 

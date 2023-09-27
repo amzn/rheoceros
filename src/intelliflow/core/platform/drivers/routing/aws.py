@@ -4,7 +4,7 @@
 import logging
 import uuid
 from enum import Enum
-from typing import ClassVar, Dict, Iterator, List, Optional, Sequence, Set, Tuple, Type, cast
+from typing import ClassVar, Dict, Iterator, List, Optional, Sequence, Set, Tuple, Type, Union, cast
 
 import boto3
 from boto3.dynamodb.conditions import Attr, Key, Or
@@ -32,8 +32,10 @@ from ...definitions.aws.auto_scaling.client_wrapper import (
     put_target_tracking_scaling_policy,
     register_scalable_target,
 )
+from ...definitions.aws.common import CommonParams as AWSCommonParams
 from ...definitions.aws.common import exponential_retry
 from ...definitions.aws.ddb.client_wrapper import (
+    BillingMode,
     create_table,
     delete_ddb_item,
     delete_table,
@@ -42,6 +44,8 @@ from ...definitions.aws.ddb.client_wrapper import (
     query_ddb_table,
     scan_ddb_table,
 )
+from ...definitions.aws.ddb.lock import create_lock_table, lock, release
+from ...definitions.common import ActivationParams
 from ...definitions.compute import ComputeResponseType, ComputeSessionStateType
 from ..aws_common import AWSConstructMixin
 
@@ -63,6 +67,15 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
     ROUTES_HISTORY_TABLE_NAME_FORMAT: ClassVar[str] = "IntelliFlow-Routes-History-{0}-{1}-{2}"
     ROUTES_PENDING_NODES_TABLE_NAME_FORMAT: ClassVar[str] = "IntelliFlow-Routes-PendingNodes-{0}-{1}-{2}"
     ROUTES_ACTIVE_COMPUTE_RECORDS_TABLE_NAME_FORMAT: ClassVar[str] = "IntelliFlow-Routes-ActiveComputeRecords-{0}-{1}-{2}"
+    ROUTES_LOCK_TABLE_NAME_FORMAT: ClassVar[str] = "IntelliFlow-Routes-Lock-{0}-{1}-{2}"
+
+    HISTORY_TABLE_COMPUTE_TRIGGER_INDEX_NAME = "compute_trigger_index"
+    HISTORY_TABLE_COMPUTE_FINISHED_INDEX_NAME = "compute_finished_index"
+    HISTORY_TABLE_SLOT_TYPE_INDEX_NAME = "slot_type_index"
+    HISTORY_TABLE_SESSION_STATE_INDEX_NAME = "session_state_index"
+
+    BILLING_MODE_PARAM: ClassVar[str] = "BillingMode"
+    DEFAULT_BILLING_MODE: BillingMode = BillingMode.PAY_PER_REQUEST
 
     def __init__(self, params: ConstructParamsDict) -> None:
         """Called the first time this construct is added/configured within a platform.
@@ -81,11 +94,15 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
         self._routing_pending_nodes_table = None
         self._routing_active_compute_records_table_name = None
         self._routing_active_compute_records_table = None
+        self._routing_lock_table_name = None
+        self._routing_lock_table = None
+        self._routing_lock_retainer_id = self._create_retainer_id_for_session()
 
     def _deserialized_init(self, params: ConstructParamsDict) -> None:
         super()._deserialized_init(params)
         self._ddb = self._session.resource("dynamodb", region_name=self._region)
         self._ddb_scaling = self._session.client("application-autoscaling", region_name=self._region)
+        self._routing_lock_retainer_id = self._create_retainer_id_for_session()
 
     def _serializable_copy_init(self, org_instance: "BaseConstruct") -> None:
         AWSConstructMixin._serializable_copy_init(self, org_instance)
@@ -94,7 +111,9 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
         self._routing_history_table = None
         self._routing_pending_nodes_table = None
         self._routing_active_compute_records_table = None
+        self._routing_lock_table = None
         self._ddb_scaling = None
+        self._routing_lock_retainer_id = None
 
     @property
     def routing_table_name(self):
@@ -113,20 +132,39 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
         return self._routing_active_compute_records_table_name
 
     @property
-    def is_synchronized(self) -> bool:
-        # TODO remove this property once _lock and _release are implemented.
-        # RoutingTable::is_synchronized is True by default.
-        return False
+    def routing_lock_table_name(self):
+        return self._routing_lock_table_name
 
-    def _lock(self, route_id: RouteID) -> None:
-        # TODO acquire from the lock table ([route_id, is_locked, uuid])
-        #  - read lock field
-        #  - once value changes, use conditional write to acquire the field (via uuid)
-        pass
+    @property
+    def is_synchronized(self) -> bool:
+        # because `_lock` and `_release` are implemented
+        return True
+
+    @property
+    def billing_mode(self) -> BillingMode:
+        billing_mode = self._params.get(self.BILLING_MODE_PARAM, self.DEFAULT_BILLING_MODE)
+        return billing_mode if billing_mode else self.DEFAULT_BILLING_MODE
+
+    @classmethod
+    def _create_retainer_id_for_session(self) -> str:
+        return str(uuid.uuid4())
+
+    def _lock(
+        self,
+        route_id: RouteID,
+        lock_duration_in_secs: int = RoutingTable.DEFAULT_LOCK_DURATION_IN_SECS,
+        retain_attempt_duration_in_secs: int = RoutingTable.DEFAULT_LOCK_RETAIN_ATTEMPT_DURATION_IN_SECS,
+    ) -> bool:
+        return lock(
+            self._routing_lock_table,
+            route_id,
+            self._routing_lock_retainer_id,
+            lock_duration_in_secs=lock_duration_in_secs,
+            retain_attempt_duration_in_secs=retain_attempt_duration_in_secs,
+        )
 
     def _release(self, route_id: RouteID) -> None:
-        # TODO release back into the lock table
-        pass
+        return release(self._routing_lock_table, route_id, self._routing_lock_retainer_id)
 
     def _load(self, route_id: RouteID) -> Optional[RoutingTable.RouteRecord]:
         """Load the internal record for a route."""
@@ -305,90 +343,86 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
     def load_active_route_record(self, route_id: RouteID) -> "RoutingTable.RouteRecord":
         return self._load(route_id)
 
-    def query_inactive_records(
+    def load_inactive_compute_records(
         self,
-        slot_types: Set[SlotType],
-        trigger_range: Tuple[int, int],
-        deactivated_range: Tuple[int, int],
-        elapsed_range: Tuple[int, int],
-        response_states: Set[Enum],
-        response_sub_states: Set[Enum],
-        session_states: Set[Enum],
-        session_sub_states: Set[Enum],
+        route_id: Optional[RouteID] = None,
         ascending: bool = False,
-    ) -> Iterator[Tuple[Route, "RoutingTable.ComputeRecord"]]:
-        scan_kwargs = {
-            "ScanIndexForward": ascending,
-        }
-
-        filter_exp = None
-        if trigger_range:
-            trigger_range_exp = Attr("compute_trigger_timestamp_utc").between(*trigger_range)
-            filter_exp = trigger_range_exp
-        if deactivated_range:
-            deactivated_range_exp = Attr("compute_finished_timestamp_utc").between(*deactivated_range)
-            filter_exp = filter_exp & deactivated_range_exp if filter_exp else deactivated_range_exp
-        if elapsed_range:
-            elapsed_exp = Attr("compute_elapsed_time").between(*elapsed_range)
-            filter_exp = filter_exp & elapsed_exp if filter_exp else elapsed_exp
-        if response_states:
-            response_states_exp = Or(*[Attr("compute_response_state").contains(state.value) for state in response_states])
-            filter_exp = filter_exp & response_states_exp if filter_exp else response_states_exp
-        if response_sub_states:
-            response_sub_states_exp = Or(*[Attr("compute_response_sub_state").contains(state.value) for state in response_sub_states])
-            filter_exp = filter_exp & response_sub_states_exp if filter_exp else response_sub_states_exp
-        if session_states:
-            session_states_exp = Or(*[Attr("compute_session_state").contains(state.value) for state in session_states])
-            filter_exp = filter_exp & session_states_exp if filter_exp else session_states_exp
-        if session_sub_states:
-            session_sub_states_exp = Or(*[Attr("compute_session_sub_state").contains(state.value) for state in session_sub_states])
-            filter_exp = filter_exp & session_sub_states_exp if filter_exp else session_sub_states_exp
-        if slot_types:
-            slot_types_exp = Or(*[Attr("slot_type").contains(slot_type.value) for slot_type in slot_types])
-            filter_exp = filter_exp & slot_types_exp if filter_exp else slot_types_exp
-
-        if filter_exp:
-            scan_kwargs["FilterExpression"] = filter_exp
-
-        done = False
-        start_key = None
-        while not done:
-            if start_key:
-                scan_kwargs["ExclusiveStartKey"] = start_key
-            response = exponential_retry(
-                scan_ddb_table,
-                ["InternalServerError", "RequestLimitExceeded", "ProvisionedThroughputExceededException"],
-                self._routing_history_table,
-                **scan_kwargs,
+        trigger_range: Tuple[int, int] = None,
+        deactivated_range: Tuple[int, int] = None,
+        slot_type: SlotType = None,
+        session_state: ComputeSessionStateType = None,
+        limit: Optional[int] = None,
+    ) -> Iterator["RoutingTable.ComputeRecord"]:
+        if route_id:
+            return self.query_inactive_compute_records(
+                route_id, ascending, trigger_range, deactivated_range, slot_type, session_state, limit
             )
-            items = response.get("Items", [])
-            for item in items:
-                yield (
-                    loads(item["serialized_route"]),
-                    loads(item["serialized_active_compute_records"]),
-                    loads(item["serialized_active_execution_context_state"]),
-                )
+        else:
+            return self.scan_inactive_compute_records(ascending, trigger_range, deactivated_range, slot_type, session_state, limit)
 
-            start_key = response.get("LastEvaluatedKey", None)
-            done = start_key is None
-
-    def load_inactive_compute_records(self, route_id: RouteID, ascending: bool = False) -> Iterator["RoutingTable.ComputeRecord"]:
+    def query_inactive_compute_records(
+        self,
+        route_id: RouteID,
+        ascending: bool = False,
+        trigger_range: Tuple[int, int] = None,
+        deactivated_range: Tuple[int, int] = None,
+        slot_type: SlotType = None,
+        session_state: ComputeSessionStateType = None,
+        limit: Optional[int] = None,
+    ) -> Iterator["RoutingTable.ComputeRecord"]:
         query_kwargs = {}
         done = False
         start_key = None
+        filter_exp = None
+        key_cond_expr = Key("route_id").eq(route_id)
+        index_name = None
+
+        # Check existing secondary indexes of the table, only use if this secondary index is created
+        secondary_indexes_raw = self._routing_history_table.local_secondary_indexes or []
+        secondary_indexes = [secondary_index_raw["IndexName"] for secondary_index_raw in secondary_indexes_raw]
+
+        # Looking for range key and index name
+        if trigger_range and self.HISTORY_TABLE_COMPUTE_TRIGGER_INDEX_NAME in secondary_indexes:
+            key_cond_expr = key_cond_expr & Key("compute_trigger_timestamp_utc").between(*trigger_range)
+            index_name = self.HISTORY_TABLE_COMPUTE_TRIGGER_INDEX_NAME
+        elif deactivated_range and self.HISTORY_TABLE_COMPUTE_FINISHED_INDEX_NAME in secondary_indexes:
+            key_cond_expr = key_cond_expr & Key("compute_finished_timestamp_utc").between(*deactivated_range)
+            index_name = self.HISTORY_TABLE_COMPUTE_FINISHED_INDEX_NAME
+        elif slot_type and self.HISTORY_TABLE_SLOT_TYPE_INDEX_NAME in secondary_indexes:
+            key_cond_expr = key_cond_expr & Key("slot_type").eq(slot_type.value)
+            index_name = self.HISTORY_TABLE_SLOT_TYPE_INDEX_NAME
+        elif session_state and self.HISTORY_TABLE_SESSION_STATE_INDEX_NAME in secondary_indexes:
+            key_cond_expr = key_cond_expr & Key("compute_session_state").eq(session_state.value)
+            index_name = self.HISTORY_TABLE_SESSION_STATE_INDEX_NAME
+
+        if index_name:
+            query_kwargs["IndexName"] = index_name
+
+        # Compute the filter expression
+        if trigger_range and index_name != self.HISTORY_TABLE_COMPUTE_TRIGGER_INDEX_NAME:
+            trigger_range_exp = Attr("compute_trigger_timestamp_utc").between(*trigger_range)
+            filter_exp = trigger_range_exp
+        if deactivated_range and index_name != self.HISTORY_TABLE_COMPUTE_FINISHED_INDEX_NAME:
+            deactivated_range_exp = Attr("compute_finished_timestamp_utc").between(*deactivated_range)
+            filter_exp = filter_exp & deactivated_range_exp if filter_exp else deactivated_range_exp
+        if slot_type and index_name != self.HISTORY_TABLE_SLOT_TYPE_INDEX_NAME:
+            slot_type_exp = Attr("slot_type").eq(slot_type.value)
+            filter_exp = filter_exp & slot_type_exp if filter_exp else slot_type_exp
+        if session_state and index_name != self.HISTORY_TABLE_SESSION_STATE_INDEX_NAME:
+            session_state_exp = Attr("compute_session_state").eq(session_state.value)
+            filter_exp = filter_exp & session_state_exp if filter_exp else session_state_exp
+
+        retrieved_count: int = 0
         while not done:
             if start_key:
                 query_kwargs["ExclusiveStartKey"] = start_key
+            if filter_exp:
+                query_kwargs["FilterExpression"] = filter_exp
             response = exponential_retry(
                 query_ddb_table,
-                [
-                    "InternalServerError",
-                    "RequestLimitExceeded",
-                    # https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Programming.Errors.html
-                    #   'ProvisionedThroughputExceededException'
-                ],
+                ["InternalServerError", "RequestLimitExceeded", "ProvisionedThroughputExceededException"],
                 table=self._routing_history_table,
-                key_cond_expr=Key("route_id").eq(route_id),
+                key_cond_expr=key_cond_expr,
                 scan_index_forward=ascending,
                 **query_kwargs,
             )
@@ -397,9 +431,67 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
                 try:
                     record = loads(item["serialized_inactive_compute_record"])
                     yield record
+                    retrieved_count = retrieved_count + 1
+                    if limit is not None and retrieved_count >= limit:
+                        break
                 except AttributeError as serialization_error:
                     # TODO METRICS_SUPPORT (backwards incompatible framework change)
                     logging.critical(f"Incompatible inactive record detected for route: {route_id!r}. Ignoring...")
+
+            start_key = response.get("LastEvaluatedKey", None)
+            done = start_key is None
+
+    def scan_inactive_compute_records(
+        self,
+        ascending: bool = False,
+        trigger_range: Tuple[int, int] = None,
+        deactivated_range: Tuple[int, int] = None,
+        slot_type: SlotType = None,
+        session_state: ComputeSessionStateType = None,
+        limit: Optional[int] = None,
+    ) -> Iterator["RoutingTable.ComputeRecord"]:
+        scan_kwargs = {}
+        done = False
+        start_key = None
+        filter_exp = None
+
+        # Compute the filter expression
+        if trigger_range:
+            trigger_range_exp = Attr("compute_trigger_timestamp_utc").between(*trigger_range)
+            filter_exp = trigger_range_exp
+        if deactivated_range:
+            deactivated_range_exp = Attr("compute_finished_timestamp_utc").between(*deactivated_range)
+            filter_exp = filter_exp & deactivated_range_exp if filter_exp else deactivated_range_exp
+        if slot_type:
+            slot_type_exp = Attr("slot_type").eq(slot_type.value)
+            filter_exp = filter_exp & slot_type_exp if filter_exp else slot_type_exp
+        if session_state:
+            session_state_exp = Attr("compute_session_state").eq(session_state.value)
+            filter_exp = filter_exp & session_state_exp if filter_exp else session_state_exp
+
+        retrieved_count: int = 0
+        while not done:
+            if start_key:
+                scan_kwargs["ExclusiveStartKey"] = start_key
+            if filter_exp:
+                scan_kwargs["FilterExpression"] = filter_exp
+            response = exponential_retry(
+                scan_ddb_table,
+                ["InternalServerError", "RequestLimitExceeded", "ProvisionedThroughputExceededException"],
+                table=self._routing_history_table,
+                **scan_kwargs,
+            )
+            items = response.get("Items", [])
+            for item in items:
+                try:
+                    record = loads(item["serialized_inactive_compute_record"])
+                    yield record
+                    retrieved_count = retrieved_count + 1
+                    if limit is not None and retrieved_count >= limit:
+                        break
+                except AttributeError as serialization_error:
+                    # TODO METRICS_SUPPORT (backwards incompatible framework change)
+                    logging.critical(f"Incompatible inactive record detected during scan. Ignoring...")
 
             start_key = response.get("LastEvaluatedKey", None)
             done = start_key is None
@@ -439,10 +531,10 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
                             else inactive_record.state.failed_response_type.value,
                             "compute_session_state": inactive_record.session_state.state_type.value
                             if inactive_record.session_state
-                            else "",
+                            else ComputeSessionStateType.FAILED.value,
                             "compute_session_sub_state": inactive_record.session_state.failed_type.value
                             if inactive_record.session_state and inactive_record.session_state.state_type == ComputeSessionStateType.FAILED
-                            else "",
+                            else "",  # cannot leave empty if will be used as a secondary index, in that case set as ComputeFailedResponseType.UNKNOWN
                             "slot_type": inactive_record.slot.type.value,
                             # TODO create a GSI to get compute records that belong to the same context together
                             "execution_context_id": inactive_record.execution_context_id,
@@ -461,7 +553,43 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
                 # TODO try to move to a secondary storage but no matter what 'do emit' Routing internal metric
                 pass
 
-    def load_pending_nodes(self, route_id: RouteID, ascending: bool = False) -> Iterator["RuntimeLinkNode"]:
+    def load_pending_nodes(
+        self, route_id: Optional[RouteID] = None, ascending: bool = False
+    ) -> Union[Iterator[Tuple[RouteID, "RuntimeLinkNode"]], Iterator["RuntimeLinkNode"]]:
+        if route_id:
+            return self.query_pending_nodes(route_id, ascending)
+        else:
+            return self.scan_all_pending_nodes(ascending)
+
+    def scan_all_pending_nodes(self, ascending: bool = False) -> Iterator[Tuple[RouteID, "RuntimeLinkNode"]]:
+        """DDB scan based internal impl that serves user exposed load function `load_pending_nodes`"""
+        scan_kwargs = {}
+
+        done = False
+        start_key = None
+        while not done:
+            if start_key:
+                scan_kwargs["ExclusiveStartKey"] = start_key
+            response = exponential_retry(
+                scan_ddb_table,
+                ["InternalServerError", "RequestLimitExceeded", "ProvisionedThroughputExceededException"],
+                self._routing_pending_nodes_table,
+                **scan_kwargs,
+            )
+            items = response.get("Items", [])
+            for item in items:
+                try:
+                    record = loads(item["serialized_pending_node"])
+                    yield item["route_id"], record
+                except AttributeError as serialization_error:
+                    # TODO METRICS_SUPPORT (backwards incompatible framework change)
+                    logging.critical(f"Incompatible pending node detected! Ignoring...")
+
+            start_key = response.get("LastEvaluatedKey", None)
+            done = start_key is None
+
+    def query_pending_nodes(self, route_id: RouteID, ascending: bool = False) -> Iterator["RuntimeLinkNode"]:
+        """DDB query based internal impl that serves user exposed load function"""
         query_kwargs = {}
         done = False
         start_key = None
@@ -533,7 +661,43 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
             )
             raise
 
-    def load_active_compute_records(self, route_id: RouteID, ascending: bool = False) -> Iterator["RoutingTable.ComputeRecord"]:
+    def load_active_compute_records(
+        self, route_id: Optional[RouteID] = None, ascending: bool = False
+    ) -> Iterator["RoutingTable.ComputeRecord"]:
+        if route_id:
+            return self.query_active_compute_records(route_id, ascending)
+        else:
+            return self.scan_all_active_compute_records(ascending)
+
+    def scan_all_active_compute_records(self, ascending: bool = False) -> Iterator["RoutingTable.ComputeRecord"]:
+        """DDB scan based internal impl that serves user exposed load function"""
+        scan_kwargs = {}
+
+        done = False
+        start_key = None
+        while not done:
+            if start_key:
+                scan_kwargs["ExclusiveStartKey"] = start_key
+            response = exponential_retry(
+                scan_ddb_table,
+                ["InternalServerError", "RequestLimitExceeded", "ProvisionedThroughputExceededException"],
+                self._routing_active_compute_records_table,
+                **scan_kwargs,
+            )
+            items = response.get("Items", [])
+            for item in items:
+                try:
+                    record = loads(item["serialized_active_compute_record"])
+                    yield record
+                except AttributeError as serialization_error:
+                    # TODO METRICS_SUPPORT (backwards incompatible framework change)
+                    logging.critical(f"Incompatible active compute record detected! Ignoring...")
+
+            start_key = response.get("LastEvaluatedKey", None)
+            done = start_key is None
+
+    def query_active_compute_records(self, route_id: RouteID, ascending: bool = False) -> Iterator["RoutingTable.ComputeRecord"]:
+        """DDB query based internal impl that serves user exposed load function"""
         query_kwargs = {}
         done = False
         start_key = None
@@ -609,7 +773,15 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
             )
             raise
 
-    def _deregister_scalable_target(self, table_name) -> None:
+    def _deregister_scalable_target(self, table) -> None:
+        # we have to read the billing mode from the table (rather than using self.billing_mode), otherwise we'd not be
+        # able to switch between different modes and end up making redundant service calls here while auto-scaling is
+        # not active (e.g billing_mode == PAY_PER_REQUEST)
+        if table.billing_mode_summary:
+            # if this field exists, then billing mode is PAY_PER_REQUEST avoid making redundant service calls
+            return
+
+        table_name = table.table_name
         # READ
         try:
             exponential_retry(
@@ -669,8 +841,8 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
         # end WRITE
 
     def _delete_table(self, table_name: str) -> None:
-        self._deregister_scalable_target(table_name)
         table = self._ddb.Table(table_name)
+        self._deregister_scalable_target(table)
         try:
             exponential_retry(
                 delete_table,
@@ -695,16 +867,19 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
         self._delete_table(self._routing_history_table_name)
         self._delete_table(self._routing_pending_nodes_table_name)
         self._delete_table(self._routing_active_compute_records_table_name)
+        self._delete_table(self._routing_lock_table_name)
         self._create_route_table()
         self._create_route_history_table()
         self._create_route_pending_nodes_table()
         self._create_route_active_compute_records_table()
+        self._create_route_lock_table()
         module_logger.info(
             f"Tables "
             f"{self._routing_table_name!r}, "
             f"{self._routing_history_table_name!r}, "
             f"{self._routing_pending_nodes_table_name!r}, "
             f"{self._routing_active_compute_records_table_name!r} "
+            f"{self._routing_lock_table_name!r} "
             f"have been cleared!"
         )
 
@@ -713,14 +888,17 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
         self._delete_table(self._routing_table_name)
         self._delete_table(self._routing_pending_nodes_table_name)
         self._delete_table(self._routing_active_compute_records_table_name)
+        self._delete_table(self._routing_lock_table_name)
         self._create_route_table()
         self._create_route_pending_nodes_table()
         self._create_route_active_compute_records_table()
+        self._create_route_lock_table()
         module_logger.info(
             f"Tables "
             f"{self._routing_table_name!r},"
             f"{self._routing_pending_nodes_table_name!r},"
             f"{self._routing_active_compute_records_table_name!r}"
+            f"{self._routing_lock_table_name!r}"
             f" have been cleared!"
         )
 
@@ -741,6 +919,9 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
         if self._routing_active_compute_records_table_name:
             self._delete_table(self._routing_active_compute_records_table_name)
             self._routing_active_compute_records_table_name = None
+        if self._routing_lock_table_name:
+            self._delete_table(self._routing_lock_table_name)
+            self._routing_lock_table_name = None
         module_logger.info("Routing tables are deleted!")
         super().terminate()
 
@@ -774,6 +955,13 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
         self._validate_table_name_on_dev_init(self._routing_active_compute_records_table_name)
         self._routing_active_compute_records_table = self._ddb.Table(self._routing_active_compute_records_table_name)
 
+        # 5- lock table
+        self._routing_lock_table_name: str = self.ROUTES_LOCK_TABLE_NAME_FORMAT.format(
+            self.__class__.__name__, self._dev_platform.context_id.lower(), self._region
+        )
+        self._validate_table_name_on_dev_init(self._routing_lock_table_name)
+        self._routing_lock_table = self._ddb.Table(self._routing_lock_table_name)
+
     def _validate_table_name_on_dev_init(self, table_name: str):
         if len(table_name) > 255:
             raise ValueError(
@@ -791,6 +979,8 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
         self._routing_history_table = self._ddb.Table(self._routing_history_table_name)
         self._routing_pending_nodes_table = self._ddb.Table(self._routing_pending_nodes_table_name)
         self._routing_active_compute_records_table = self._ddb.Table(self._routing_active_compute_records_table_name)
+        self._routing_lock_table = self._ddb.Table(self._routing_lock_table_name)
+        self._routing_lock_retainer_id = self._create_retainer_id_for_session()
 
     def provide_runtime_trusted_entities(self) -> List[str]:
         return []
@@ -803,10 +993,11 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
         return [
             ConstructPermission(
                 [
-                    f"arn:aws:dynamodb:{self._region}:{self._account_id}:table/{self._routing_table_name}",
-                    f"arn:aws:dynamodb:{self._region}:{self._account_id}:table/{self._routing_history_table_name}",
-                    f"arn:aws:dynamodb:{self._region}:{self._account_id}:table/{self._routing_pending_nodes_table_name}",
-                    f"arn:aws:dynamodb:{self._region}:{self._account_id}:table/{self._routing_active_compute_records_table_name}",
+                    f"arn:aws:dynamodb:{self._region}:{self._account_id}:table/{self._routing_table_name}*",
+                    f"arn:aws:dynamodb:{self._region}:{self._account_id}:table/{self._routing_history_table_name}*",
+                    f"arn:aws:dynamodb:{self._region}:{self._account_id}:table/{self._routing_pending_nodes_table_name}*",
+                    f"arn:aws:dynamodb:{self._region}:{self._account_id}:table/{self._routing_active_compute_records_table_name}*",
+                    f"arn:aws:dynamodb:{self._region}:{self._account_id}:table/{self._routing_lock_table_name}*",
                 ],
                 [
                     "dynamodb:Describe*",
@@ -826,11 +1017,25 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
 
     @classmethod
     def provide_devtime_permissions(cls, params: ConstructParamsDict) -> List[ConstructPermission]:
-        # TODO make this finer granular (see AWS Athena based driver)
-        # construct impls overriding this.
+        region: str = params[AWSCommonParams.REGION]
+        account_id: str = params[AWSCommonParams.ACCOUNT_ID]
+        context_id: str = params[ActivationParams.CONTEXT_ID].lower()
         return [
             ConstructPermission(
-                ["*"], ["dynamodb:*", "dax:*", "application-autoscaling:*", "iam:CreateServiceLinkedRole", "iam:DeleteServiceLinkedRole"]
+                [
+                    # add asterisk to support table sub-resources such as indexes (for Query operation)
+                    # e.g arn:aws:dynamodb:<REGION>:<ACCOUNT>:table/<TABLE_NAME>/index/compute_trigger_index
+                    f"arn:aws:dynamodb:{region}:{account_id}:table/{cls.ROUTES_TABLE_NAME_FORMAT.format(cls.__name__, context_id, region)}*",
+                    f"arn:aws:dynamodb:{region}:{account_id}:table/{cls.ROUTES_HISTORY_TABLE_NAME_FORMAT.format(cls.__name__, context_id, region)}*",
+                    f"arn:aws:dynamodb:{region}:{account_id}:table/{cls.ROUTES_PENDING_NODES_TABLE_NAME_FORMAT.format(cls.__name__, context_id, region)}*",
+                    f"arn:aws:dynamodb:{region}:{account_id}:table/{cls.ROUTES_ACTIVE_COMPUTE_RECORDS_TABLE_NAME_FORMAT.format(cls.__name__, context_id, region)}*",
+                    f"arn:aws:dynamodb:{region}:{account_id}:table/{cls.ROUTES_LOCK_TABLE_NAME_FORMAT.format(cls.__name__, context_id, region)}*",
+                ],
+                ["dynamodb:*"],
+            ),
+            ConstructPermission(
+                ["*"],
+                ["dax:*", "application-autoscaling:*", "iam:CreateServiceLinkedRole", "iam:DeleteServiceLinkedRole"],
             ),
         ]
 
@@ -874,6 +1079,7 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
             self._routing_history_table_name: "routingHistoryTable",
             self._routing_pending_nodes_table_name: "routingPendingNodeTable",
             self._routing_active_compute_records_table_name: "routingActiveComputeRecordsTable",
+            self._routing_lock_table_name: "routingLockTable",
         }
         # where dimension is Type='count'
         table_metrics_and_supported_statistics = {
@@ -885,7 +1091,7 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
             "TransactionConflict": ["*"],
             "ReadThrottleEvents": ["*"],
             "WriteThrottleEvents": ["*"]
-            # enable when DDB Mutex is implemented (on that table only)
+            # TODO enable when default CW dashboard max widget limit issue is handled
             # "ConditionalCheckFailedRequests": []
         }
 
@@ -959,7 +1165,10 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
             for operation in supported_operations
         ]
 
-    def _update_route_table_read_scaling(self, table_name, min_capacity: int = 5, max_capacity: int = 500):
+    def _update_route_table_read_scaling(self, table_name, min_capacity: int = 20, max_capacity: int = 500):
+        if self.billing_mode == BillingMode.PAY_PER_REQUEST:
+            return
+
         exponential_retry(
             register_scalable_target,
             ["ConcurrentUpdateException", "InternalServiceException"],
@@ -988,6 +1197,9 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
         )
 
     def _update_route_table_write_scaling(self, table_name, min_capacity: int = 5, max_capacity: int = 500):
+        if self.billing_mode == BillingMode.PAY_PER_REQUEST:
+            return
+
         exponential_retry(
             register_scalable_target,
             ["ConcurrentUpdateException", "InternalServiceException"],
@@ -1015,7 +1227,7 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
             },
         )
 
-    def _update_route_table_scaling(self, table_name: str, rcu_min: int = 5, rcu_max: int = 500, wcu_min: int = 5, wcu_max: int = 500):
+    def _update_route_table_scaling(self, table_name: str, rcu_min: int = 40, rcu_max: int = 500, wcu_min: int = 20, wcu_max: int = 500):
         self._update_route_table_read_scaling(table_name, rcu_min, rcu_max)
         self._update_route_table_write_scaling(table_name, wcu_min, wcu_max)
 
@@ -1031,7 +1243,10 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
                 # When billing mode is provisioned we need to provide the
                 # RCUs and WCUs but the following values are just dummy.
                 # Refer Auto Scaling Capacities above.
-                provisioned_throughput={"ReadCapacityUnits": 20, "WriteCapacityUnits": 20},
+                provisioned_throughput={"ReadCapacityUnits": 20, "WriteCapacityUnits": 20}
+                if self.billing_mode == BillingMode.PROVISIONED
+                else None,
+                billing_mode=self.billing_mode,
             )
 
         except ClientError as error:
@@ -1056,18 +1271,59 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
                 attribute_def=[
                     {"AttributeName": "route_id", "AttributeType": "S"},
                     {"AttributeName": "compute_record_sort_key", "AttributeType": "S"},
+                    {"AttributeName": "compute_trigger_timestamp_utc", "AttributeType": "N"},
+                    {"AttributeName": "compute_finished_timestamp_utc", "AttributeType": "N"},
+                    {"AttributeName": "slot_type", "AttributeType": "N"},
+                    {"AttributeName": "compute_session_state", "AttributeType": "S"},
+                ],
+                local_secondary_index=[
+                    {
+                        "IndexName": self.HISTORY_TABLE_COMPUTE_TRIGGER_INDEX_NAME,
+                        "KeySchema": [
+                            {"AttributeName": "route_id", "KeyType": "HASH"},  # Partition key
+                            {"AttributeName": "compute_trigger_timestamp_utc", "KeyType": "RANGE"},
+                        ],
+                        "Projection": {"ProjectionType": "ALL"},
+                    },
+                    {
+                        "IndexName": self.HISTORY_TABLE_COMPUTE_FINISHED_INDEX_NAME,
+                        "KeySchema": [
+                            {"AttributeName": "route_id", "KeyType": "HASH"},  # Partition key
+                            {"AttributeName": "compute_finished_timestamp_utc", "KeyType": "RANGE"},
+                        ],
+                        "Projection": {"ProjectionType": "ALL"},
+                    },
+                    {
+                        "IndexName": self.HISTORY_TABLE_SLOT_TYPE_INDEX_NAME,
+                        "KeySchema": [
+                            {"AttributeName": "route_id", "KeyType": "HASH"},  # Partition key
+                            {"AttributeName": "slot_type", "KeyType": "RANGE"},
+                        ],
+                        "Projection": {"ProjectionType": "ALL"},
+                    },
+                    {
+                        "IndexName": self.HISTORY_TABLE_SESSION_STATE_INDEX_NAME,
+                        "KeySchema": [
+                            {"AttributeName": "route_id", "KeyType": "HASH"},  # Partition key
+                            {"AttributeName": "compute_session_state", "KeyType": "RANGE"},
+                        ],
+                        "Projection": {"ProjectionType": "ALL"},
+                    },
                 ],
                 # When billing mode is provisioned we need to provide the
                 # RCUs and WCUs but the following values are just dummy.
                 # Refer Auto Scaling Capacities above.
-                provisioned_throughput={"ReadCapacityUnits": 20, "WriteCapacityUnits": 10},
+                provisioned_throughput={"ReadCapacityUnits": 20, "WriteCapacityUnits": 10}
+                if self.billing_mode == BillingMode.PROVISIONED
+                else None,
+                billing_mode=self.billing_mode,
             )
         except ClientError as error:
             if error.response["Error"]["Code"] == "ResourceInUseException":
-                self._update_route_table_scaling(self._routing_history_table_name)
+                self._update_route_table_scaling(self._routing_history_table_name, rcu_min=400, rcu_max=1000, wcu_min=50, wcu_max=1000)
             raise
 
-        self._update_route_table_scaling(self._routing_history_table_name)
+        self._update_route_table_scaling(self._routing_history_table_name, rcu_min=400, rcu_max=1000, wcu_min=50, wcu_max=1000)
         return table
 
     def _create_route_pending_nodes_table(self):
@@ -1088,14 +1344,19 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
                 # When billing mode is provisioned we need to provide the
                 # RCUs and WCUs but the following values are just dummy.
                 # Refer Auto Scaling Capacities above.
-                provisioned_throughput={"ReadCapacityUnits": 20, "WriteCapacityUnits": 10},
+                provisioned_throughput={"ReadCapacityUnits": 20, "WriteCapacityUnits": 10}
+                if self.billing_mode == BillingMode.PROVISIONED
+                else None,
+                billing_mode=self.billing_mode,
             )
         except ClientError as error:
             if error.response["Error"]["Code"] == "ResourceInUseException":
-                self._update_route_table_scaling(self._routing_pending_nodes_table_name, rcu_max=1000, wcu_max=1000)
+                self._update_route_table_scaling(
+                    self._routing_pending_nodes_table_name, rcu_min=100, rcu_max=1000, wcu_min=75, wcu_max=1000
+                )
             raise
 
-        self._update_route_table_scaling(self._routing_pending_nodes_table_name, rcu_max=1000, wcu_max=1000)
+        self._update_route_table_scaling(self._routing_pending_nodes_table_name, rcu_min=100, rcu_max=1000, wcu_min=75, wcu_max=1000)
         return table
 
     def _create_route_active_compute_records_table(self):
@@ -1116,14 +1377,32 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
                 # When billing mode is provisioned we need to provide the
                 # RCUs and WCUs but the following values are just dummy.
                 # Refer Auto Scaling Capacities above.
-                provisioned_throughput={"ReadCapacityUnits": 20, "WriteCapacityUnits": 10},
+                provisioned_throughput={"ReadCapacityUnits": 20, "WriteCapacityUnits": 10}
+                if self.billing_mode == BillingMode.PROVISIONED
+                else None,
+                billing_mode=self.billing_mode,
             )
         except ClientError as error:
             if error.response["Error"]["Code"] == "ResourceInUseException":
-                self._update_route_table_scaling(self._routing_active_compute_records_table_name, rcu_max=1000, wcu_max=1000)
+                self._update_route_table_scaling(
+                    self._routing_active_compute_records_table_name, rcu_min=100, rcu_max=1000, wcu_min=50, wcu_max=1000
+                )
             raise
 
-        self._update_route_table_scaling(self._routing_active_compute_records_table_name, rcu_max=1000, wcu_max=1000)
+        self._update_route_table_scaling(
+            self._routing_active_compute_records_table_name, rcu_min=100, rcu_max=1000, wcu_min=50, wcu_max=1000
+        )
+        return table
+
+    def _create_route_lock_table(self):
+        try:
+            table = create_lock_table(self._ddb, self._routing_lock_table_name)
+        except ClientError as error:
+            if error.response["Error"]["Code"] == "ResourceInUseException":
+                self._update_route_table_scaling(self._routing_lock_table_name, rcu_min=20, wcu_min=50, wcu_max=1000)
+            raise
+
+        self._update_route_table_scaling(self._routing_lock_table_name, rcu_min=20, wcu_min=50, wcu_max=1000)
         return table
 
     def activate(self) -> None:
@@ -1169,6 +1448,15 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
                 module_logger.error(
                     f"An error occurred while trying to provision/update routing table "
                     f"{self._routing_active_compute_records_table_name}!"
+                )
+                raise
+
+        try:
+            self._create_route_lock_table()
+        except ClientError as error:
+            if error.response["Error"]["Code"] != "ResourceInUseException":
+                module_logger.error(
+                    f"An error occurred while trying to provision/update routing table " f"{self._routing_lock_table_name}!"
                 )
                 raise
 

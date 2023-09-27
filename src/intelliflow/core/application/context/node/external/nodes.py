@@ -8,10 +8,12 @@ from typing import Any, Dict, List, Optional, Sequence, cast
 from intelliflow.core.platform.definitions.aws.common import CommonParams as AWSCommonParams
 from intelliflow.core.platform.definitions.aws.glue import catalog as glue_catalog
 from intelliflow.core.platform.definitions.aws.glue.catalog import GlueTableDesc
+from intelliflow.core.platform.definitions.aws.sns.client_wrapper import create_topic_arn, topic_exists
 from intelliflow.core.platform.development import HostPlatform
 from intelliflow.core.serialization import Serializable
 from intelliflow.core.signal_processing import DimensionFilter, DimensionSpec, Signal, SignalDomainSpec, Slot
-from intelliflow.core.signal_processing.signal import SignalType
+from intelliflow.core.signal_processing.definitions.dimension_defs import Type
+from intelliflow.core.signal_processing.signal import SignalIntegrityProtocol, SignalType
 from intelliflow.core.signal_processing.signal_source import (
     COMPUTE_HINTS_KEY,
     DATA_FORMAT_KEY,
@@ -26,6 +28,7 @@ from intelliflow.core.signal_processing.signal_source import (
     S3SignalSourceAccessSpec,
     SignalSourceAccessSpec,
     SignalSourceType,
+    SNSSignalSourceAccessSpec,
 )
 
 from ..base import DataNode
@@ -58,9 +61,21 @@ class ExternalDataNode(DataNode, ABC):
         def requires_dimension_spec(cls) -> bool:
             ...
 
+        @classmethod
+        def provide_default_dimension_spec(cls) -> DimensionSpec:
+            return None
+
         @abstractmethod
         def provide_default_id(self) -> str:
             ...
+
+        def set_platform(self, platform: HostPlatform) -> None:
+            self._set_platform(platform)
+            if self._proxy:
+                self._proxy._set_platform(platform)
+
+        def _set_platform(self, platform: HostPlatform) -> None:
+            pass
 
         @abstractmethod
         def create_node(self, data_id: str, domain_spec: SignalDomainSpec, platform: HostPlatform) -> "ExternalDataNode":
@@ -122,6 +137,10 @@ class S3DataNode(ExternalDataNode):
         @classmethod
         def requires_dimension_spec(cls) -> bool:
             return True
+
+        @classmethod
+        def provide_default_dimension_spec(cls) -> DimensionSpec:
+            return DimensionSpec()
 
         # overrides
         def provide_default_id(self) -> str:
@@ -206,6 +225,9 @@ class GlueTableDataNode(ExternalDataNode):
             if self._partition_keys and not isinstance(self._partition_keys, list):
                 raise TypeError(f"Please provide a list for {PARTITION_KEYS_KEY}")
 
+            self._table_desc: Optional[GlueTableDesc] = None
+            self._new_kwargs = None
+
         # overrides
         @classmethod
         def requires_dimension_spec(cls) -> bool:
@@ -214,6 +236,71 @@ class GlueTableDataNode(ExternalDataNode):
         # overrides
         def provide_default_id(self) -> str:
             return self._table_name
+
+        # overrides
+        def _set_platform(self, platform: HostPlatform) -> None:
+            # marshal glue catalog data in the form of S3.
+            #  use information from catalog to compensate metadata normally expected from the user.
+            region: str = platform.conf.get_param(AWSCommonParams.REGION)
+            glue = platform.conf.get_param(AWSCommonParams.BOTO_SESSION).client("glue", region_name=region)
+            self._table_desc: Optional[GlueTableDesc] = glue_catalog.create_signal(
+                glue_client=glue, database_name=self._database, table_name=self._table_name
+            )
+            if not self._table_desc:
+                raise ValueError(
+                    f"Table {self._table_name!r} in database: {self._database!r} does not exist in Glue" f"catalog [region={region!r}]"
+                )
+
+            if self._table_desc._test_bypass_checks:
+                return
+
+            table_as_signal: Signal = self._table_desc.signal
+            compute_hints = self._table_desc.default_compute_params
+
+            self._new_kwargs = dict(self._data_kwargs)
+            self._new_kwargs.update({COMPUTE_HINTS_KEY: compute_hints})
+
+            if table_as_signal.resource_access_spec.source == SignalSourceType.S3:
+                # check encryption
+                s3_access_spec = cast("S3SignalSourceAccessSpec", table_as_signal.resource_access_spec)
+                if s3_access_spec.encryption_key and not self._data_kwargs.get(ENCRYPTION_KEY_KEY, None):
+                    # TODO this metadata does not mean that a client side encryption is required, so we will be ok with
+                    # a warning for now (E.g S3 SSE)
+                    logger.warning(
+                        f"'encryption_key' should be provided for table {self._table_name!r} in database: {self._database!r}!"
+                        f" You can ignore this if SSE encryption is used but even in that case you might"
+                        f" need to provide compute 'extra_permissions' for KMS related permissions in"
+                        f" execution role policy."
+                    )
+
+                data_format = s3_access_spec.attrs.get(DATA_FORMAT_KEY, None)
+                if data_format:
+                    if DATA_FORMAT_KEY in self._new_kwargs:
+                        user_data_format = self._new_kwargs[DATA_FORMAT_KEY]
+                        if user_data_format is not None and DatasetSignalSourceFormat(user_data_format) != data_format:
+                            raise ValueError(
+                                f"Data format does not match the value for S3 dataset {self._table_name!r}"
+                                f" in database: {self._database!r}!"
+                                f" User provided format : {user_data_format!r},"
+                                f" keys in the catalog: {data_format!r}"
+                            )
+                    else:
+                        self._new_kwargs.update({DATA_FORMAT_KEY: data_format})
+
+                if self._partition_keys is not None and self._partition_keys != s3_access_spec.partition_keys:
+                    raise ValueError(
+                        f"Partition keys don't match the value for S3 dataset {self._table_name!r}"
+                        f" in database: {self._database!r}!"
+                        f" User keys: {self._partition_keys!r},"
+                        f" keys in the catalog: {s3_access_spec.partition_keys!r}"
+                    )
+                self._partition_keys = s3_access_spec.partition_keys
+            else:
+                raise NotImplementedError(
+                    f"Table {self._table_name!r} in database: {self._database!r} is not supported by"
+                    f" any application layer external node implementation! "
+                    f"Table type: {table_as_signal.resource_access_spec.source!r}"
+                )
 
         @classmethod
         def _create_domain_spec(cls, user_domain_spec: SignalDomainSpec, catalog_domain_spec: SignalDomainSpec) -> SignalDomainSpec:
@@ -273,59 +360,16 @@ class GlueTableDataNode(ExternalDataNode):
 
         # overrides
         def create_node(self, data_id: str, domain_spec: SignalDomainSpec, platform: HostPlatform) -> ExternalDataNode:
-            # marshal glue catalog data in the form of S3 (or any other specialized signal type in the future).
-            #  use information from catalog to compensate metadata normally expected from the user.
-            #  emulate the user:
-            #  use S3Descriptor object interface and call create_node on it.
-            region: str = platform.conf.get_param(AWSCommonParams.REGION)
-            glue = platform.conf.get_param(AWSCommonParams.BOTO_SESSION).client("glue", region_name=region)
-            table_desc: Optional[GlueTableDesc] = glue_catalog.create_signal(
-                glue_client=glue, database_name=self._database, table_name=self._table_name
-            )
-            if not table_desc:
-                raise ValueError(
-                    f"Table {self._table_name!r} in database: {self._database!r} does not exist in Glue" f"catalog [region={region!r}]"
-                )
-            elif table_desc._test_bypass_checks:
+            if self._table_desc._test_bypass_checks:
                 return GlueTableDataNode(self, data_id, domain_spec)
 
-            table_as_signal: Signal = table_desc.signal
-            compute_hints = table_desc.default_compute_params
-
-            new_kwargs = dict(self._data_kwargs)
-            new_kwargs.update({COMPUTE_HINTS_KEY: compute_hints})
+            table_as_signal: Signal = self._table_desc.signal
 
             # check user provided dim_spec and dim_filter
             new_domain_spec = self._create_domain_spec(user_domain_spec=domain_spec, catalog_domain_spec=table_as_signal.domain_spec)
             if table_as_signal.resource_access_spec.source == SignalSourceType.S3:
                 # check encryption
                 s3_access_spec = cast("S3SignalSourceAccessSpec", table_as_signal.resource_access_spec)
-                if s3_access_spec.encryption_key and not self._data_kwargs.get(ENCRYPTION_KEY_KEY, None):
-                    raise ValueError(f"'encryption_key' should be provided for table {self._table_name!r} in database: {self._database!r}!")
-
-                data_format = s3_access_spec.attrs.get(DATA_FORMAT_KEY, None)
-                if data_format:
-                    if DATA_FORMAT_KEY in new_kwargs or DATASET_FORMAT_KEY in new_kwargs:
-                        user_data_format = new_kwargs.get(DATA_FORMAT_KEY, new_kwargs[DATASET_FORMAT_KEY])
-                        if user_data_format is not None and DatasetSignalSourceFormat(user_data_format) != data_format:
-                            raise ValueError(
-                                f"Data format does not match the value for S3 dataset {self._table_name!r}"
-                                f" in database: {self._database!r}!"
-                                f" User provided format : {user_data_format!r},"
-                                f" keys in the catalog: {data_format!r}"
-                            )
-                    else:
-                        new_kwargs.update({DATA_FORMAT_KEY: data_format})
-
-                if self._partition_keys is not None and self._partition_keys != s3_access_spec.partition_keys:
-                    raise ValueError(
-                        f"Partition keys don't match the value for S3 dataset {self._table_name!r}"
-                        f" in database: {self._database!r}!"
-                        f" User keys: {self._partition_keys!r},"
-                        f" keys in the catalog: {s3_access_spec.partition_keys!r}"
-                    )
-                self._partition_keys = s3_access_spec.partition_keys
-
                 # if the user has provided the account_id (as metadata, etc), honor it otherwise always default to
                 #  'catalog' module retrieved account_id (which does not exist for S3 datasets right now [None),
                 #  then fall back to the account_id of the current session.
@@ -333,36 +377,6 @@ class GlueTableDataNode(ExternalDataNode):
                     "account_id",
                     s3_access_spec.account_id if s3_access_spec.account_id else platform.conf.get_param(AWSCommonParams.ACCOUNT_ID),
                 )
-                # validate user provided keys
-                # why do we do this even though those keys are always retrieved from catalog?
-                #  Because
-                #  - we allow users to be 'strictly typed' and embedded table metadata to code to declare
-                #  for what they've created their business logic for, to avoid obscure, auto changes in the future.
-                #  - also this can be preffered to make high-level app code to be more readable/declarative
-                # so we just intend to do a validation here (during the activation) and make sure that underlying
-                # data source is still on par user's expectations (if any).
-                if self._partition_keys is not None and self._partition_keys != s3_access_spec.partition_keys:
-                    raise ValueError(
-                        f"Partition keys don't match GlueTable {self._table_name!r}"
-                        f" in database: {self._database!r}!"
-                        f" User keys: {self._partition_keys!r},"
-                        f" keys in the catalog: {s3_access_spec.partition_keys!r}"
-                    )
-
-                if PARTITION_KEYS_KEY in new_kwargs:
-                    del new_kwargs[PARTITION_KEYS_KEY]
-
-                if PRIMARY_KEYS_KEY in new_kwargs:
-                    user_primary_keys = new_kwargs[PRIMARY_KEYS_KEY]
-                    if user_primary_keys is not None and user_primary_keys != s3_access_spec.primary_keys:
-                        raise ValueError(
-                            f"Primary keys don't match for GlueTable {self._table_name!r}"
-                            f" in database: {self._database!r}!"
-                            f" User keys: {user_primary_keys!r},"
-                            f" keys in the catalog: {s3_access_spec.primary_keys!r}"
-                        )
-                    # clean up kwargs, since the following constructor will provide params explicitly
-                    del new_kwargs[PRIMARY_KEYS_KEY]
 
                 return (
                     S3DataNode.Descriptor(
@@ -371,7 +385,7 @@ class GlueTableDataNode(ExternalDataNode):
                         s3_access_spec.folder,
                         # add '{}' for each partition key
                         *[DIMENSION_PLACEHOLDER_FORMAT for key in s3_access_spec.partition_keys],
-                        **new_kwargs,
+                        **self._new_kwargs,
                     )
                     .link(self)
                     .create_node(data_id, new_domain_spec, platform)
@@ -418,3 +432,88 @@ class GlueTableDataNode(ExternalDataNode):
     # overrides
     def signal(self) -> Signal:
         return Signal(SignalType.EXTERNAL_GLUE_TABLE_PARTITION_UPDATE, self._source_access_spec, self._domain_spec, self._data_id)  # alias
+
+
+class SNSNode(ExternalDataNode):
+    class Descriptor(ExternalDataNode.Descriptor):
+        def __init__(
+            self, topic_name: str, region: Optional[str] = None, account_id: Optional[str] = None, retain_ownership: bool = True, **kwargs
+        ) -> None:
+            super().__init__(**kwargs)
+            if not topic_name:
+                raise ValueError(f"'topic_name' must be defined!")
+            self._topic_name = topic_name
+            self._region = region
+            self._account_id = account_id
+            self._retain_ownership = retain_ownership
+
+        # overrides
+        @classmethod
+        def requires_dimension_spec(cls) -> bool:
+            return False
+
+        @classmethod
+        def provide_default_dimension_spec(cls) -> DimensionSpec:
+            return DimensionSpec.load_from_pretty({"time": {type: Type.DATETIME}})
+
+        # overrides
+        def provide_default_id(self) -> str:
+            # convert SNS allowed hyphen to underscore to make it a valid data node id
+            return self._topic_name.replace("-", "_")
+
+        # overrides
+        def _set_platform(self, platform: HostPlatform) -> None:
+            """use platform to do validation and defaulting"""
+            app_account_id: str = platform.conf.get_param(AWSCommonParams.ACCOUNT_ID)
+            if not self._account_id:
+                self._account_id = app_account_id
+                logger.warning(
+                    f"Undefined 'account_id' for SNS topic {self._topic_name!r} will be defaulted to application account {self._account_id!r}."
+                )
+
+            if not self._region:
+                self._region = platform.conf.get_param(AWSCommonParams.REGION)
+                logger.warning(
+                    f"Undefined 'region' for SNS topic {self._topic_name!r} will be defaulted to application region {self._region!r}."
+                )
+
+            topic_arn: str = create_topic_arn(self._region, self._account_id, self._topic_name)
+
+            if not self._retain_ownership:
+                sns = platform.conf.get_param(AWSCommonParams.BOTO_SESSION).client("sns", region_name=self._region)
+                if not topic_exists(sns, topic_arn):
+                    raise ValueError(
+                        f"Topic {self._topic_name!r} could not be found in account: {self._account_id!r}, region: {self._region!r}."
+                    )
+            elif self._account_id != app_account_id:
+                raise ValueError(f"Cannot retain the ownership of topic {self._topic_name!r} from another account {self._account_id!r}!")
+            else:
+                logger.info(
+                    f"Topic {self._topic_name} will be retained and its connections will be managed by framework."
+                    f" If it does not exist already, it will be created during activation."
+                )
+
+        # overrides
+        def create_node(self, data_id: str, domain_spec: SignalDomainSpec, platform: HostPlatform) -> ExternalDataNode:
+            return SNSNode(self, data_id, domain_spec)
+
+        # overrides
+        def _create_source_spec(self, data_id: str, domain_spec: SignalDomainSpec) -> SignalSourceAccessSpec:
+            return SNSSignalSourceAccessSpec(self._topic_name, self._account_id, self._region, self._retain_ownership, **self._data_kwargs)
+
+    def __init__(self, desc: Descriptor, data_id: str, domain_spec: SignalDomainSpec) -> None:
+
+        if domain_spec.integrity_check_protocol is not None:
+            logger.critical(
+                f"Signal integrity protocol defined for {data_id!r} will be ignored on events coming from "
+                f"SNS. Each incoming event will be interpreted as a valid signal."
+            )
+            domain_spec = SignalDomainSpec(domain_spec.dimension_spec, domain_spec.dimension_filter_spec, None)
+
+        sns_source_access_spec = desc.create_source_spec(data_id, domain_spec)
+
+        super().__init__(desc, data_id, sns_source_access_spec, domain_spec, None, None, None)
+
+    # overrides
+    def signal(self) -> Signal:
+        return Signal(SignalType.EXTERNAL_SNS_NOTIFICATION, self._source_access_spec, self._domain_spec, self._data_id)

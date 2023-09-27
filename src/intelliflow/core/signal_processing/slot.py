@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 
 from intelliflow.core.entity import CoreData
 from intelliflow.core.permission import Permission
+from intelliflow.core.serialization import loads
 
 from .definitions import compute_defs
 from .signal import Signal
@@ -51,6 +52,10 @@ class SlotCodeMetadata(CoreData):
         self.target_method = target_method
         # ex: s3 paths, etc
         self.external_library_paths = external_library_paths
+        if self.external_library_paths:
+            # make __eq__ happy
+            self.external_library_paths = list(external_library_paths)
+            self.external_library_paths.sort()
 
 
 class SlotCode(str):
@@ -146,6 +151,19 @@ class Slot:
     @property
     def max_retry_count(self) -> int:
         return getattr(self, "retry_count", 0)
+
+    def describe_code(self) -> str:
+        """Deserialize and return a human-readable/pretty form of the code"""
+        code = loads(self.code)
+        if isinstance(code, str):
+            return code
+        else:
+            try:
+                from dill.source import getsource
+
+                return getsource(code)
+            except:
+                return str(type(code))
 
 
 __test__ = {name: value for name, value in locals().items() if name.startswith("test_")}

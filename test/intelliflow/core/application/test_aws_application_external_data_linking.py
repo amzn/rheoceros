@@ -197,6 +197,15 @@ class TestAWSApplicationExternalDataLinking(AWSTestBase):
             output_dim_links=[("hour", lambda search_h: search_h.hour, search_tommy_data("hour"))],
         )
 
+        # - all dimensions from "search_tommy_data" adapted by output
+        # - output("hour") -> reference_data("dataset_date")
+        tommy_hourly_2 = self.app.create_data(
+            id="TOMMY_HOURLY_2",
+            inputs=[search_tommy_data, reference_data.ref.range_check(True)],
+            compute_targets=[NOOPCompute],
+            output_dim_links=[(reference_data("dataset_date"), EQUALS, "hour")],
+        )
+
         # this is the preffered / most optimized way of creating this node (check the next node TOMMY_DAILY_2 for
         # comparison.
         tommy_daily = self.app.create_data(
@@ -297,6 +306,10 @@ class TestAWSApplicationExternalDataLinking(AWSTestBase):
             # this is required because in this test we use range_check(True) on tommy_hourly with 24 hours range in
             # tommy_daily.
             add_test_data(self.app, tommy_hourly["se"]["2021-03-08"][str(hour).zfill(5)], "_SUCCESS", "")
+
+            # additional check on tommy_hourly_2
+            path, _ = self.app.poll(tommy_hourly_2["se"]["20210308"][f"20210308{str(hour).zfill(tommy_hourly_digits)}"])
+            assert path
 
         # we need this sleep in this local test because we rely on asynchronous dependency check on the second input of
         # tommy daily which relies on 24 hours of partitions as a reference. those partitions are put into storage in

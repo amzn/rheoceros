@@ -4,6 +4,7 @@
 import json
 import logging
 import os
+import time
 import uuid
 from typing import Any, ClassVar, Dict, List, Optional, Set, Type, Union, cast
 from urllib.parse import unquote_plus
@@ -25,8 +26,10 @@ from intelliflow.core.signal_processing.signal_source import (
     GlueTableSignalSourceAccessSpec,
     S3SignalSourceAccessSpec,
     SignalSourceType,
+    SNSSignalSourceAccessSpec,
     TimerSignalSourceAccessSpec,
 )
+from intelliflow.utils.digest import calculate_bytes_sha256
 
 from ...constructs import (
     FEEDBACK_SIGNAL_PROCESSING_MODE_KEY,
@@ -56,7 +59,22 @@ from ...definitions.aws.s3.bucket_wrapper import (
     remove_notification,
     update_policy,
 )
-from ...definitions.aws.s3.object_wrapper import build_object_key, empty_bucket, get_object, put_object
+from ...definitions.aws.s3.object_wrapper import (
+    build_object_key,
+    empty_bucket,
+    get_object,
+    get_object_metadata,
+    get_object_sha256_hash,
+    put_object,
+)
+from ...definitions.aws.sns.client_wrapper import (
+    SNSPublisherType,
+    add_publisher_to_topic,
+    find_subscription,
+    get_topic_policy,
+    remove_publisher_from_topic,
+    topic_exists,
+)
 from ...definitions.aws.sqs.client_wrapper import *
 from ...definitions.common import ActivationParams
 from ..aws_common import AWSConstructMixin
@@ -90,6 +108,11 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
         "ResourceConflictException",
     }
     MAIN_LOOP_INTERVAL_IN_MINUTES: ClassVar[int] = 1
+    REPLAY_LOOP_INTERVAL_IN_MINUTES: ClassVar[int] = 5
+
+    #  TODO turn into a app-level exposed driver param
+    MAX_CORE_LAMBDA_CONCURRENCY: ClassVar[int] = 15  # set to None to remove limit
+    MAX_REPLAY_LAMBDA_CONCURRENCY: ClassVar[int] = 1
 
     def __init__(self, params: ConstructParamsDict) -> None:
         """Called the first time this construct is added/configured within a platform.
@@ -107,6 +130,8 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
         self._s3 = self._session.resource("s3", region_name=self._region)
         self._bucket = None
         self._bucket_name = None
+        # SNS proxies
+        self._sns = self._session.client(service_name="sns", region_name=self._region)
         # DLQ
         self._sqs = self._session.client(service_name="sqs", region_name=self._region)
         self._dlq_name = None
@@ -114,6 +139,7 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
         self._dlq_arn = None
 
         self._main_loop_timer_id = None
+        self._replay_loop_timer_id = None
 
     def _deserialized_init(self, params: ConstructParamsDict) -> None:
         super()._deserialized_init(params)
@@ -121,6 +147,7 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
         self._s3 = self._session.resource("s3", region_name=self._region)
         self._bucket = get_bucket(self._s3, self._bucket_name)
         self._sqs = self._session.client(service_name="sqs", region_name=self._region)
+        self._sns = self._session.client(service_name="sns", region_name=self._region)
 
     def _serializable_copy_init(self, org_instance: "BaseConstruct") -> None:
         AWSConstructMixin._serializable_copy_init(self, org_instance)
@@ -128,6 +155,7 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
         self._s3 = None
         self._bucket = None
         self._sqs = None
+        self._sns = None
 
     def process(
         self,
@@ -136,6 +164,7 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
         processing_mode=FeedBackSignalProcessingMode.ONLY_HEAD,
         target_route_id: Optional[RouteID] = None,
         is_async=True,
+        filter=False,
     ) -> Optional[List[RoutingTable.Response]]:
         if isinstance(signal_or_event, Signal):
             lambda_event = {
@@ -151,13 +180,14 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
         if use_activated_instance or not self._dev_platform:
             while True:
                 try:
+                    target_lambda_name: str = self._lambda_name if not filter else self._filter_lambda_name
                     exponential_retry(
                         invoke_lambda_function,
                         # KMSAccessDeniedException is caused by quick terminate->activate cycles
                         # where Lambda encryption store might have problems with IAM propagation probably.
                         ["ServiceException", "KMSAccessDeniedException"],
                         self._lambda,
-                        self._lambda_name,
+                        target_lambda_name,
                         lambda_event,
                         is_async,
                     )
@@ -187,11 +217,22 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
         then some of the events will be dropped and pause-resume cycle won't basically be
         graceful.
         """
-        exponential_retry(put_function_concurrency, self.CLIENT_RETRYABLE_EXCEPTION_LIST, self._lambda, self._lambda_name, 0)
+        try:
+            exponential_retry(put_function_concurrency, self.CLIENT_RETRYABLE_EXCEPTION_LIST, self._lambda, self._lambda_name, 0)
+        except ClientError as error:
+            if error.response["Error"]["Code"] == "ResourceNotFoundException":
+                logger.warning(
+                    f"Ignoring PAUSE request on non-existent Processor core lambda {self._lambda_name!r}! "
+                    f"If this is not a retry on a previous unsuccessful termination attempt, then should "
+                    f"be treated as a system error."
+                )
         super().pause()
 
     def resume(self) -> None:
         concurreny_limit = self.concurrency_limit
+        if concurreny_limit is None:
+            concurreny_limit = self.MAX_CORE_LAMBDA_CONCURRENCY
+
         if concurreny_limit:
             exponential_retry(
                 put_function_concurrency, self.CLIENT_RETRYABLE_EXCEPTION_LIST, self._lambda, self._lambda_name, concurreny_limit
@@ -209,6 +250,9 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
 
         self._filter_lambda_name: str = self._lambda_name + "-FILTER"
         self._filter_lambda_arn = f"arn:aws:lambda:{self._region}:{self._account_id}:function:{self._filter_lambda_name}"
+
+        self._replay_lambda_name: str = self._lambda_name + "-REPLAY"
+        self._replay_lambda_arn = f"arn:aws:lambda:{self._region}:{self._account_id}:function:{self._replay_lambda_name}"
 
         self._dlq_name = self._lambda_name + "-DLQ"
         queue_name_len_diff = len(self._dlq_name) - MAX_QUEUE_NAME_SIZE
@@ -242,6 +286,12 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
             module_logger.error(msg)
             raise ValueError(msg)
 
+        self._replay_loop_timer_id = self._lambda_name + "-replay"
+        if (len(self._replay_loop_timer_id) - MAX_PUT_RULE_LIMIT) > 0:
+            msg = f"Replay Loop Timer Id ({self._replay_loop_timer_id}) length needs to be less than or equal to {str(MAX_PUT_RULE_LIMIT)}"
+            module_logger.error(msg)
+            raise ValueError(msg)
+
         # TODO easily hits event-bridge PutRule 64 limit (should be <= 64)
         #   re-evaluate 'using unique but abbreviated IDs of drivers', e.g AWS_Lambda_1
         self._glue_catalog_event_channel_rule_id = self._lambda_name + "-gluec-id"
@@ -262,6 +312,7 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
         self._s3 = boto3.resource("s3")
         self._bucket = get_bucket(self._s3, self._bucket_name)
         self._sqs = boto3.client(service_name="sqs", region_name=self._region)
+        self._sns = boto3.client(service_name="sns", region_name=self._region)
 
     def provide_runtime_trusted_entities(self) -> List[str]:
         return ["lambda.amazonaws.com", "events.amazonaws.com"]
@@ -288,7 +339,7 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
                     # not a big deal since self._dlq_name should already be created.
                     f"arn:aws:sqs:{self._region}:{self._account_id}:{self._dlq_name}"
                 ],
-                ["sqs:SendMessage", "sqs:SendMessageBatch"],
+                ["sqs:SendMessage", "sqs:SendMessageBatch", "sqs:DeleteMessage", "sqs:GetQueueAttributes", "sqs:ReceiveMessage"],
             ),
         ]
 
@@ -340,6 +391,7 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
 
         lambda_name_format: str = cls.LAMBDA_NAME_FORMAT.format(cls.__name__, "*", params[AWSCommonParams.REGION])
         filter_lambda_name_format: str = lambda_name_format + "-FILTER"
+        replay_lambda_name_format: str = lambda_name_format + "-REPLAY"
         dlq_name_format: str = lambda_name_format + "-DLQ"
         return [
             # full permission on its own bucket
@@ -362,6 +414,7 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
                 [
                     f"arn:aws:lambda:{params[AWSCommonParams.REGION]}:{params[AWSCommonParams.ACCOUNT_ID]}:function:{lambda_name_format}",
                     f"arn:aws:lambda:{params[AWSCommonParams.REGION]}:{params[AWSCommonParams.ACCOUNT_ID]}:function:{filter_lambda_name_format}",
+                    f"arn:aws:lambda:{params[AWSCommonParams.REGION]}:{params[AWSCommonParams.ACCOUNT_ID]}:function:{replay_lambda_name_format}",
                 ],
                 ["lambda:*"],
             ),
@@ -376,6 +429,13 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
             # 2- SQS
             ConstructPermission(["*"], ["sqs:Get*", "sqs:List*"]),
             ConstructPermission(["*"], ["events:*"]),
+            # 3- SNS (proxy registrations)
+            ConstructPermission(["*"], ["sns:*"]),
+            # Glue catalog access (see "glue_catalog.check_table" call below)
+            ConstructPermission(
+                [f"arn:aws:glue:{params[AWSCommonParams.REGION]}:{params[AWSCommonParams.ACCOUNT_ID]}:catalog"],
+                ["glue:GetTable", "glue:GetTables"],
+            ),
         ]
 
     # overrides
@@ -389,7 +449,8 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
             SQS:
             https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-available-cloudwatch-metrics.html
         """
-        function_names = [self._lambda_name, self._filter_lambda_name]
+        function_names = [self._lambda_name, self._filter_lambda_name, self._replay_lambda_name]
+        function_types = ["core", "filter", "replay"]
         function_level_metrics = [
             "Throttles",
             "Errors",
@@ -439,7 +500,7 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
                     integrity_check_protocol=None,
                 ),
                 # make sure that default metric alias/ID complies with CW expectation (first letter lower case).
-                f"processor.{'core' if i == 0 else 'filter'}",
+                f"processor.{function_types[i]}",
             )
             for i, function_name in enumerate(function_names)
         ] + [
@@ -494,6 +555,13 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
                 # since metric names are shared with the other event type, we have to
                 # discriminate using a sub-dimension.
                 extra_sub_dimensions={"filter_mode": "True"},
+            ),
+            ConstructInternalMetricDesc(
+                id="processor.replay.event.type",
+                metric_names=["Internal", "ProcessorQueue", "NextCycle", "S3", "SNS", "CW_Alarm", "Glue", "EventBridge", "Unrecognized"],
+                # since metric names are shared with the other event type, we have to
+                # discriminate using a sub-dimension.
+                extra_sub_dimensions={"replay_mode": "True"},
             ),
             ConstructInternalMetricDesc(id="processor.event.error.type", metric_names=["NameError", "Exception"]),
         ]
@@ -556,7 +624,6 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
 
     def activate(self) -> None:
         super().activate()
-
         if not bucket_exists(self._s3, self._bucket_name):
             self._setup_scripts_bucket()
         else:
@@ -589,11 +656,14 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
 
         if not is_environment_immutable():
             working_set_stream = get_working_set_as_zip_stream()
+            # Sync working set to S3
+            deployment_package = self._upload_working_set_to_s3(working_set_stream, self._bucket, "WorkingSet.zip")
             # lambda
-            self._activate_core_lambda(working_set_stream)
+            self._activate_core_lambda(deployment_package)
             # filter lambda
-            self._activate_filter_lambda(working_set_stream)
-
+            self._activate_filter_lambda(deployment_package)
+            # filter lambda
+            self._activate_replay_lambda(deployment_package)
             # So what about ASYNC invocation configuration?
             # Why not use https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/lambda.html#Lambda.Client.put_function_event_invoke_config
             # - Because, default settings (6 hours event age, 2 retries, etc) are perfectly ok for this driver impl and
@@ -602,8 +672,25 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
             # to alternatively set our DLQ as a failure destination.
 
         self._activate_main_loop()
+        self._activate_replay_loop()
 
-    def _activate_core_lambda(self, working_set_stream):
+    def _upload_working_set_to_s3(self, working_set_stream: bytes, bucket, s3_object_key: str) -> Dict[str, str]:
+        # Upload working set to S3 if has not been loaded yet, return bucket name and object key as dict.
+        # Try getting metadata which contains hash of the workspace from S3, compare it with local hash.
+        remote_object_hash = exponential_retry(
+            get_object_sha256_hash, self.CLIENT_RETRYABLE_EXCEPTION_LIST, self._s3, self._bucket_name, s3_object_key
+        )
+        local_object_hash = calculate_bytes_sha256(working_set_stream)
+        if remote_object_hash and remote_object_hash == local_object_hash:
+            # If the remote version is consistent with local
+            logger.info("Workspace already uploaded to S3, skipped upload")
+        else:
+            # If the remote version needs upload
+            logger.info("Uploading working set to S3")
+            exponential_retry(put_object, self.CLIENT_RETRYABLE_EXCEPTION_LIST, bucket, s3_object_key, working_set_stream)
+        return {"S3Bucket": self._bucket_name, "S3Key": s3_object_key, "sha256": local_object_hash}
+
+    def _activate_core_lambda(self, deployment_package):
         lambda_arn = exponential_retry(get_lambda_arn, self.CLIENT_RETRYABLE_EXCEPTION_LIST, self._lambda, self._lambda_name)
         if lambda_arn and lambda_arn != self._lambda_arn:
             raise RuntimeError(f"AWS Lambda returned an ARN in an unexpected format." f" Expected: {self._lambda_arn}. Got: {lambda_arn}")
@@ -620,7 +707,7 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
                 # TODO
                 "intelliflow.core.platform.drivers.processor.aws.AWSLambdaProcessorBasic_lambda_handler",
                 self._params[AWSCommonParams.IF_EXE_ROLE],
-                working_set_stream,
+                deployment_package,
                 PYTHON_VERSION_MAJOR,
                 PYTHON_VERSION_MINOR,
                 self._dlq_arn,
@@ -630,14 +717,18 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
             # at the end of the activation cycle. we cannot set it now since activation across
             # other drivers might happen in parallel and they might impact the final state of
             # the platform which needs to be serialized as the bootstrapper.
-        else:  # update
+        elif not self._lambda_code_source_in_sync(deployment_package, self._lambda_name):  # update
             # code should be updated first, as the workset should naturally be backward compatible
             # with the conf (which carries the bootstrapper [RuntimePlatform]).
             exponential_retry(
-                update_lambda_function_code, self.CLIENT_RETRYABLE_EXCEPTION_LIST, self._lambda, self._lambda_name, working_set_stream
+                update_lambda_function_code, self.CLIENT_RETRYABLE_EXCEPTION_LIST, self._lambda, self._lambda_name, deployment_package
             )
+        else:
+            logger.info("Same working set already uploaded, upload skipped")
 
         concurreny_limit = self.concurrency_limit
+        if concurreny_limit is None:
+            concurreny_limit = self.MAX_CORE_LAMBDA_CONCURRENCY
         if concurreny_limit:
             exponential_retry(
                 put_function_concurrency,
@@ -650,7 +741,7 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
             # delete the limit
             exponential_retry(delete_function_concurrency, self.CLIENT_RETRYABLE_EXCEPTION_LIST, self._lambda, self._lambda_name)
 
-    def _activate_filter_lambda(self, working_set_stream):
+    def _activate_filter_lambda(self, deployment_package):
         lambda_arn = exponential_retry(get_lambda_arn, self.CLIENT_RETRYABLE_EXCEPTION_LIST, self._lambda, self._filter_lambda_name)
         if lambda_arn and lambda_arn != self._filter_lambda_arn:
             raise RuntimeError(
@@ -669,13 +760,13 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
                 "RheocerOS application Processor construct filterer/forwarder in Lambda",
                 "intelliflow.core.platform.drivers.processor.aws.AWSLambdaProcessorBasic_lambda_handler",
                 self._params[AWSCommonParams.IF_EXE_ROLE],
-                working_set_stream,
+                deployment_package,
                 PYTHON_VERSION_MAJOR,
                 PYTHON_VERSION_MINOR,
                 self._dlq_arn,
                 is_filter="True",
             )
-        else:  # update
+        elif not self._lambda_code_source_in_sync(deployment_package, self._filter_lambda_name):  # update
             # code should be updated first, as the workset should naturally be backward compatible
             # with the conf (which carries the bootstrapper [RuntimePlatform]).
             exponential_retry(
@@ -683,8 +774,64 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
                 self.CLIENT_RETRYABLE_EXCEPTION_LIST,
                 self._lambda,
                 self._filter_lambda_name,
-                working_set_stream,
+                deployment_package,
             )
+        else:
+            logger.info("Same working set already uploaded, upload skipped")
+
+    def _activate_replay_lambda(self, deployment_package):
+        lambda_arn = exponential_retry(get_lambda_arn, self.CLIENT_RETRYABLE_EXCEPTION_LIST, self._lambda, self._replay_lambda_name)
+        if lambda_arn and lambda_arn != self._replay_lambda_arn:
+            raise RuntimeError(
+                f"AWS Lambda returned an ARN in an unexpected format." f" Expected: {self._replay_lambda_arn}. Got: {lambda_arn}"
+            )
+
+        if not lambda_arn:
+            # create the function without the 'bootstrapper' first so that connections can be established,
+            # bootstrapper is later on set within _update_bootstrapper below as an env param.
+            self._replay_lambda_arn = exponential_retry(
+                create_lambda_function,
+                self.CLIENT_RETRYABLE_EXCEPTION_LIST,
+                self._lambda,
+                self._replay_lambda_name,
+                "IntelliFlow application Processor construct throttled (or retryable) events replay Lambda",
+                "intelliflow.core.platform.drivers.processor.aws.AWSLambdaProcessorBasic_replay_lambda_handler",
+                self._params[AWSCommonParams.IF_EXE_ROLE],
+                deployment_package,
+                PYTHON_VERSION_MAJOR,
+                PYTHON_VERSION_MINOR,
+                None,  # DLQ
+            )
+
+            # see '_update_bootstrapper' callback below to see how bootstrapper is set
+            # at the end of the activation cycle. we cannot set it now since activation across
+            # other drivers might happen in parallel and they might impact the final state of
+            # the platform which needs to be serialized as the bootstrapper.
+        elif not self._lambda_code_source_in_sync(deployment_package, self._replay_lambda_name):  # update
+            # code should be updated first, as the workset should naturally be backward compatible
+            # with the conf (which carries the bootstrapper [RuntimePlatform]).
+            exponential_retry(
+                update_lambda_function_code,
+                self.CLIENT_RETRYABLE_EXCEPTION_LIST,
+                self._lambda,
+                self._replay_lambda_name,
+                deployment_package,
+            )
+        else:
+            logger.info("Same working set already uploaded to replay Lambda, upload skipped")
+
+        concurreny_limit = self.MAX_REPLAY_LAMBDA_CONCURRENCY
+        if concurreny_limit:
+            exponential_retry(
+                put_function_concurrency,
+                self.CLIENT_RETRYABLE_EXCEPTION_LIST,
+                self._lambda,
+                self._replay_lambda_name,
+                concurreny_limit,
+            )
+        else:
+            # delete the limit
+            exponential_retry(delete_function_concurrency, self.CLIENT_RETRYABLE_EXCEPTION_LIST, self._lambda, self._replay_lambda_name)
 
     def build_bootstrapper_object_key(self) -> str:
         return build_object_key(["bootstrapper"], f"{self.__class__.__name__.lower()}_RuntimePlatform.data")
@@ -734,6 +881,27 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
             is_filter="True",
         )
 
+        # replay
+        exponential_retry(
+            update_lambda_function_conf,
+            self.CLIENT_RETRYABLE_EXCEPTION_LIST,
+            self._lambda,
+            self._replay_lambda_name,
+            "IntelliFlow application Processor construct throttled (retryable) event replay Lambda",
+            "intelliflow.core.platform.drivers.processor.aws.AWSLambdaProcessorBasic_replay_lambda_handler",
+            self._params[AWSCommonParams.IF_EXE_ROLE],
+            PYTHON_VERSION_MAJOR,
+            PYTHON_VERSION_MINOR,
+            None,
+            bootstrapper_bucket=self._bucket_name,
+            bootstrapper_key=bootstrapper_object_key,
+        )
+
+    def _lambda_code_source_in_sync(self, deployment_package, lambda_name):
+        lambda_digest = exponential_retry(get_lambda_digest, self.CLIENT_RETRYABLE_EXCEPTION_LIST, self._lambda, lambda_name)
+        logger.info("Remote lambda's code SHA256 is %s, local source %s", lambda_digest, deployment_package["sha256"])
+        return lambda_digest is not None and deployment_package["sha256"] == lambda_digest
+
     def _activate_main_loop(self) -> None:
         events = self._session.client(service_name="events", region_name=self._region)
 
@@ -747,17 +915,14 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
             if error.response["Error"]["Code"] not in ["ResourceNotFoundException"]:
                 raise
 
-        try:
-            response = exponential_retry(
-                events.put_rule,
-                ["ConcurrentModificationException", "InternalException"],
-                Name=self._main_loop_timer_id,
-                ScheduleExpression=main_loop_schedule_expression,
-                State="ENABLED",
-            )
-            rule_arn = response["RuleArn"]
-        except ClientError as error:
-            raise
+        response = exponential_retry(
+            events.put_rule,
+            ["ConcurrentModificationException", "InternalException"],
+            Name=self._main_loop_timer_id,
+            ScheduleExpression=main_loop_schedule_expression,
+            State="ENABLED",
+        )
+        rule_arn = response["RuleArn"]
 
         try:
             exponential_retry(
@@ -828,6 +993,97 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
 
         self._main_loop_timer_id = None
 
+    def _activate_replay_loop(self) -> None:
+        events = self._session.client(service_name="events", region_name=self._region)
+
+        interval = self.REPLAY_LOOP_INTERVAL_IN_MINUTES
+        replay_loop_schedule_expression = f"rate({interval} minute{'s' if interval > 1 else ''})"
+
+        statement_id: str = self._get_unique_statement_id_for_cw(self._replay_loop_timer_id)
+        try:
+            exponential_retry(remove_permission, self.CLIENT_RETRYABLE_EXCEPTION_LIST, self._lambda, self._replay_lambda_name, statement_id)
+        except ClientError as error:
+            if error.response["Error"]["Code"] not in ["ResourceNotFoundException"]:
+                raise
+
+        response = exponential_retry(
+            events.put_rule,
+            ["ConcurrentModificationException", "InternalException"],
+            Name=self._replay_loop_timer_id,
+            ScheduleExpression=replay_loop_schedule_expression,
+            State="ENABLED",
+        )
+        rule_arn = response["RuleArn"]
+
+        try:
+            exponential_retry(
+                add_permission,
+                # on platforms where related waiters are not supported, func might not be ready yet.
+                self.CLIENT_RETRYABLE_EXCEPTION_LIST.union({"ResourceNotFoundException"}),
+                self._lambda,
+                self._replay_lambda_name,
+                statement_id,
+                "lambda:InvokeFunction",
+                "events.amazonaws.com",
+                rule_arn,
+            )
+        except ClientError as error:
+            # TODO remove this special handling since we remove and add every time.
+            if error.response["Error"]["Code"] not in ["ResourceConflictException"]:
+                raise
+
+        # now connect rule & lambda (add lamda as target on the CW side)
+        response = exponential_retry(
+            events.put_targets,
+            ["ConcurrentModificationException", "InternalException"],
+            Rule=self._replay_loop_timer_id,
+            Targets=[
+                {
+                    "Arn": self._replay_lambda_arn,
+                    "Id": self._replay_lambda_name,
+                }
+            ],
+        )
+        if "FailedEntryCount" in response and response["FailedEntryCount"] > 0:
+            raise RuntimeError(
+                f"Cannot create timer {self._replay_loop_timer_id} for Lambda {self._replay_lambda_arn}. Response: {response}"
+            )
+
+    def _deactivate_replay_loop(self) -> None:
+        """Retry friendly. Be resilient against retries during the high-level termination workflow."""
+        if not self._replay_loop_timer_id:
+            return
+        events = self._session.client(service_name="events", region_name=self._region)
+
+        statement_id: str = self._get_unique_statement_id_for_cw(self._replay_loop_timer_id)
+        try:
+            exponential_retry(
+                events.remove_targets,
+                ["ConcurrentModificationException", "InternalException"],
+                Rule=self._replay_loop_timer_id,
+                Ids=[
+                    self._replay_lambda_name,
+                ],
+            )
+        except ClientError as error:
+            if error.response["Error"]["Code"] not in ["ResourceNotFoundException"]:
+                raise
+
+        try:
+            exponential_retry(remove_permission, self.CLIENT_RETRYABLE_EXCEPTION_LIST, self._lambda, self._replay_lambda_name, statement_id)
+        except ClientError as error:
+            if error.response["Error"]["Code"] not in ["ResourceNotFoundException"]:
+                raise
+
+        try:
+            exponential_retry(events.delete_rule, ["ConcurrentModificationException", "InternalException"], Name=self._replay_loop_timer_id)
+        except ClientError as error:
+            if error.response["Error"]["Code"] not in ["ResourceNotFoundException"]:
+                logger.critical(f"Cannot delete timer {self._replay_loop_timer_id} for Lambda {self._replay_lambda_arn}!")
+                raise
+
+        self._replay_loop_timer_id = None
+
     def rollback(self) -> None:
         # roll back activation, something bad has happened (probably in another Construct) during app launch
         super().rollback()
@@ -840,6 +1096,9 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
         # 1- remove main-loop 'event bridge' rule and detach from the lambda.
         if self._main_loop_timer_id:
             self._deactivate_main_loop()
+
+        if self._replay_loop_timer_id:
+            self._deactivate_replay_loop()
 
         # 2- remove lambda
         if self._lambda_name:
@@ -858,6 +1117,15 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
                 if error.response["Error"]["Code"] not in ["ResourceNotFoundException", "404"]:
                     raise
             self._filter_lambda_name = None
+
+        # 2.2- remove replay lambda
+        if self._replay_lambda_name:
+            try:
+                exponential_retry(delete_lambda_function, self.CLIENT_RETRYABLE_EXCEPTION_LIST, self._lambda, self._replay_lambda_name)
+            except ClientError as error:
+                if error.response["Error"]["Code"] not in ["ResourceNotFoundException", "404"]:
+                    raise
+            self._replay_lambda_name = None
 
         # 3- remove the resources that lambda relies on
         # 3.1- DLQ
@@ -909,8 +1177,8 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
                             f"RheocerOS could not update bucket notification for the removal of lambda: {self._filter_lambda_arn}"
                             f" due to {str(err)}."
                             f" Please manually make sure that external bucket {removed_bucket}"
-                            f" has the following BucketNotification setup for lambda."
-                            f" (LambdaFunctionArn={self._filter_lambda_arn}, events='s3:ObjectCreated:*'"
+                            f" BucketNotification does not have the following statement:"
+                            f" (LambdaFunctionArn={self._filter_lambda_arn}, events='s3:ObjectCreated:*')"
                             f" or owners of that bucket can grant the following to "
                             f" IF_DEV_ROLE ({self._params[AWSCommonParams.IF_DEV_ROLE]})"
                             f" ['s3:GetBucketNotificationConfiguration', 's3:PutBucketNotificationConfiguration']."
@@ -918,6 +1186,9 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
 
         if removed_s3_signal_source_access_specs:
             self._remove_from_remote_bucket_policy(removed_s3_signal_source_access_specs)
+
+        # note: no need to revert SNS bindings, during the termination sequence _process_external_SNS will be called
+        # with current and new signals swapped. That will do the trick.
 
         super().terminate()
 
@@ -931,6 +1202,10 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
     @classmethod
     def _get_unique_statement_id_for_cw(cls, timer_id: str) -> str:
         return "cwInvoke" + generate_statement_id(timer_id)
+
+    @classmethod
+    def _get_unique_statement_id_for_sns(cls, region: str, account: str, topic: str) -> str:
+        return "ext_snsInvoke" + generate_statement_id(region + account + topic)
 
     def hook_internal(self, route: "Route") -> None:
         super().hook_internal(route)
@@ -946,6 +1221,8 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
             not in [
                 SignalSourceType.S3,
                 SignalSourceType.GLUE_TABLE,
+                # notifications
+                SignalSourceType.SNS,
                 # this driver supports the consumption of the following (use-case:
                 # external CW signals from the same account).
                 SignalSourceType.CW_ALARM,
@@ -965,6 +1242,7 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
                     f"Account_id for S3 source {s!r} should be provided for {self.__class__.__name__}."
                     f"This is required for RheocerOS' auto-connection mechanism using this resource."
                 )
+            # TODO this validation is now responsibility of application layer. we can remove this.
             # convenience check to help users to avoid typos, etc in the most common scenario of s3 + glue_table
             if s.resource_access_spec.proxy and s.resource_access_spec.proxy.source == SignalSourceType.GLUE_TABLE:
                 glue_access_spec: GlueTableSignalSourceAccessSpec = cast("GlueTableSignalSourceAccessSpec", s.resource_access_spec.proxy)
@@ -973,15 +1251,8 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
                         f"Glue table {glue_access_spec!r} could not be found in account " f"{self._account_id!r} region {self._region!r}!"
                     )
 
-        # Glue table specific check
-        for s in signals:
-            if s.resource_access_spec.source == SignalSourceType.GLUE_TABLE:
-                access_spec: GlueTableSignalSourceAccessSpec = cast("GlueTableSignalSourceAccessSpec", s.resource_access_spec)
-                if not glue_catalog.check_table(self._session, self._region, access_spec.database, access_spec.table_name):
-                    raise ValueError(
-                        f"Either the database ({access_spec.database!r}) or table ({access_spec.table_name!r}) "
-                        f" could not be found in account {self._account_id!r} region {self._region!r}."
-                    )
+        # note: external notifications (SNS, etc)
+        # we assume that application layer should validate them early pre-activation
 
     def _process_internal(self, new_routes: Set[Route], current_routes: Set[Route]) -> None:
         # we dont need to check each one of those `Route`s,
@@ -1023,6 +1294,9 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
         # 1- Timers
         self._process_internal_timers_signals(new_signals, current_signals)
         # add other signal types here
+
+        # 2- Internal notifications? (probably we'll never have them)
+        # self._process_internal_notification_signals(new_signals, current_signals)
 
         new_alarms: List[Signal] = [
             s
@@ -1107,17 +1381,14 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
             # create the cw rule
             if new_signal.resource_access_spec.context_id == self._dev_platform.context_id:
                 # timer is owner by the same context (application)
-                try:
-                    response = exponential_retry(
-                        events.put_rule,
-                        ["ConcurrentModificationException", "InternalException"],
-                        Name=new_timer_id,
-                        ScheduleExpression=new_signal.resource_access_spec.schedule_expression,
-                        State="ENABLED",
-                    )
-                    rule_arn = response["RuleArn"]
-                except ClientError as error:
-                    raise
+                response = exponential_retry(
+                    events.put_rule,
+                    ["ConcurrentModificationException", "InternalException"],
+                    Name=new_timer_id,
+                    ScheduleExpression=new_signal.resource_access_spec.schedule_expression,
+                    State="ENABLED",
+                )
+                rule_arn = response["RuleArn"]
             else:
                 try:
                     response = exponential_retry(events.describe_rule, ["InternalException"], Name=new_timer_id)
@@ -1161,6 +1432,7 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
     def _process_external(self, new_signals: Set[Signal], current_signals: Set[Signal]) -> None:
         self._process_external_S3(new_signals, current_signals)
         self._process_external_glue_table(new_signals, current_signals)
+        self._process_external_SNS(new_signals, current_signals)
 
     def _process_external_S3(self, new_signals: Set[Signal], current_signals: Set[Signal]) -> None:
         processed_resources: Set[str] = set(
@@ -1221,9 +1493,14 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
                             module_logger.critical(
                                 f"RheocerOS could not update bucket notification for the removal of lambda: {self._filter_lambda_arn}"
                                 f" due to {str(err)}."
-                                f" Please manually make sure that external bucket {removed_bucket}"
+                                f" You have two options to setup the event channel:"
+                                f""
+                                f" 1- Create an SNS topic and add it as an proxy to the external S3 signal. Add the following lambda as a "
+                                f" target to the topic: {self._filter_lambda_arn}."
+                                f""
+                                f" 2- Manually make sure that external bucket {removed_bucket}"
                                 f" has the following BucketNotification setup for lambda."
-                                f" (LambdaFunctionArn={self._filter_lambda_arn}, events='s3:ObjectCreated:*'"
+                                f" (LambdaFunctionArn={self._filter_lambda_arn}, events='s3:ObjectCreated:*')"
                                 f" or owners of that bucket can grant the following to "
                                 f" IF_DEV_ROLE ({self._params[AWSCommonParams.IF_DEV_ROLE]})"
                                 f" ['s3:GetBucketNotificationConfiguration', 's3:PutBucketNotificationConfiguration']."
@@ -1237,13 +1514,14 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
         s3_signal_source_access_specs: Set[S3SignalSourceAccessSpec] = set()
         for ext_signal in new_signals:
             if ext_signal.resource_access_spec.source == SignalSourceType.S3:
+                s3_signal_source_access_specs.add(ext_signal.resource_access_spec)
                 ext_bucket = ext_signal.resource_access_spec.bucket
+
                 # Don't do the rest of the loop if bucket is already processed
                 # Ex: Two different external signals from the same bucket
                 if ext_bucket in updated_buckets:
                     continue
                 updated_buckets.add(ext_bucket)
-                s3_signal_source_access_specs.add(ext_signal.resource_access_spec)
 
                 # 1. add lambda permission
                 # TODO post-MVP wipe out previously added permissions
@@ -1287,36 +1565,40 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
                     # S3 will reject our notification registration due to 'overlapped' conf.
                     # Please a sample arch like: https://aws.amazon.com/blogs/compute/fanout-s3-event-notifications-to-multiple-endpoints/
                     # on the ideal registration scheme (which is what IF uses in between diff apps by default).
-                    #
-                    # 2. add bucket notification
-                    # (dev-role should have permission to do this, otherwise raise and inform the user)
-                    # By default, only the bucket owner can configure notifications on a bucket.
-                    # However, bucket owners can use a bucket policy to grant permission to other users to set
-                    # this configuration with
-                    #   s3:GetBucketNotificationConfiguration
-                    #   s3:PutBucketNotificationConfiguration
-                    # permissions.
-                    s3 = self._get_session_for(ext_signal, self._dev_platform).resource("s3")
-                    try:
-                        # best effort (auto-connection) action against external bucket (not owned by current plat/app)
-                        # TODO register notification with 'event filter's so that we won't have conflict with
-                        #  other existing notifications that use filters already. If they are also bucket level, then
-                        #  that won't work either. This will increase the likelihood of this automation.
-                        put_notification(s3, ext_bucket, None, None, [self._filter_lambda_arn], events=["s3:ObjectCreated:*"])
-                    except Exception as err:
-                        # swallow so that the following actions can be taken by the developer to unblock the app.
-                        module_logger.critical(
-                            f"RheocerOS could not setup bucket notification for lambda: {self._filter_lambda_arn}"
-                            f" due to {str(err)}."
-                            f" Please manually make sure that external bucket {ext_bucket}"
-                            f" has the following BucketNotification setup for lambda."
-                            f" (LambdaFunctionArn={self._filter_lambda_arn}, events='s3:ObjectCreated:*'"
-                            f" or owners of that bucket can grant the following to "
-                            f" IF_DEV_ROLE ({self._params[AWSCommonParams.IF_DEV_ROLE]})"
-                            f" ['s3:GetBucketNotificationConfiguration', 's3:PutBucketNotificationConfiguration']."
-                            f" Also make sure that an overlapping BucketNotification against the same event type"
-                            f" does not already exist in the notification configuration."
-                        )
+
+                    # check if SNS notification is added as a proxy
+                    proxy = ext_signal.resource_access_spec.proxy
+                    if not proxy or proxy.source != SignalSourceType.SNS:
+                        #
+                        # 2. add bucket notification
+                        # (dev-role should have permission to do this, otherwise raise and inform the user)
+                        # By default, only the bucket owner can configure notifications on a bucket.
+                        # However, bucket owners can use a bucket policy to grant permission to other users to set
+                        # this configuration with
+                        #   s3:GetBucketNotificationConfiguration
+                        #   s3:PutBucketNotificationConfiguration
+                        # permissions.
+                        s3 = self._get_session_for(ext_signal, self._dev_platform).resource("s3")
+                        try:
+                            # best effort (auto-connection) action against external bucket (not owned by current plat/app)
+                            # TODO register notification with 'event filter's so that we won't have conflict with
+                            #  other existing notifications that use filters already. If they are also bucket level, then
+                            #  that won't work either. This will increase the likelihood of this automation.
+                            put_notification(s3, ext_bucket, None, None, [self._filter_lambda_arn], events=["s3:ObjectCreated:*"])
+                        except Exception as err:
+                            # swallow so that the following actions can be taken by the developer to unblock the app.
+                            module_logger.critical(
+                                f"IntelliFlow could not setup bucket notification for lambda: {self._filter_lambda_arn}"
+                                f" due to {str(err)}."
+                                f" Please manually make sure that external bucket {ext_bucket}"
+                                f" has the following BucketNotification setup for lambda."
+                                f" (LambdaFunctionArn={self._filter_lambda_arn}, events='s3:ObjectCreated:*'"
+                                f" or owners of that bucket can grant the following to "
+                                f" IF_DEV_ROLE ({self._params[AWSCommonParams.IF_DEV_ROLE]})"
+                                f" ['s3:GetBucketNotificationConfiguration', 's3:PutBucketNotificationConfiguration']."
+                                f" Also make sure that an overlapping BucketNotification against the same event type"
+                                f" does not already exist in the notification configuration."
+                            )
             elif ext_signal.resource_access_spec.source == SignalSourceType.GLUE_TABLE:
                 continue
 
@@ -1426,6 +1708,405 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
                     f" Please manually make sure that external s3 signal sources {s3_signal_source_access_specs!r}"
                     f" does not have the following statements: {removed_statements}."
                 )
+
+    @classmethod
+    def _get_sns_spec(cls, signal: Signal) -> Optional[SNSSignalSourceAccessSpec]:
+        if signal.resource_access_spec.source == SignalSourceType.SNS:
+            return signal.resource_access_spec
+        elif signal.resource_access_spec.proxy and signal.resource_access_spec.proxy.source == SignalSourceType.SNS:
+            return signal.resource_access_spec.proxy
+
+    def _revert_S3_SNS_connections(
+        self, current_signals: Set[Signal], unique_context_id: str, survivor_buckets: Set[str], topics_to_be_deleted: Set[str]
+    ) -> None:
+        # update a bucket if it is removed or its topic is removed. Or update remaining topics for removed publishers.
+        for ext_signal in current_signals:
+            sns_access_spec: SNSSignalSourceAccessSpec = self._get_sns_spec(ext_signal)
+            if sns_access_spec:
+                topic = sns_access_spec.topic_arn
+                if sns_access_spec.retain_ownership and ext_signal.resource_access_spec.get_owner_context_uuid() == unique_context_id:
+                    # attempt to remove the link from the bucket (if bucket is also in the same account)
+                    if ext_signal.resource_access_spec.source == SignalSourceType.S3:
+                        source_bucket = ext_signal.resource_access_spec.bucket
+                        if source_bucket not in survivor_buckets or topic in topics_to_be_deleted:
+                            # in both cases, attempt to remove the topic from the bucket
+                            s3 = self._get_session_for(ext_signal, self._dev_platform).resource("s3")
+                            try:
+                                remove_notification(s3, source_bucket, {topic}, None, None)
+                            except Exception as err:
+                                # swallow so that the following actions can be taken by the developer to unblock the app.
+                                module_logger.critical(
+                                    f"IntelliFlow could not update bucket notification for the removel of SNS topic: {topic!r}"
+                                    f" due to {str(err)}."
+                                    f" Please manually make sure that external bucket {source_bucket!r}"
+                                    f" BucketNotification does not have the following statement:"
+                                    f" (TopicArn={topic}, events='s3:ObjectCreated:*')"
+                                    f" or owners of that bucket can grant the following to "
+                                    f" IF_DEV_ROLE ({self._params[AWSCommonParams.IF_DEV_ROLE]})"
+                                    f" ['s3:GetBucketNotificationConfiguration', 's3:PutBucketNotificationConfiguration']."
+                                    f" Also make sure that an overlapping BucketNotification against the same event type"
+                                    f" does not already exist in the notification configuration."
+                                )
+
+                            # if topic is still around but bucket is gone, then update topic policy
+                            if topic not in topics_to_be_deleted:
+                                if sns_access_spec.region == self.region:
+                                    sns = self._sns
+                                else:
+                                    sns = self.session.client("sns", region_name=sns_access_spec.region)
+                                remove_publisher_from_topic(sns, topic, SNSPublisherType.S3_BUCKET, source_bucket)
+
+    def _remove_SNS_topics(self, current_signals: Set[Signal], unique_context_id: str, topics_to_be_deleted: Set[str]):
+        """
+        - Break the link between the topic and the lambda
+        - Nuke the topic if we own it
+        """
+        removed_topics: Set[str] = set()
+        for ext_signal in current_signals:
+            sns_access_spec: SNSSignalSourceAccessSpec = self._get_sns_spec(ext_signal)
+            if sns_access_spec:
+                removed_topic = sns_access_spec.topic_arn
+                removed_topic_name = sns_access_spec.topic
+                if removed_topic in topics_to_be_deleted:
+                    if removed_topic in removed_topics:
+                        continue
+                    removed_topics.add(removed_topic)
+
+                    # client from the region that owns the topic
+                    sns = self._get_session_for(ext_signal, self._dev_platform).client(
+                        service_name="sns", region_name=sns_access_spec.region
+                    )
+                    # app side client (should be created based on topic region)
+                    if sns_access_spec.region == self.region:
+                        downstream_sns = self._sns
+                    else:
+                        # within app's account but using ext signal's region
+                        downstream_sns = self._session.client(service_name="sns", region_name=sns_access_spec.region)
+
+                    # 1- attempt to clean-up the topic
+                    # Convenience feature for faster data-science experimentation.
+                    # Topic management is actually expected from the user.
+                    try:
+                        # 1- check if subscribed (don't rely on state-machine, be resilient against manual modifications, etc).
+                        subscription_arn: Optional[str] = find_subscription(sns, topic_arn=removed_topic, endpoint=self._filter_lambda_arn)
+                        if subscription_arn:
+                            # if already subscribed, then unsubscribe call from the app session.
+                            # please note that we are using the sns client from the app side (app account + region)
+                            exponential_retry(downstream_sns.unsubscribe, {"InternalErrorException"}, SubscriptionArn=subscription_arn)
+
+                        if self._account_id != sns_access_spec.account_id:
+                            permission_label: str = generate_statement_id(
+                                f"{self.__class__.__name__}_{self.get_platform().context_id}_notification_channel"
+                            )
+
+                            try:
+                                exponential_retry(
+                                    sns.remove_permission, {"InternalErrorException"}, TopicArn=removed_topic, Label=permission_label
+                                )
+                            except sns.exceptions.NotFoundException:
+                                pass
+
+                    except ClientError as error:
+                        # swallow and report
+                        logger.error(
+                            f"Could not deregister from the external topic {removed_topic!r} due to error {error!r}!"
+                            f" Application filter lambda {self._filter_lambda_arn!r} should be removed from the topic if it is not"
+                            f" going to be used/imported again."
+                        )
+
+                    # 2- now we can remove the topic related permission from the filter lambda
+                    statement_id: str = self._get_unique_statement_id_for_sns(
+                        sns_access_spec.region, sns_access_spec.account_id, removed_topic_name
+                    )
+                    try:
+                        exponential_retry(
+                            remove_permission, self.CLIENT_RETRYABLE_EXCEPTION_LIST, self._lambda, self._filter_lambda_name, statement_id
+                        )
+                    except ClientError as error:
+                        if error.response["Error"]["Code"] not in ["ResourceNotFoundException"]:
+                            raise
+
+                    if sns_access_spec.retain_ownership and ext_signal.resource_access_spec.get_owner_context_uuid() == unique_context_id:
+                        # delete the topic
+                        try:
+                            # This action is idempotent, so deleting a topic that does not exist does not result in an error.
+                            exponential_retry(
+                                sns.delete_topic,
+                                ["InternalError", "InternalErrorException", "ConcurrentAccess", "ConcurrentAccessException"],
+                                TopicArn=removed_topic,
+                            )
+                        except KeyError:
+                            # TODO moto sns::delete_topic bug. they maintain an OrderDict for topics which causes KeyError for
+                            #   a non-existent key, rather than emulating SNS NotFound exception.
+                            pass
+                        except ClientError as err:
+                            if err.response["Error"]["Code"] not in ["NotFound", "ResourceNotFoundException"]:
+                                module_logger.error(f"Couldn't delete SNS topic {removed_topic!r}! Error:" f"{str(err)}")
+                                raise
+
+    def _add_or_update_SNS_topics(self, new_signals: Set[Signal], unique_context_id: str) -> None:
+        """
+        Go over all of the topics that exist in the new version of the app topology. Here the param "new_signals" contains
+        brand new external signals or the ones that exist in both the previous and new versions of the app.
+
+        - Create the topic if we own it
+        - Establish the link between the topic and the lambda, so that events will be received by the app at runtime
+        """
+        updated_topics: Set[str] = set()
+        for ext_signal in new_signals:
+            sns_access_spec: SNSSignalSourceAccessSpec = self._get_sns_spec(ext_signal)
+            if sns_access_spec:
+                updated_topic = sns_access_spec.topic_arn
+                updated_topic_name = sns_access_spec.topic
+                if updated_topic in updated_topics:
+                    continue
+                updated_topics.add(updated_topic)
+
+                sns = self._get_session_for(ext_signal, self._dev_platform).client(service_name="sns", region_name=sns_access_spec.region)
+
+                # 0- check the existence if the app retains the topic
+                if sns_access_spec.retain_ownership and ext_signal.resource_access_spec.get_owner_context_uuid() == unique_context_id:
+                    if not topic_exists(sns, updated_topic):
+                        try:
+                            exponential_retry(
+                                sns.create_topic, ["InternalErrorException", "ConcurrentAccessException"], Name=updated_topic_name
+                            )
+                        except ClientError as err:
+                            module_logger.error(f"Couldn't create SNS topic {updated_topic!r}! Error: %s", str(err))
+                            raise
+
+                # 1- we can add the topic related permission to the filter lambda
+                statement_id: str = self._get_unique_statement_id_for_sns(
+                    sns_access_spec.region, sns_access_spec.account_id, updated_topic_name
+                )
+                try:
+                    exponential_retry(
+                        remove_permission,
+                        self.CLIENT_RETRYABLE_EXCEPTION_LIST,
+                        self._lambda,
+                        self._filter_lambda_name,
+                        statement_id,
+                    )
+                except ClientError as error:
+                    if error.response["Error"]["Code"] not in ["ResourceNotFoundException"]:
+                        raise
+
+                exponential_retry(
+                    add_permission,
+                    self.CLIENT_RETRYABLE_EXCEPTION_LIST,
+                    self._lambda,
+                    self._filter_lambda_arn,
+                    statement_id,
+                    "lambda:InvokeFunction",
+                    "sns.amazonaws.com",
+                    updated_topic,
+                )
+
+                # 2- attempt to give permission to SNS to call this lambda resource owned by our platform.
+                #    convenience feature to avoid extra configuration on the topic side in most cases (where topic resides in the same account)
+                try:
+                    if self._account_id != sns_access_spec.account_id:
+                        # 1 - check permission to downstream resource
+                        permission_label: str = generate_statement_id(
+                            f"{self.__class__.__name__}_{self.get_platform().context_id}_notification_channel"
+                        )
+
+                        # TODO replace the following (acc based) permission control code with a more granular policy based version.
+                        # similar to what we do in 'AWSS3StorageBasic::_setup_event_channel' using 'self._topic_root_policy', and then
+                        # calling 'self._sns.set_topic_attributes'
+                        try:
+                            exponential_retry(
+                                sns.remove_permission, {"InternalErrorException"}, TopicArn=updated_topic, Label=permission_label
+                            )
+                        except sns.exceptions.NotFoundException:
+                            pass
+
+                        exponential_retry(
+                            sns.add_permission,
+                            {"InternalErrorException"},
+                            TopicArn=updated_topic,
+                            Label=permission_label,
+                            AWSAccountId=[self.account_id],
+                            ActionName=["Receive", "Subscribe"],
+                        )
+
+                    # and finally the actual subscribe call can now be made from app side session.
+                    # if upstream makes this call on behalf of downstream, then downstream lambda should
+                    # catch SNS notification with a 'token' and then call 'confirm_subscription' (we avoid this).
+                    if sns_access_spec.region == self.region:
+                        downstream_sns = self._sns
+                    else:
+                        # within app's account but using ext signal's region
+                        downstream_sns = self._session.client(service_name="sns", region_name=sns_access_spec.region)
+
+                    exponential_retry(
+                        downstream_sns.subscribe,
+                        {"InternalErrorException"},
+                        TopicArn=updated_topic,
+                        Protocol="lambda",
+                        Endpoint=self._filter_lambda_arn,
+                    )
+                except ClientError as error:
+                    # swallow and report
+                    logger.error(
+                        f"Could not register to the external topic {updated_topic!r} due to error {error!r}!"
+                        f" Application filter lambda {self._filter_lambda_arn!r} should be manually added to the topic if event-based"
+                        f" ingestion/triggers are expected within this application."
+                    )
+
+    def _add_or_update_S3_SNS_connections(self, new_signals: Set[Signal], unique_context_id: str):
+        """Go over all of the S3 external signals (buckets) that exist in the new version of the app topology. Here the param "new_signals" contains
+        brand new external signals or the ones that exist in both the previous and new versions of the app.
+
+        Here we establish an S3-SNS connection or update it if the user wants the framework manage the topic (via "retain_ownership").
+
+        A connection has two ends:
+        - Update the bucket notification to channel S3 events into the topic
+        - Update the topic to grant S3 bucket to "sns:Publish"
+        """
+        updated_resources: Set[str] = set()
+        for ext_signal in new_signals:
+            sns_access_spec: SNSSignalSourceAccessSpec = self._get_sns_spec(ext_signal)
+            if sns_access_spec:
+                updated_topic = sns_access_spec.topic_arn
+                updated_topic_name = sns_access_spec.topic
+                if sns_access_spec.retain_ownership and ext_signal.resource_access_spec.get_owner_context_uuid() == unique_context_id:
+                    # special treatment for S3 bucket
+                    # 1- we have to do policy update all the time because:
+                    #    - same topic might be associated with different buckets
+                    #    - in between different versions of the application, same topic can switch to a different bucket
+                    #    so we need to make policy update incremental as well, to accommodate multiple buckets.
+                    # 2- update the newly created topic with notifications out of the bucket
+                    if ext_signal.resource_access_spec.source == SignalSourceType.S3:
+                        source_bucket = ext_signal.resource_access_spec.bucket
+                        if source_bucket in updated_resources:
+                            continue
+                        updated_resources.add(source_bucket)
+
+                        if sns_access_spec.region == self.region:
+                            sns = self._sns
+                        else:
+                            sns = self.session.client("sns", region_name=sns_access_spec.region)
+
+                        # 1- update the policy
+                        add_publisher_to_topic(sns, updated_topic, SNSPublisherType.S3_BUCKET, source_bucket)
+
+                        # 2- always try to update the bucket notification even if the topic is not new
+                        s3 = self._get_session_for(ext_signal, self._dev_platform).resource("s3")
+                        source_bucket = ext_signal.resource_access_spec.bucket
+                        try:
+                            exponential_retry(
+                                put_notification,
+                                {"ServiceException", "TooManyRequestsException"},
+                                s3,
+                                source_bucket,
+                                {updated_topic},
+                                {},
+                                {},
+                                events=["s3:ObjectCreated:*"],
+                            )
+                        except Exception as err:
+                            # swallow so that the following actions can be taken by the developer to unblock the app.
+                            module_logger.critical(
+                                f"IntelliFlow could not setup bucket notification for topic: {updated_topic}"
+                                f" due to {str(err)}."
+                                f" Please manually make sure that external bucket {source_bucket}"
+                                f" has the following BucketNotification setup for the topic:"
+                                f" (TopicArn={updated_topic}, events='s3:ObjectCreated:*')"
+                                f" or owners of that bucket can grant the following to "
+                                f" IF_DEV_ROLE ({self._params[AWSCommonParams.IF_DEV_ROLE]})"
+                                f" ['s3:GetBucketNotificationConfiguration', 's3:PutBucketNotificationConfiguration']."
+                                f" Also make sure that an overlapping BucketNotification against the same event type"
+                                f" does not already exist in the notification configuration."
+                            )
+
+    def _process_external_SNS(self, new_signals: Set[Signal], current_signals: Set[Signal]) -> None:
+        """
+        Here we evaluate two types of SNS signals:
+         - SNS signals linked with upstream AWS resources such as S3 bucket (aka proxy signals)
+         - Pure / standalone imports of SNS topics into the app
+
+         In the most simple case, we just make sure that those topics can publish into the Lambdas managed by this driver and
+         we will be able to ingest events from those topics. In the most sophisticated case (where we retain the ownership of the topic),
+         we try to control the first hop/link between source AWS resource (S3 bucket -> SNS), create the topic if non existent and then again
+         link the topic to the lambda here.
+
+         So there are four categories of operations here. They can be grouped as below:
+
+        1- removed topics
+           1.1- effect of removed topics on upstream buckets when we "retain ownership" (do the cleanup in upstream bucket policies)
+           1.2- cleanup Lambda's permission for the topic (invoke permission in Lambda granted to the topic)
+           1.3- delete the topic when we "retain ownership"
+
+        2- removed buckets (on a survivor topic). a topic can be reused for multiple buckets. so this is the case when one of the buckets is removed
+        from the app. In this case:
+           2.1- update the topic that forwards the bucket. drop permission in topic policy (sns:publish permission in topic granted to the bucket)
+           2.2- attempt to update bucket's notification if we "retain owership". clean up bucket's notification and remove the topic as the notification target.
+
+        3- added topics (brand new topics)
+           3.1- if "retained", create the topic and attempt to register it to upstream bucket's notification list
+           3.2- update permission registry of topic (allow bucket to publish)
+           3.3- create the link between the topic and the lambda here so that it can publish into the app (so that we can ingest events from the topic,
+           see event_handler method in this driver)
+
+        4- new buckets (no change on topics). like a new bucket being registered on a topic that was used in another "marshal_external_data" call and linked to another bucket already.
+           4.1- if "retain_ownership", then update the notification
+           4.2- update permission registry of topic (allow bucket to publish)
+
+
+        In all of those main operations, sns clients are instantiated specifically for each signal. Reason:
+        - driver level sns client (self._sns) cannot be used if the external signal (topic) is from a different account or region
+        - if from a different account, we try to retrieve the session from upstream platform. we check if the topic is imported from an upstream IF app (IF collaboration feature).
+        - and when we are about to finalize the link between the topic and the lambda here, we need to make the "sns:subscribe" call from the lambda account (app account) but
+        using the region of the topic (another reason why self._sns cannot be used).
+        """
+        processed_resources: Set[str] = set()
+        old_bucket_to_sns_map: Dict[str, str] = dict()
+        for s in current_signals:
+            sns_spec = self._get_sns_spec(s)
+            if sns_spec:
+                processed_resources.add(sns_spec.topic_arn)
+                if s.resource_access_spec.source == SignalSourceType.S3:
+                    # SNS topic given as proxy to a bucket, let's see if the same bucket has any other
+                    old_bucket_to_sns_map[s.resource_access_spec.bucket] = sns_spec.topic_arn
+
+        new_processed_resources: Set[str] = set()
+        # while extracting new topics, also validate if application misconfigures a bucket with multiple topics
+        new_bucket_to_sns_map: Dict[str, Set[str]] = dict()
+        for s in new_signals:
+            sns_spec = self._get_sns_spec(s)
+            if sns_spec:
+                new_processed_resources.add(sns_spec.topic_arn)
+                if s.resource_access_spec.source == SignalSourceType.S3:
+                    # SNS topic given as proxy to a bucket, let's see if the same bucket has any other
+                    new_bucket_to_sns_map.setdefault(s.resource_access_spec.bucket, set()).add(sns_spec.topic_arn)
+
+        # now check if same bucket has multiple notifications defined
+        bucket_with_sns_overlap = {bucket: topics for bucket, topics in new_bucket_to_sns_map.items() if len(topics) > 1}
+        if bucket_with_sns_overlap:
+            raise ValueError(
+                f"There are overlapping SNS notifications on one or more buckets! Buckets with conflicting topics: {bucket_with_sns_overlap}"
+            )
+
+        # resources_to_be_added = new_processed_resources - processed_resources
+        resources_to_be_deleted = processed_resources - new_processed_resources
+
+        unique_context_id = self._params[ActivationParams.UNIQUE_ID_FOR_CONTEXT]
+
+        # 1 - REMOVALS
+        # 1.1
+        self._revert_S3_SNS_connections(current_signals, unique_context_id, set(new_bucket_to_sns_map.keys()), resources_to_be_deleted)
+
+        # 1.2
+        self._remove_SNS_topics(current_signals, unique_context_id, resources_to_be_deleted)
+
+        # 2 - SURVIVORS + NEW ONES (always doing the check/update even against the existing [common] signals)
+        # 2.1 establish links between topics and the lambda
+        self._add_or_update_SNS_topics(new_signals, unique_context_id)
+
+        # 2.2
+        # establish links for publishers (e.g s3 bucket) for the topics that this app owns
+        self._add_or_update_S3_SNS_connections(new_signals, unique_context_id)
 
     def _process_external_glue_table(self, new_signals: Set[Signal], current_signals: Set[Signal]) -> None:
         def _is_gt(s: Signal) -> bool:
@@ -1720,11 +2401,14 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
         # currently we check the queue optimistically at the end of each cycle
         routing_responses: List[RoutingTable.Response] = []
         target_route_id = event.get(SIGNAL_TARGET_ROUTE_ID_KEY, None)
-        module_logger.info(f"Processing event: {event!r}")
-
         serialized_feed_back_signal: str = event.get(FEEDBACK_SIGNAL_TYPE_EVENT_KEY, None)
+
+        if not serialized_feed_back_signal:
+            module_logger.info(f"Processing event: {event!r}")
+
         if serialized_feed_back_signal:
             feed_back_signal: Signal = Signal.deserialize(serialized_feed_back_signal)
+            module_logger.info(f"Processing internal event: {feed_back_signal.unique_key()!r}")
             processing_mode: FeedBackSignalProcessingMode = FeedBackSignalProcessingMode(
                 event.get(FEEDBACK_SIGNAL_PROCESSING_MODE_KEY, FeedBackSignalProcessingMode.FULL_DOMAIN.value)
             )
@@ -1973,6 +2657,53 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
 
         return routing_responses
 
+    def replay_event_handler(self, runtime_platform: "Platform", context, routing_session: RoutingSession = RoutingSession()):
+        self.metric(f"processor.replay.event.type")["NextCycle"].emit(1)
+        response = self._sqs.receive_message(
+            QueueUrl=self._dlq_url,
+            # AttributeNames=['All'],
+            MessageAttributeNames=["All"],
+            MaxNumberOfMessages=10,
+            VisibilityTimeout=1
+            * self.REPLAY_LOOP_INTERVAL_IN_MINUTES
+            * 60,  # skip next cycle for these events in case we cannot process and delete them
+            WaitTimeSeconds=10,
+        )
+        messages = response.get("Messages", None)
+
+        if messages:
+            # first delete. we cannot take the risk of replaying and then deleting in which case duplicate signalling
+            # might occur due to a failed deletion upon successful replay into core lambda. because in a subsequent
+            # replay cycle that message can be picked again.
+            response = self._sqs.delete_message_batch(
+                QueueUrl=self._dlq_url,
+                Entries=[{"Id": message["MessageId"], "ReceiptHandle": message["ReceiptHandle"]} for message in messages],
+            )
+            deleted_messages_ids = {msg["Id"] for msg in response.get("Successful", [])}
+            replay_messages = [message for message in messages if message["MessageId"] in deleted_messages_ids]
+            replay_count = 0
+            for replay_msg in replay_messages:
+                body = json.loads(replay_msg["Body"])
+                # filter out if it is a throttled timer event (no need to replay the core lambda for a missed ping)
+                if any(self._main_loop_timer_id.lower() in resource.lower() for resource in body.get("resources", [])):
+                    # self.metric(f"processor.replay.event.type")["EventBridge"].emit(1)
+                    continue
+
+                msg_attributes = replay_msg.get("MessageAttributes", None)
+                if msg_attributes and (
+                    msg_attributes.get("ErrorCode", {}).get("StringValue", "") == "429"
+                    or "Rate Exceeded".lower() in msg_attributes.get("ErrorMessage", {}).get("StringValue", "").lower()
+                ):
+                    # replay: send back to "filter" lambda's queue asynchronously (DLQ is shared so we cannot bombard
+                    #  core lambda with events throttled by filter lambda)
+                    runtime_platform.processor.process(body, True, filter=True)
+                    replay_count = replay_count + 1
+                    time.sleep(1)
+
+            if replay_count:
+                module_logger.critical(f"{replay_count} events have been sent back to core processor Lambda!")
+                self.metric(f"processor.replay.event.type")["ProcessorQueue"].emit(replay_count)
+
     @staticmethod
     def lambda_handler(event, context):
         import traceback
@@ -1993,6 +2724,16 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
                 if any([response for response in routing_responses if response.routes]):
                     runtime_platform.processor.process(event, True)
                     module_logger.critical("Forwarded the event into the core processor!")
+            else:
+                # send deferred signals back to processor queue
+                # set their target_route_id s before sending it
+                for routing_response in routing_responses:
+                    deferred_signals: Dict[Route, Set[Signal]] = routing_response.deferred_signals
+                    for route, signals in deferred_signals.items():
+                        module_logger.critical(f"Will put {len(signals)} deferred signals back to queue on route {route.route_id!r}...")
+                        for signal in signals:
+                            # this will cause the deferred signal to hit the target route only (not the other routes that have processed it already)
+                            runtime_platform.processor.process(signal, True, target_route_id=route.route_id)
             lambda_response = {"routing_responses": [response.simple_dump() for response in routing_responses if response.routes]}
             lambda_response.update({"code": "200", "message": "SUCCESS"})
             try:
@@ -2037,8 +2778,34 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
             # TODO SETUP ALARM ON DLQ (#2)
             raise retryable_error
 
+    @staticmethod
+    def replay_lambda_handler(event, context):
+        import traceback
+
+        try:
+            init_basic_logging(None, False, logging.CRITICAL)
+
+            runtime_platform = AWSLambdaProcessorBasic.runtime_bootstrap()
+            cast("AWSLambdaProcessorBasic", runtime_platform.processor).replay_event_handler(
+                runtime_platform,
+                context,
+                RoutingSession(max_duration_in_secs=13 * 60),
+            )
+
+            lambda_response = {"code": "200", "message": "SUCCESS"}
+            # make sure that Lambda response is json serializable
+            return json.dumps(lambda_response)
+        except Exception as swallow:
+            # swallow (by returning to Lambda), this will disable implicit retries for ASYNC requests.
+            # TODO ALARM metric (will be addressed as part of the overall IF error handling/conf support)
+            msg = "Replay lambda raised an exception {}".format(event, str(swallow))
+            print(msg)
+            traceback.print_exc()
+            return {"message": msg, "code": "500"}
+
 
 AWSLambdaProcessorBasic_lambda_handler = AWSLambdaProcessorBasic.lambda_handler
+AWSLambdaProcessorBasic_replay_lambda_handler = AWSLambdaProcessorBasic.replay_lambda_handler
 
 
 # avoid cyclic module dependency

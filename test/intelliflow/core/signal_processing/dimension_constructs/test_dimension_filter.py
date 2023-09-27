@@ -3,7 +3,7 @@
 
 import copy
 from collections import OrderedDict
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from test.intelliflow.core.signal_processing.dimension_constructs.test_dimension_spec import TestDimensionSpec
 from typing import cast
 
@@ -12,7 +12,7 @@ from dateutil.tz import tzlocal
 
 from intelliflow.api import INSENSITIVE, LOWER, UPPER
 from intelliflow.core.serialization import dumps, loads
-from intelliflow.core.signal_processing.definitions.dimension_defs import Type
+from intelliflow.core.signal_processing.definitions.dimension_defs import DatetimeGranularity, Type
 from intelliflow.core.signal_processing.dimension_constructs import (
     AnyVariant,
     DateVariant,
@@ -50,13 +50,17 @@ class TestDimensionFilter:
     dimension_filter_basic_any_type_long.set_spec(DimensionSpec.load_from_pretty({"dim_1_1": {type: Type.LONG}}))
 
     dimension_filter_basic_relative_1 = DimensionFilter.load_raw({"_:-2": {}})
+    dimension_filter_basic_relative_1_shift_minus_1 = DimensionFilter.load_raw({"_:-2:-1": {}})
     dimension_filter_basic_relative_2 = DimensionFilter.load_raw({"_:2": {}})
+    dimension_filter_basic_relative_2_shift_plus_1 = DimensionFilter.load_raw({"_:2:1": {}})
     dimension_filter_basic_relative_1_type_datetime = copy.deepcopy(dimension_filter_basic_relative_1)
     dimension_filter_basic_relative_1_type_datetime.set_spec(DimensionSpec.load_from_pretty({"dim": {type: Type.DATETIME}}))
 
     # filter for TestDimensionSpec.dimension_spec_branch_lvl_2
     dimension_filter_branch_1 = DimensionFilter.load_raw({"*": {"*": {}}})
     dimension_filter_branch_1.set_spec(TestDimensionSpec.dimension_spec_branch_lvl_2)
+
+    datetime_now = datetime.utcnow().date()
 
     def test_dimension_filter_init(self):
         DimensionFilter()
@@ -107,7 +111,9 @@ class TestDimensionFilter:
             dimension_filter_basic_datetime_4,
             dimension_filter_basic_any,
             dimension_filter_basic_relative_1,
+            dimension_filter_basic_relative_1_shift_minus_1,
             dimension_filter_basic_relative_2,
+            dimension_filter_basic_relative_2_shift_plus_1,
         ],
     )
     def test_dimension_filter_serialization(self, filter):
@@ -131,6 +137,8 @@ class TestDimensionFilter:
             (dimension_filter_basic_datetime_4, Dimension("name"), "2020-06-15 00:00:00"),
             (dimension_filter_basic_any, Dimension("name"), "*"),
             (dimension_filter_basic_relative_1, Dimension("name"), "_:-2"),
+            # shift goes into params,
+            (dimension_filter_basic_relative_1_shift_minus_1, Dimension("name"), "_:-2"),
             (dimension_filter_basic_relative_2, Dimension("name"), "_:2"),
         ],
     )
@@ -220,7 +228,11 @@ class TestDimensionFilter:
             (dimension_filter_basic_any, {"_:2": {}}, {"_:2": {}}),
             (dimension_filter_basic_any, {"_:-2": {}}, {"_:-2": {}}),
             (dimension_filter_basic_relative_1, {5: {}}, {5: {}, 4: {}}),
+            # shift/transforms should not cause any difference in underlying variants
+            (dimension_filter_basic_relative_1_shift_minus_1, {5: {}}, {5: {}, 4: {}}),
             (dimension_filter_basic_relative_2, {5: {}}, {5: {}, 6: {}}),
+            # shift/transforms should not cause any difference in underlying variants
+            (dimension_filter_basic_relative_2_shift_plus_1, {5: {}}, {5: {}, 6: {}}),
             (dimension_filter_basic_relative_1, {"strvalue": {}}, {"strvalue": {}, "strvalud": {}}),
             (dimension_filter_basic_relative_2, {"strvalue": {}}, {"strvalue": {}, "strvaluf": {}}),
             (dimension_filter_basic_relative_1, {"2020-06-15": {}}, {"2020-06-15": {}, "2020-06-14": {}}),
@@ -251,8 +263,10 @@ class TestDimensionFilter:
         "filter, filter2",
         [
             (dimension_filter_basic_relative_1, {"_:-1": {}}),
+            (dimension_filter_basic_relative_1_shift_minus_1, {"_:-1": {}}),
             (dimension_filter_basic_relative_1, {"_:1": {}}),
             (dimension_filter_basic_relative_2, {"_:1": {}}),
+            (dimension_filter_basic_relative_2_shift_plus_1, {"_:1": {}}),
             (dimension_filter_basic_relative_2, {"_:-1": {}}),
         ],
     )
@@ -265,9 +279,13 @@ class TestDimensionFilter:
         [
             (DimensionFilter(), {}, {}),
             (dimension_filter_basic_relative_1, {"_:-1": {}}, {"_:-1": {}}),
+            (dimension_filter_basic_relative_1_shift_minus_1, {"_:-1": {}}, {"_:-1": {}}),
             (dimension_filter_basic_relative_1, {"_:1": {}}, {"_:0": {}}),
+            (dimension_filter_basic_relative_1_shift_minus_1, {"_:1:-1": {}}, {"_:0": {}}),
             (dimension_filter_basic_relative_2, {"_:1": {}}, {"_:1": {}}),
+            (dimension_filter_basic_relative_2_shift_plus_1, {"_:1": {}}, {"_:1": {}}),
             (dimension_filter_basic_relative_2, {"_:-1": {}}, {"_:0": {}}),
+            (dimension_filter_basic_relative_2_shift_plus_1, {"_:-1": {}}, {"_:0": {}}),
             (dimension_filter_basic_relative_1, {5: {}}, {5: {}, 4: {}}),
             (dimension_filter_basic_relative_2, {5: {}}, {5: {}, 6: {}}),
             (dimension_filter_basic_relative_1, {"strvalue": {}}, {"strvalue": {}, "strvalud": {}}),
@@ -275,6 +293,8 @@ class TestDimensionFilter:
             (dimension_filter_basic_relative_1, {"2020-06-15": {}}, {"2020-06-15": {}, "2020-06-14": {}}),
             (dimension_filter_basic_relative_2, {"2020-06-15": {}}, {"2020-06-15": {}, "2020-06-16": {}}),
             (DimensionFilter.load_raw({"NA": {"*": {}}, "EU": {"_:-3": {}}}), {"EU": {"_:-2": {}}}, {"EU": {"_:-2": {}}}),
+            # this one just checks that shift/transform does not impact the actual value
+            (DimensionFilter.load_raw({"NA": {"*": {}}, "EU": {"_:-3:-1": {}}}), {"EU": {"_:-2": {}}}, {"EU": {"_:-2": {}}}),
         ],
     )
     def test_dimension_filter_chain(self, filter, filter2, result):
@@ -283,6 +303,29 @@ class TestDimensionFilter:
             assert new_filter is None
         else:
             assert DimensionFilter.load_raw(result).is_equivalent(new_filter)
+
+    @pytest.mark.parametrize(
+        "filter, filter2, result",
+        [
+            (dimension_filter_basic_relative_1_shift_minus_1, {5: {}}, {4: {}, 3: {}}),
+            (dimension_filter_basic_relative_2_shift_plus_1, {5: {}}, {6: {}, 7: {}}),
+            (dimension_filter_basic_relative_1_shift_minus_1, {"strvalue": {}}, {"strvalud": {}, "strvaluc": {}}),
+            (dimension_filter_basic_relative_2_shift_plus_1, {"strvalue": {}}, {"strvaluf": {}, "strvalug": {}}),
+            (dimension_filter_basic_relative_1_shift_minus_1, {"2020-06-15": {}}, {"2020-06-14": {}, "2020-06-13": {}}),
+            (dimension_filter_basic_relative_2_shift_plus_1, {"2020-06-15": {}}, {"2020-06-16": {}, "2020-06-17": {}}),
+        ],
+    )
+    def test_dimension_filter_chain_with_shift(self, filter, filter2, result):
+        new_filter = filter.chain(DimensionFilter.load_raw(filter2), False)
+        # in order to check the effect of shift, we need to transform
+        new_filter = new_filter.transform()
+        assert DimensionFilter.load_raw(result).is_equivalent(new_filter)
+
+    def test_dimension_filter_chain_preserves_shift(self):
+        new_filter = self.dimension_filter_basic_relative_1_shift_minus_1.chain(DimensionFilter.load_raw({"_:-1": {}}), False)
+        variant = next(iter(new_filter.get_root_dimensions()))
+        shift = variant.params.get(DimensionVariant.RANGE_SHIFT_FIELD_ID, None)
+        assert shift == -1
 
     @pytest.mark.parametrize(
         "filter, filter2, result",
@@ -869,6 +912,7 @@ class TestDimensionFilter:
             (["*"], {"dim": {type: Type.DATETIME}}, AnyVariant, Type.DATETIME),
             (["*"], {"dim": {type: Type.STRING}}, AnyVariant, Type.STRING),
             (["_:-1"], {"dim": {type: Type.DATETIME}}, RelativeVariant, Type.DATETIME),
+            (["_:-1:-1"], {"dim": {type: Type.DATETIME}}, RelativeVariant, Type.DATETIME),
             ([1], {"dim": {type: Type.STRING}}, StringVariant, Type.STRING),
             ([1], {"dim": {type: Type.LONG}}, LongVariant, Type.LONG),
             ([1], {}, LongVariant, Type.LONG),
@@ -936,6 +980,7 @@ class TestDimensionFilter:
             ({"*": {}}, {"dim": {type: Type.DATETIME}}, AnyVariant, Type.DATETIME),
             ({"*": {}}, {"dim": {type: Type.STRING}}, AnyVariant, Type.STRING),
             ({"_:-1": {}}, {"dim": {type: Type.DATETIME}}, RelativeVariant, Type.DATETIME),
+            ({"_:-1:-1": {}}, {"dim": {type: Type.DATETIME}}, RelativeVariant, Type.DATETIME),
             ({1: {}}, {"dim": {type: Type.STRING}}, StringVariant, Type.STRING),
             ({1: {}}, {"dim": {type: Type.LONG}}, LongVariant, Type.LONG),
             ({1: {}}, {"dim": {type: Type.LONG}, "dim2": {type: Type.STRING}}, LongVariant, Type.LONG),  # extra type won't be used
@@ -1134,6 +1179,89 @@ class TestDimensionFilter:
         assert isinstance(variant, DateVariant)
         assert cast(DateVariant, variant).value == date_value
         assert cast(DateVariant, variant).raw_value.replace(tzinfo=None) == date_raw_value
+
+    @pytest.mark.parametrize(
+        "raw_filter, date_value, date_raw_value",
+        [
+            (
+                {"2022-11-4": {type: Type.DATETIME, "min": datetime(2022, 11, 3)}},
+                "2022-11-04 00:00:00",
+                datetime(2022, 11, 4, 0, 0, 0),
+            ),
+            (
+                {"2022-11-4": {type: Type.DATETIME, "min": "2022-11-3"}},
+                "2022-11-04 00:00:00",
+                datetime(2022, 11, 4, 0, 0, 0),
+            ),
+            (
+                # here relative_min will automatically use "granularity" defined on this variant.
+                # so 2 here means "2 days earlier from now"
+                {datetime_now - timedelta(days=1): {type: Type.DATETIME, "relative_min": 2, "format": "%Y-%m-%d %H:%M:%S"}},
+                (datetime_now - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S"),
+                datetime_now - timedelta(days=1),
+            ),
+            (
+                {datetime_now: {type: Type.DATETIME, "relative_min": timedelta(2), "format": "%Y-%m-%d %H:%M:%S"}},
+                # use a sec value that overlaps with day, month, hour, min range
+                datetime_now.strftime("%Y-%m-%d %H:%M:%S"),
+                datetime_now,
+            ),
+        ],
+    )
+    def test_dimension_filter_datevariant_min_and_relative_min_parameters(self, raw_filter, date_value, date_raw_value):
+        filter = DimensionFilter.load_raw(raw_filter)
+        assert filter, "DimensionFilter must have been loaded successfully!"
+        variant = next(iter(filter.get_root_dimensions()))
+        assert isinstance(variant, DateVariant)
+        assert cast(DateVariant, variant).value == date_value
+        assert cast(DateVariant, variant).raw_value == date_raw_value or variant.raw_value.date() == date_raw_value
+
+    @pytest.mark.parametrize(
+        "raw_filter",
+        [
+            ({"2022-11-3": {type: Type.DATETIME, "min": datetime(2022, 11, 4)}},),
+            ({"2022-11-3": {type: Type.DATETIME, "min": "2022-11-4"}},),
+            ({"2022-11-3 00:00:00": {type: Type.DATETIME, "min": "2022-11-3 00:00:01"}},),
+            ({datetime_now - timedelta(days=3): {type: Type.DATETIME, "relative_min": timedelta(days=1)}},),
+            (
+                # here 2 maps to "2 hours earlier from now" because granularity is set as HOUR
+                {datetime_now - timedelta(hours=4): {type: Type.DATETIME, "granularity": DatetimeGranularity.HOUR, "relative_min": 2}},
+            ),
+            (
+                # here relative_min will automatically use "granularity" defined on this variant.
+                # so 2 here means "2 days earlier from now". because default granularity is DAY.
+                {datetime_now - timedelta(days=4): {type: Type.DATETIME, "relative_min": 2}},
+            ),
+        ],
+    )
+    def test_dimension_filter_datevariant_min_and_relative_min_reject_date_value(self, raw_filter):
+        assert DimensionFilter.load_raw(raw_filter) is None
+
+    def test_dimension_filter_datevariant_min_chain(self):
+        filter = DimensionFilter.load_raw({"*": {type: Type.DATETIME, "min": "2022-11-01"}})
+
+        incoming_filter = {"2022-10-20": {}}
+        # first make sure that normally this filter cannot be created using the spec from "filter"
+        assert DimensionFilter.load_raw(incoming_filter, cast=filter.get_spec()) is None
+        # but let's test the behavior if we create the raw incoming filter and apply to the datetime with "min" condition
+        with pytest.raises(ValueError):
+            new_filter = filter.chain(DimensionFilter.load_raw(incoming_filter), False)
+
+        # but if it is within range, then everything should be ok
+        incoming_filter = {"2022-11-01": {}}
+        new_filter = filter.chain(DimensionFilter.load_raw(incoming_filter), False)
+        assert new_filter
+
+    def test_dimension_filter_datevariant_relative_min_chain(self):
+        filter = DimensionFilter.load_raw({"*": {type: Type.DATETIME, "relative_min": timedelta(2)}})
+
+        incoming_filter = {datetime.utcnow() - timedelta(days=4): {}}  # way too old
+        with pytest.raises(ValueError):
+            filter.chain(DimensionFilter.load_raw(incoming_filter), False)
+
+        incoming_filter = {datetime.utcnow(): {}}  # recent
+        new_filter = filter.chain(DimensionFilter.load_raw(incoming_filter), False)
+        assert new_filter
 
     @pytest.mark.parametrize(
         "raw_filter",

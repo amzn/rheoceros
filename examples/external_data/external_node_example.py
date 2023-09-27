@@ -12,14 +12,14 @@ flow.init_basic_logging()
 
 app = AWSApplication(app_name, "us-east-1")
 app.set_security_conf(Storage, ConstructSecurityConf(
-                                    persisting=ConstructPersistenceSecurityDef(
-                                        ConstructEncryption(EncryptionKeyAllocationLevel.HIGH,
-                                                            key_rotation_cycle_in_days=365,
-                                                            is_hard_rotation=False,
-                                                            reencrypt_old_data_during_hard_rotation=False,
-                                                            trust_access_from_same_root=True)),
-                                    passing=None,
-                                    processing=None))
+    persisting=ConstructPersistenceSecurityDef(
+        ConstructEncryption(EncryptionKeyAllocationLevel.HIGH,
+                            key_rotation_cycle_in_days=365,
+                            is_hard_rotation=False,
+                            reencrypt_old_data_during_hard_rotation=False,
+                            trust_access_from_same_root=True)),
+    passing=None,
+    processing=None))
 
 ducsi_data = app.marshal_external_data(external_data_desc=GlueTable("booker", "d_unified_cust_shipment_items"))
 assert ducsi_data.bound.data_id == "d_unified_cust_shipment_items"
@@ -35,8 +35,8 @@ ducsi_data_explicit_import = app.marshal_external_data(
                 'type': DimensionType.DATETIME
             }
         }
-    }
-    , {
+    },
+    {
         '1': {
             '*': {
                 'timezone': 'PST',
@@ -65,7 +65,6 @@ ducsi_data_explicit_import = app.marshal_external_data(
             }
         }
     },
-
     SignalIntegrityProtocol("FILE_CHECK", {"file": ["SNAPSHOT"]})
 )
 assert ducsi_data_explicit_import.bound.data_id == "DEXML_DUCSI2"
@@ -84,52 +83,56 @@ d_ad_orders_na_explicit_decl = app.marshal_external_data(
             'format': '%Y-%m-%d',
             'timezone': 'PST'
         }
-    }
-    , {
+    },
+    {
         '*': {}
     }
 )
 
-repeat_ducsi = app.create_data(id="REPEAT_DUCSI",
-                               inputs={
-                                   "DEXML_DUCSI": ducsi_data
-                               },
-                               compute_targets="output=DEXML_DUCSI.limit(100)")
+repeat_ducsi = app.create_data(
+    id="REPEAT_DUCSI",
+    inputs={
+        "DEXML_DUCSI": ducsi_data
+    },
+    compute_targets="output=DEXML_DUCSI.limit(100)")
 
-repeat_d_ad_orders_na = app.create_data(id="REPEAT_AD_ORDERS",
-                                        inputs=[d_ad_orders_na],
-                                        compute_targets=[
-                                            BatchCompute("output=d_ad_orders_na.limit(100)",
-                                             WorkerType=GlueWorkerType.G_1X.value,
-                                             NumberOfWorkers=50,
-                                             GlueVersion="2.0")
-                                        ])
+repeat_d_ad_orders_na = app.create_data(
+    id="REPEAT_AD_ORDERS",
+    inputs=[d_ad_orders_na],
+    compute_targets=[
+        BatchCompute("output=d_ad_orders_na.limit(100)",
+                     WorkerType=GlueWorkerType.G_1X.value,
+                     NumberOfWorkers=50,
+                     GlueVersion="2.0")
+    ])
 
-ducsi_with_AD_orders_NA = app.create_data(id="DUCSI_WITH_AD_ORDERS_NA",
-                               inputs=[
-                                   d_ad_orders_na, # keep it as the first input to make this node adapt its dimension spec (due to default behaviour in AWSApplication::create_data)
-                                   ducsi_data["1"]["*"]
-                               ],
-                               input_dim_links=[
-                                   (ducsi_data('ship_day'),
-                                    lambda dim: dim
-                                    , d_ad_orders_na('order_day'))
-                               ],
-                               compute_targets=[
-                                   BatchCompute("""
-output=d_unified_cust_shipment_items.limit(100).join(d_ad_orders_na.limit(100), ['customer_id']).limit(10).drop(*('customer_id', 'order_day'))
-                                   """,
-                                                WorkerType=GlueWorkerType.G_1X.value,
-                                                NumberOfWorkers=100,
-                                                Timeout=3 * 60,  # 3 hours
-                                                GlueVersion="3.0"
-                                                )
-                               ]
-                               )
-
+ducsi_with_AD_orders_NA = app.create_data(
+    id="DUCSI_WITH_AD_ORDERS_NA",
+    inputs=[
+        d_ad_orders_na,
+        # keep it as the first input to make this node adapt its dimension spec (due to default behaviour in AWSApplication::create_data)
+        ducsi_data["1"]["*"]
+    ],
+    input_dim_links=[
+        (ducsi_data('ship_day'),
+         lambda dim: dim
+         , d_ad_orders_na('order_day'))
+    ],
+    compute_targets=[
+        BatchCompute(
+            """
+            output=d_unified_cust_shipment_items.limit(100).join(d_ad_orders_na.limit(100), ['customer_id']).limit(10).drop(*('customer_id', 'order_day'))
+            """,
+            WorkerType=GlueWorkerType.G_1X.value,
+            NumberOfWorkers=100,
+            Timeout=3 * 60,  # 3 hours
+            GlueVersion="3.0"
+        )
+    ]
+)
 
 # experiment early (warning: will activate the application with the nodes added so far).
-#materialized_output_path = app.execute(repeat_ducsi, ducsi_data[1]['2020-12-01'])
+# materialized_output_path = app.execute(repeat_ducsi, ducsi_data[1]['2020-12-01'])
 
 json_str = app.dev_context.to_json()
 dev_context = CoreData.from_json(json_str)
@@ -171,7 +174,7 @@ path, compute_records = app.poll(ducsi_with_AD_orders_NA["2021-01-13"])
 assert path
 
 ## 2- 2021-02-13
-#app.execute(ducsi_with_AD_orders_NA["2021-02-13"])
+# app.execute(ducsi_with_AD_orders_NA["2021-02-13"])
 
 # INJECT events/signals
 '''

@@ -12,7 +12,7 @@ from intelliflow.core.platform.definitions.aws.sagemaker import notebook
 from intelliflow.core.platform.definitions.aws.sagemaker.common import SAGEMAKER_NOTEBOOK_INSTANCE_ASSUMED_ROLE_USER
 from intelliflow.core.platform.endpoint import DevEndpoint
 
-from ..serialization import Serializable
+from ..serialization import DeserializationError, Serializable, SerializationError
 from ..signal_processing.routing_runtime_constructs import Route
 from ..signal_processing.signal import Signal
 from ..signal_processing.signal_source import SignalSourceType
@@ -20,11 +20,13 @@ from .constructs import (
     BaseConstruct,
     BatchCompute,
     CompositeBatchCompute,
+    CompositeExtension,
     ConstructParamsDict,
     ConstructPermission,
     ConstructPermissionGroup,
     ConstructSecurityConf,
     Diagnostics,
+    Extension,
     ProcessingUnit,
     ProcessorQueue,
     RoutingTable,
@@ -36,12 +38,12 @@ from .definitions.aws.common import (
     AWS_ASSUMED_ROLE_ARN_ROOT,
     AWS_MAX_ROLE_NAME_SIZE,
     IF_DEV_POLICY_NAME_FORMAT,
+    IF_DEV_REMOVED_DRIVERS_TEMP_POLICY_NAME_FORMAT,
     IF_DEV_ROLE_FORMAT,
     IF_DEV_ROLE_NAME_FORMAT,
     IF_EXE_POLICY_NAME_FORMAT,
     IF_EXE_ROLE_FORMAT,
     IF_EXE_ROLE_NAME_FORMAT,
-    MAX_ASSUME_ROLE_DURATION,
     MAX_CHAINED_ROLE_DURATION,
     AWSAccessPair,
 )
@@ -52,7 +54,6 @@ from .definitions.aws.common import (
     delete_inlined_policy,
     delete_role,
     exponential_retry,
-    get_assumed_role_session,
     get_aws_account_id,
     get_caller_identity,
     get_session,
@@ -64,10 +65,13 @@ from .definitions.aws.common import (
     update_role,
     update_role_trust_policy,
 )
+from .definitions.aws.refreshable_session import RefreshableBotoSession
 from .definitions.common import ActivationParams
 from .drivers.compute.aws import AWSGlueBatchComputeBasic
 from .drivers.compute.aws_athena import AWSAthenaBatchCompute
 from .drivers.compute.aws_emr import AWSEMRBatchCompute
+from .drivers.compute.aws_sagemaker.training_job import AWSSagemakerTrainingJobBatchCompute
+from .drivers.compute.aws_sagemaker.transform_job import AWSSagemakerTransformJobBatchCompute
 from .drivers.compute.local import LocalSparkBatchComputeImpl, LocalSparkIPCBatchComputeImpl
 from .drivers.diagnostics.aws import AWSCloudWatchDiagnostics
 from .drivers.diagnostics.local import LocalDiagnosticsImpl
@@ -94,6 +98,7 @@ class RuntimePlatform(Platform):
         batch_compute: BatchCompute,
         routing_table: RoutingTable,
         diagnostics: Diagnostics,
+        extensions: CompositeExtension,
     ) -> None:
         self._context_id = context_id
         self._storage = storage
@@ -102,6 +107,7 @@ class RuntimePlatform(Platform):
         self._batch_compute = batch_compute
         self._routing_table = routing_table
         self._diagnostics = diagnostics
+        self._extensions = extensions
 
         self._serialization_cache = None
 
@@ -115,6 +121,7 @@ class RuntimePlatform(Platform):
         original_to_serialized_map[org_instance._batch_compute] = self._batch_compute
         original_to_serialized_map[org_instance._routing_table] = self._routing_table
         original_to_serialized_map[org_instance._diagnostics] = self._diagnostics
+        original_to_serialized_map[org_instance._extensions] = self._extensions
 
         self._storage.update_serialized_cross_refs(original_to_serialized_map)
         self._processor.update_serialized_cross_refs(original_to_serialized_map)
@@ -122,6 +129,7 @@ class RuntimePlatform(Platform):
         self._batch_compute.update_serialized_cross_refs(original_to_serialized_map)
         self._routing_table.update_serialized_cross_refs(original_to_serialized_map)
         self._diagnostics.update_serialized_cross_refs(original_to_serialized_map)
+        self._extensions.update_serialized_cross_refs(original_to_serialized_map)
 
     def runtime_init(self, context_owner: BaseConstruct) -> None:
         self._storage.runtime_init(self, context_owner)
@@ -130,6 +138,7 @@ class RuntimePlatform(Platform):
         self._batch_compute.runtime_init(self, context_owner)
         self._routing_table.runtime_init(self, context_owner)
         self._diagnostics.runtime_init(self, context_owner)
+        self._extensions.runtime_init(self, context_owner)
 
     # overrides
     def serialize(self) -> str:
@@ -180,6 +189,9 @@ class Configuration(Serializable):
         def with_diagnostics(self, diagnostics: Type[Diagnostics]) -> "_Builder":
             return self._with(diagnostics, Diagnostics)
 
+        def with_extensions(self, extensions: List[Extension.Descriptor]):
+            return self.with_param(CompositeExtension.EXTENSIONS_PARAM, extensions)
+
         def with_param(self, key: str, value: Any) -> "_Builder":
             self._new_conf.add_param(key, value)
             return self
@@ -199,6 +211,7 @@ class Configuration(Serializable):
         default_batch_compute: Type[BatchCompute],
         default_routing_table: Type[RoutingTable],
         default_diagnostics: Type[Diagnostics],
+        default_extensions: Type[CompositeExtension],
     ) -> None:
         self._active_construct_map: Dict[Type[BaseConstruct], Type[BaseConstruct]] = dict()
         self._active_construct_map[Storage] = storage
@@ -207,6 +220,7 @@ class Configuration(Serializable):
         self._active_construct_map[BatchCompute] = default_batch_compute
         self._active_construct_map[RoutingTable] = default_routing_table
         self._active_construct_map[Diagnostics] = default_diagnostics
+        self._active_construct_map[CompositeExtension] = default_extensions
 
         self._activated_construct_instance_map: Dict[Type[BaseConstruct], BaseConstruct] = dict()
 
@@ -297,6 +311,7 @@ class Configuration(Serializable):
         if self._is_downstream:
             raise TypeError(f"A downstream configuration cannot be initiated for development!")
         self._context_id = context_id
+        self.add_param(ActivationParams.CONTEXT_ID, context_id)
         self._add_common_params()
         self.add_param(ActivationParams.UNIQUE_ID_FOR_CONTEXT, self._generate_unique_id_for_context())
 
@@ -323,6 +338,12 @@ class Configuration(Serializable):
 
     @abstractmethod
     def _clean_common_params(self) -> None:
+        pass
+
+    def add_permissions_for_removed_drivers(self, removed_drivers: Set[BaseConstruct]) -> None:
+        pass
+
+    def clean_permissions_for_removed_drivers(self, removed_drivers: Set[BaseConstruct]) -> None:
         pass
 
     @abstractmethod
@@ -379,6 +400,9 @@ class Configuration(Serializable):
 
     def provide_diagnostics(self) -> Diagnostics:
         return self.provide_construct(Diagnostics)
+
+    def provide_extensions(self) -> CompositeExtension:
+        return self.provide_construct(CompositeExtension)
 
     def provide_runtime_trusted_entities(self) -> List[str]:
         return [
@@ -449,6 +473,7 @@ class LocalConfiguration(Configuration):
             LocalSparkBatchComputeImpl,
             LocalRoutingTableImpl,
             LocalDiagnosticsImpl,
+            CompositeExtension,
         )
 
     def _generate_unique_id_for_context(self) -> str:
@@ -493,6 +518,7 @@ class LocalConfiguration(Configuration):
             BatchCompute: {LocalSparkBatchComputeImpl, LocalSparkIPCBatchComputeImpl},
             RoutingTable: {LocalRoutingTableImpl},
             Diagnostics: {LocalDiagnosticsImpl},
+            CompositeExtension: {CompositeExtension},
         }
 
     # overrides
@@ -539,9 +565,10 @@ class AWSConfiguration(Configuration):
             self._new_conf.add_param(AWSCommonParams.AUTHENTICATE_WITH_ACCOUNT_ID, True)
             return self
 
-        def with_dev_role_credentials(self, account_id: str) -> "_Builder":
+        def with_dev_role_credentials(self, account_id: str, auto_update_dev_role: bool = True) -> "_Builder":
             self._new_conf.add_param(AWSCommonParams.ACCOUNT_ID, account_id)
             self._new_conf.add_param(AWSCommonParams.AUTHENTICATE_WITH_DEV_ROLE, True)
+            self._new_conf.add_param(AWSCommonParams.AUTO_UPDATE_DEV_ROLE, auto_update_dev_role)
             return self
 
         def with_dev_access_pair(self, aws_access_key_id: str, aws_secret_access_key: str) -> "_Builder":
@@ -577,6 +604,7 @@ class AWSConfiguration(Configuration):
             CompositeBatchCompute,
             AWSDDBRoutingTable,
             AWSCloudWatchDiagnostics,
+            CompositeExtension,
         )
         # Default BatchCompute driver priority list:
         #   - it determines which computes will be implicitly supported by the platform,
@@ -589,8 +617,10 @@ class AWSConfiguration(Configuration):
             CompositeBatchCompute.BATCH_COMPUTE_DRIVERS_PARAM,
             [
                 AWSAthenaBatchCompute,
-                AWSGlueBatchComputeBasic
-                # AWSEMRBatchCompute
+                AWSGlueBatchComputeBasic,
+                AWSEMRBatchCompute,
+                AWSSagemakerTrainingJobBatchCompute,
+                AWSSagemakerTransformJobBatchCompute,
             ],
         )
 
@@ -697,92 +727,7 @@ class AWSConfiguration(Configuration):
         if_dev_role_name: str = self._build_dev_role_name()
         session_duration = None
 
-        session = None
-        needs_to_check_role: bool = False
-        needs_to_assume_role: bool = False
-        if self._is_upstream:
-            session = self._params[AWSCommonParams.HOST_BOTO_SESSION]
-            # Remote conf/app must have already given permission to us (probably via App::export_to_remote_app) or directly.
-            # so the role switch will succeed and the owner context/app of this app will be loaded seamlessly.
-            needs_to_assume_role = True
-        elif AWSCommonParams.AUTHENTICATE_WITH_DEV_ROLE in self._params:
-            # first always get the root session (account based one, also an assumed-role per user)
-            # - to check the existence of the role first
-            # - then either enforce role based retrieval (if exists and also the admin role is not already a trustee)
-            # - or create the role using the root credentials and then assume it (if not exists)
-            self._params[AWSCommonParams.IF_DEV_ROLE] = self._build_dev_role()
-            admin_session = get_session_with_account(self._params[AWSCommonParams.ACCOUNT_ID], self._params[AWSCommonParams.REGION])
-
-            dev_role_exists: bool = False
-            already_in_trust_policy: bool = False
-            try:
-                if has_role(if_dev_role_name, admin_session):
-                    dev_role_exists = True
-                    admin_identity: str = get_caller_identity(admin_session, self._params[AWSCommonParams.REGION])
-                    if is_in_role_trust_policy(if_dev_role_name, admin_session, admin_identity):
-                        already_in_trust_policy = True
-            except Exception as err:
-                module_logger.error(
-                    f"Could not get credentials for account {self._params[AWSCommonParams.ACCOUNT_ID]}. "
-                    f"Please check your permissions with the account. If you think that this is temporary"
-                    f" then try again in a moment. Error: {str(err)}"
-                )
-                raise err
-
-            if dev_role_exists and not already_in_trust_policy:
-                # enforce role-based credentials which would not require trust-policy modifications
-                # (handled by IIBS broker service). But necessary set-up against the role must have been completed
-                # via Conduit (bindle based delegation to broker service).
-                session = get_session(self._params[AWSCommonParams.IF_DEV_ROLE], self._params[AWSCommonParams.REGION])
-                # check the new session and fail early with a proper message
-                try:
-                    self._params[AWSCommonParams.ACCOUNT_ID] = get_aws_account_id(session, self._params[AWSCommonParams.REGION])
-                except Exception as err:
-                    module_logger.error(
-                        f"Could not get credentials for role {self._params[AWSCommonParams.IF_DEV_ROLE]!r}."
-                        f"If you think that this is temporary then try again in a moment. Error: {str(err)}"
-                    )
-                    raise err
-            else:
-                # use the session as admin credentials to set things up and then assume.
-                # note: the reason we cannot use this as the default mode is that
-                # we cannot keep assuming on behalf of different users since they need to be added to the dev-role
-                # trust-policy which has an ACL (2 KB) limit. so for common applications to be accessed by different
-                # users, this mode is not possible.
-                # one exception: if the admin role is already in the trust policy of the dev-role (e.g the original
-                # creator of the app/role, where 'already_in_trust_policy = True'), then we use it as is.
-                session = admin_session
-                needs_to_check_role = True
-                needs_to_assume_role = True
-                session_duration = MAX_CHAINED_ROLE_DURATION
-        elif AWSCommonParams.IF_ACCESS_PAIR in self._params:
-            # session that can assume IF_DEV_ROLE
-            session = get_session(self._params[AWSCommonParams.IF_ACCESS_PAIR], self._params[AWSCommonParams.REGION], False)
-            needs_to_assume_role = True
-        elif AWSCommonParams.IF_ADMIN_ROLE in self._params:
-            # session that can check/create/delete IF_DEV_ROLE and then assume it
-            session = get_session(self._params[AWSCommonParams.IF_ADMIN_ROLE], self._params[AWSCommonParams.REGION])
-            needs_to_check_role = True
-            needs_to_assume_role = True
-        elif AWSCommonParams.IF_ADMIN_ACCESS_PAIR in self._params:
-            # session that can check/create/delete IF_ROLE and then assume it
-            session = get_session(self._params[AWSCommonParams.IF_ADMIN_ACCESS_PAIR], self._params[AWSCommonParams.REGION])
-            needs_to_check_role = True
-            needs_to_assume_role = True
-        elif AWSCommonParams.ACCOUNT_ID in self._params and self._params.get(AWSCommonParams.AUTHENTICATE_WITH_ACCOUNT_ID, False):
-            session = get_session(
-                IF_DEV_ROLE_FORMAT.format(self._params[AWSCommonParams.ACCOUNT_ID], self._context_id, self._params[AWSCommonParams.REGION]),
-                self._params[AWSCommonParams.REGION],
-            )
-        else:  # use system defaults
-            # treat the credentials as a
-            session = get_session(None, self._params[AWSCommonParams.REGION], None)
-            needs_to_check_role = self._params.get(AWSCommonParams.DEFAULT_CREDENTIALS_AS_ADMIN, False)
-            # we should still obey the grand permission scope determined by configuration (i.e dev-time
-            # permissions declared by drivers).
-            # also we have to make sure that everything we do during dev is doable by dev-role
-            # this is important for cross-app collaboration scheme to work.
-            needs_to_assume_role = True
+        needs_to_assume_role, needs_to_check_role, session = self._setup_session(if_dev_role_name)
 
         if AWSCommonParams.ACCOUNT_ID not in self._params:
             self._params[AWSCommonParams.ACCOUNT_ID] = get_aws_account_id(session, self._params[AWSCommonParams.REGION])
@@ -845,12 +790,6 @@ class AWSConfiguration(Configuration):
                     exponential_retry(
                         attach_aws_managed_policy, ["ServiceFailureException"], if_dev_role_name, "AmazonSageMakerFullAccess", session
                     )
-                    module_logger.info(
-                        f"If the new dev-role will be accessed by different users, do not forget to federate it or "
-                        f"change its trustees manually. "
-                        f"Note: This owner/creator session will later be allowed to access the application"
-                        f" even without that setup."
-                    )
                 else:
                     # TODO support restoration of trusted-services as well (e.g. if role's trust policy is not manually restored after Conduit wipes it out).
                     # so basically support 'services' in 'update_role_trust_policy' (add 'sagemaker.amazonaws.com').
@@ -890,18 +829,11 @@ class AWSConfiguration(Configuration):
                     put_inlined_policy(
                         if_dev_role_name, IF_DEV_POLICY_NAME_FORMAT.format(self._context_id), set(devrole_permissions), session
                     )
-                    # admin mode dev role
-                    # put_inlined_policy(if_dev_role_name,
-                    #                             IF_DEV_POLICY_NAME_FORMAT.format(self._context_id),
-                    #                             {ConstructPermission(["*"], ["*"])},
-                    #                             session)
 
             # switch IF_ROLE (raise if not possible)
             if needs_to_assume_role:
                 if self._is_upstream or get_caller_identity(session, self._params[AWSCommonParams.REGION]) != if_dev_role:
                     module_logger.info("Assuming role: {0}".format(if_dev_role))
-                    if not session_duration:
-                        session_duration = MAX_ASSUME_ROLE_DURATION if not self._is_upstream else MAX_CHAINED_ROLE_DURATION
                     # when used in a downstream app (wnen this conf is upstream), downstream app will be the host. so
                     # downstream app will have its own unique session name for assumed-upstream-role
                     context_id_as_session_name = (
@@ -909,13 +841,116 @@ class AWSConfiguration(Configuration):
                         if not self._is_upstream
                         else self._params[ActivationParams.UNIQUE_ID_FOR_HOST_CONTEXT]
                     )
-                    session = get_assumed_role_session(if_dev_role, session, session_duration, context_id=context_id_as_session_name)
+                    session = RefreshableBotoSession(
+                        role_arn=if_dev_role,
+                        session_name=context_id_as_session_name,
+                        base_session=session,
+                    ).refreshable_session()
                 else:
                     module_logger.info(
                         f"Skipping assume_role call for the development role," f" since the caller identity is already {if_dev_role}"
                     )
+            else:
+                # This means the session is already created by DEV_ROLE, we can make it refreshable
+                session = RefreshableBotoSession(
+                    # TODO: Shall we pass rola_arn and session_name here? both args are optional,
+                    #  not sure whether they are needed in collaboration?
+                    # role_arn=self._params[AWSCommonParams.IF_DEV_ROLE],
+                    # session_name="""??????""",
+                    base_session=session,
+                    duration_seconds=session_duration,
+                ).refreshable_session()
 
         self.add_param(AWSCommonParams.BOTO_SESSION, session)
+
+    def _setup_session(self, if_dev_role_name):
+        session = None
+        needs_to_check_role: bool = False
+        needs_to_assume_role: bool = False
+        if self._is_upstream:
+            session = self._params[AWSCommonParams.HOST_BOTO_SESSION]
+            # Remote conf/app must have already given permission to us (probably via App::export_to_remote_app) or directly.
+            # so the role switch will succeed and the owner context/app of this app will be loaded seamlessly.
+            needs_to_assume_role = True
+        elif AWSCommonParams.AUTHENTICATE_WITH_DEV_ROLE in self._params:
+            # first always get the root session (account based one, also an assumed-role per user)
+            # - to check the existence of the role first
+            # - then either enforce role based retrieval (if exists and also the admin role is not already a trustee)
+            # - or create the role using the root credentials and then assume it (if not exists)
+            self._params[AWSCommonParams.IF_DEV_ROLE] = self._build_dev_role()
+            admin_session = get_session_with_account(self._params[AWSCommonParams.ACCOUNT_ID], self._params[AWSCommonParams.REGION])
+
+            dev_role_exists: bool = False
+            already_in_trust_policy: bool = False
+            try:
+                if has_role(if_dev_role_name, admin_session):
+                    dev_role_exists = True
+                    admin_identity: str = get_caller_identity(admin_session, self._params[AWSCommonParams.REGION])
+                    if is_in_role_trust_policy(if_dev_role_name, admin_session, admin_identity):
+                        already_in_trust_policy = True
+            except Exception as err:
+                module_logger.error(
+                    f"Could not get credentials for account {self._params[AWSCommonParams.ACCOUNT_ID]}. "
+                    f"Please check your permissions with the account. If you think that this is temporary"
+                    f" then try again in a moment. Error: {str(err)}"
+                )
+                raise err
+
+            if dev_role_exists and not already_in_trust_policy:
+                # enforce role-based credentials which would not require trust-policy modifications
+                # (handled by IIBS broker service). But necessary set-up against the role must have been completed
+                # via Conduit (bindle based delegation to broker service).
+                session = get_session(self._params[AWSCommonParams.IF_DEV_ROLE], self._params[AWSCommonParams.REGION])
+                # check the new session and fail early with a proper message
+                try:
+                    self._params[AWSCommonParams.ACCOUNT_ID] = get_aws_account_id(session, self._params[AWSCommonParams.REGION])
+                except Exception as err:
+                    module_logger.error(
+                        f"Could not get credentials for role {self._params[AWSCommonParams.IF_DEV_ROLE]!r}."
+                        f"If you think that this is temporary then try again in a moment. Error: {str(err)}"
+                    )
+                    raise err
+            else:
+                # use the session as admin credentials to set things up and then assume.
+                # note: the reason we cannot use this as the default mode is that
+                # we cannot keep assuming on behalf of different users since they need to be added to the dev-role
+                # trust-policy which has an ACL (2 KB) limit. so for common applications to be accessed by different
+                # users, this mode is not possible.
+                # one exception: if the admin role is already in the trust policy of the dev-role (e.g the original
+                # creator of the app/role, where 'already_in_trust_policy = True'), then we use it as is.
+                session = admin_session
+                needs_to_check_role = True
+                needs_to_assume_role = True
+                session_duration = MAX_CHAINED_ROLE_DURATION
+        elif AWSCommonParams.IF_ACCESS_PAIR in self._params:
+            # session that can assume IF_DEV_ROLE
+            session = get_session(self._params[AWSCommonParams.IF_ACCESS_PAIR], self._params[AWSCommonParams.REGION])
+            needs_to_assume_role = True
+        elif AWSCommonParams.IF_ADMIN_ROLE in self._params:
+            # session that can check/create/delete IF_DEV_ROLE and then assume it
+            session = get_session(self._params[AWSCommonParams.IF_ADMIN_ROLE], self._params[AWSCommonParams.REGION])
+            needs_to_check_role = True
+            needs_to_assume_role = True
+        elif AWSCommonParams.IF_ADMIN_ACCESS_PAIR in self._params:
+            # session that can check/create/delete IF_ROLE and then assume it
+            session = get_session(self._params[AWSCommonParams.IF_ADMIN_ACCESS_PAIR], self._params[AWSCommonParams.REGION])
+            needs_to_check_role = True
+            needs_to_assume_role = True
+        elif AWSCommonParams.ACCOUNT_ID in self._params and self._params.get(AWSCommonParams.AUTHENTICATE_WITH_ACCOUNT_ID, False):
+            session = get_session(
+                IF_DEV_ROLE_FORMAT.format(self._params[AWSCommonParams.ACCOUNT_ID], self._context_id, self._params[AWSCommonParams.REGION]),
+                self._params[AWSCommonParams.REGION],
+            )
+        else:  # use system defaults
+            # treat the credentials as a
+            session = get_session(None, self._params[AWSCommonParams.REGION], None)
+            needs_to_check_role = self._params.get(AWSCommonParams.DEFAULT_CREDENTIALS_AS_ADMIN, False)
+            # we should still obey the grand permission scope determined by configuration (i.e dev-time
+            # permissions declared by drivers).
+            # also we have to make sure that everything we do during dev is doable by dev-role
+            # this is important for cross-app collaboration scheme to work.
+            needs_to_assume_role = True
+        return needs_to_assume_role, needs_to_check_role, session
 
     def get_admin_session(self) -> "boto3.Session":
         if_dev_role_name: str = self._build_dev_role_name()
@@ -937,7 +972,7 @@ class AWSConfiguration(Configuration):
         elif AWSCommonParams.IF_ACCESS_PAIR in self._params:
             # session that can assume IF_DEV_ROLE
             module_logger.critical("Attempting to use initial AWS Credentials pair as admin...")
-            admin_session = get_session(self._params[AWSCommonParams.IF_ACCESS_PAIR], self._params[AWSCommonParams.REGION], False)
+            admin_session = get_session(self._params[AWSCommonParams.IF_ACCESS_PAIR], self._params[AWSCommonParams.REGION])
         elif AWSCommonParams.IF_ADMIN_ROLE in self._params:
             # session that can check/create/delete IF_DEV_ROLE
             admin_session = get_session(self._params[AWSCommonParams.IF_ADMIN_ROLE], self._params[AWSCommonParams.REGION])
@@ -976,6 +1011,28 @@ class AWSConfiguration(Configuration):
                 module_logger.critical(f"You might consider removing it manually.")
 
     # override
+    def add_permissions_for_removed_drivers(self, removed_drivers: Set[BaseConstruct]) -> None:
+        if removed_drivers:
+            devrole_permissions = set(p for r in removed_drivers for p in r.provide_devtime_permissions(self._params))
+
+            if devrole_permissions:
+                session = self._params[AWSCommonParams.BOTO_SESSION]
+                if_dev_role_name: str = self._build_dev_role_name()
+                put_inlined_policy(
+                    if_dev_role_name,
+                    IF_DEV_REMOVED_DRIVERS_TEMP_POLICY_NAME_FORMAT.format(self._context_id),
+                    set(devrole_permissions),
+                    session,
+                )
+
+    # override
+    def clean_permissions_for_removed_drivers(self, removed_drivers: Set[BaseConstruct]) -> None:
+        if removed_drivers:
+            session = self._params[AWSCommonParams.BOTO_SESSION]
+            if_dev_role_name: str = self._build_dev_role_name()
+            delete_inlined_policy(if_dev_role_name, IF_DEV_REMOVED_DRIVERS_TEMP_POLICY_NAME_FORMAT.format(self._context_id), session)
+
+    # override
     def _setup_runtime_params(self) -> None:
         # setup common params to be used by constructs during activation
         # into self._params
@@ -986,22 +1043,31 @@ class AWSConfiguration(Configuration):
         session = self._params[AWSCommonParams.BOTO_SESSION]
         # check the role first
         if not has_role(if_exe_role_name, session):
-            create_role(if_exe_role_name, session, self._params[AWSCommonParams.REGION], False, self.provide_runtime_trusted_entities())
-        else:
-            update_role(if_exe_role_name, session, self._params[AWSCommonParams.REGION], False, self.provide_runtime_trusted_entities())
+            create_role(
+                if_exe_role_name,
+                session,
+                self._params[AWSCommonParams.REGION],
+                False,
+                self.provide_runtime_trusted_entities(),
+                # will cause malformed entity if the role is new
+                # [if_exe_role],
+            )
+        update_role(
+            if_exe_role_name,
+            session,
+            self._params[AWSCommonParams.REGION],
+            False,
+            self.provide_runtime_trusted_entities(),
+            [if_exe_role],
+        )
 
         for managed_policy in self.provide_runtime_default_policies():
             exponential_retry(attach_aws_managed_policy, ["ServiceFailureException"], if_exe_role_name, managed_policy, session)
 
-        # update no matter
+        # always update
         put_inlined_policy(
             if_exe_role_name, IF_EXE_POLICY_NAME_FORMAT.format(self._context_id), set(self.provide_runtime_construct_permissions()), session
         )
-        # Temporarily, all of the trusted entities will have admin access.
-        # put_inlined_policy(if_exe_role_name,
-        #                             IF_EXE_POLICY_NAME_FORMAT.format(self._context_id),
-        #                             [ConstructPermission(["*"], ["*"])],
-        #                             session)
 
     # override
     def _clean_runtime_params(self) -> None:
@@ -1065,9 +1131,12 @@ class AWSConfiguration(Configuration):
                 AWSAthenaBatchCompute,
                 AWSGlueBatchComputeBasic,
                 AWSEMRBatchCompute,
+                AWSSagemakerTrainingJobBatchCompute,
+                AWSSagemakerTransformJobBatchCompute,
             },
             RoutingTable: {AWSDDBRoutingTable},
             Diagnostics: {AWSCloudWatchDiagnostics},
+            CompositeExtension: {CompositeExtension},
         }
 
     # overrides
@@ -1103,6 +1172,8 @@ class AWSConfiguration(Configuration):
 class DevelopmentPlatform(Platform):
     def __init__(self, conf: Configuration):
         assert conf, f"Configuration is not valid!"
+        self._enforce_runtime_compatibility = True
+        self._incompatible_runtime = False
         self._context_id = None
         self._conf = conf
 
@@ -1116,6 +1187,19 @@ class DevelopmentPlatform(Platform):
         self._batch_compute = self._conf.get_active_construct(BatchCompute)
         self._routing_table = self._conf.get_active_construct(RoutingTable)
         self._diagnostics = self._conf.get_active_construct(Diagnostics)
+        self._extensions = self._conf.get_active_construct(CompositeExtension)
+
+    @property
+    def enforce_runtime_compatibility(self) -> bool:
+        return getattr(self, "_enforce_runtime_compatibility", True)
+
+    @enforce_runtime_compatibility.setter
+    def enforce_runtime_compatibility(self, enforce: bool) -> None:
+        self._enforce_runtime_compatibility = enforce
+
+    @property
+    def incompatible_runtime(self) -> bool:
+        return getattr(self, "_incompatible_runtime", False)
 
     @property
     def conf(self) -> Configuration:
@@ -1126,9 +1210,17 @@ class DevelopmentPlatform(Platform):
         self._context_id = context_id
         self._conf.dev_init(context_id)
         self._init_storage_construct()
+        synced = False
         if self.should_load_constructs() and self._check_platform_exists():
-            self._load_constructs()
-        else:
+            try:
+                self._load_constructs()
+                synced = True
+            except (ModuleNotFoundError, AttributeError, SerializationError, DeserializationError) as error:
+                self._incompatible_runtime = True
+                module_logger.critical(f"Active platform state is not compatible! Error: {error!r}")
+                if self.enforce_runtime_compatibility:
+                    raise error
+        if not synced:
             self._provide_constructs()
         self._init_constructs()
 
@@ -1151,6 +1243,7 @@ class DevelopmentPlatform(Platform):
         self._batch_compute = self._conf.provide_batch_compute()
         self._routing_table = self._conf.provide_routing_table()
         self._diagnostics = self._conf.provide_diagnostics()
+        self._extensions = self._conf.provide_extensions()
 
     def _init_constructs(self) -> None:
         self._processor.dev_init(self)
@@ -1158,6 +1251,7 @@ class DevelopmentPlatform(Platform):
         self._batch_compute.dev_init(self)
         self._routing_table.dev_init(self)
         self._diagnostics.dev_init(self)
+        self._extensions.dev_init(self)
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(conf={repr(self._conf)})"
@@ -1170,6 +1264,7 @@ class DevelopmentPlatform(Platform):
         self._batch_compute = persisted_platform.batch_compute
         self._routing_table = persisted_platform.routing_table
         self._diagnostics = persisted_platform.diagnostics
+        self._extensions = persisted_platform.extensions
 
     @abstractmethod
     def should_load_constructs(self) -> bool:
@@ -1264,6 +1359,7 @@ class HostPlatform(DevelopmentPlatform):
         self._batch_compute = self._check_update(persisted_platform.batch_compute, BatchCompute)
         self._routing_table = self._check_update(persisted_platform.routing_table, RoutingTable)
         self._diagnostics = self._check_update(persisted_platform.diagnostics, Diagnostics)
+        self._extensions = self._check_update(persisted_platform.extensions, CompositeExtension)
 
     # overrides
     def should_load_constructs(self) -> bool:
@@ -1324,6 +1420,9 @@ class HostPlatform(DevelopmentPlatform):
         for const_type, const_ins in self._conf._activated_construct_instance_map.items():
             const_conf = security_conf.get(const_type, None)
             const_ins.hook_security_conf(const_conf, security_conf)
+
+    def add_dashboards(self, dashboards: Dict[str, Any]):
+        self.diagnostics.hook_dashboards(dashboards)
 
     def connect_external(self, signals: List[Signal]) -> None:
         for const_ins in self._conf._activated_construct_instance_map.values():
@@ -1459,10 +1558,27 @@ class HostPlatform(DevelopmentPlatform):
             for signal in internal_signal_list:
                 self.connect_internal_signal(signal)
 
+    def _terminate_replaced_drivers(self) -> None:
+        for replaced_construct in self._replaced_constructs:
+            replaced_construct.terminate()
+        self._replaced_constructs.clear()
+
+    def _get_all_removed_drivers(self) -> Set[BaseConstruct]:
+        removed_drivers = set(self._replaced_constructs)
+        if isinstance(self.batch_compute, CompositeBatchCompute):
+            removed_drivers = removed_drivers.union(set(self.batch_compute.removed_drivers))
+
+        removed_drivers = removed_drivers.union(set(self.extensions.removed_extensions))
+
+        return removed_drivers
+
     def activate(self) -> None:
         self._connect_auto_internal_signals()
 
         self._conf.activate()
+        all_removed_drivers = self._get_all_removed_drivers()
+        self._conf.add_permissions_for_removed_drivers(all_removed_drivers)
+        self._terminate_replaced_drivers()
         self._conf.authorize(list(self._downstream_connections.values()))
         self._conf.unauthorize(list(self._removed_downstream_connections.values()))
 
@@ -1481,11 +1597,14 @@ class HostPlatform(DevelopmentPlatform):
             activated_constructs.append(self.processor)
             self.diagnostics.activate()
             activated_constructs.append(self.diagnostics)
+            self.extensions.activate()
+            activated_constructs.append(self.extensions)
             # end PARALLEL EXEC
 
             self._process_signals()
             self._process_connections()
             self._process_security_conf()
+            self._process_dashboards()
 
             self._process_upstream_connections()
 
@@ -1497,6 +1616,7 @@ class HostPlatform(DevelopmentPlatform):
                 self.batch_compute,
                 self.routing_table,
                 self.diagnostics,
+                self.extensions,
             )
             self._update_bootstrapper(runtime_bootstrapper)
         except Exception as ex:
@@ -1504,14 +1624,8 @@ class HostPlatform(DevelopmentPlatform):
             self._rollback(activated_constructs)
             raise
 
+        self._conf.clean_permissions_for_removed_drivers(all_removed_drivers)
         self._activation_completed()
-        # TODO terminate() is not called here since prev construct might actually be embedded within a container
-        #  construct/driver (as in the case for CompositeBatchCompute and Glue Driver where the latter can be contained
-        #  by the former as is). So in that case, we cannot auto-terminate a replaced driver. Driver itself should
-        #  decide via 'replaced' callback or more specifically via 'should_terminate_during_update'.
-        # for replaced_construct in self._replaced_constructs:
-        #    replaced_construct.replaced(self)
-        self._replaced_constructs.clear()
 
         # everything went well. we can capture this platform as the active one
         self._storage.save(self.serialize(True), [Platform.__name__], DevelopmentPlatform.__name__)
@@ -1539,6 +1653,9 @@ class HostPlatform(DevelopmentPlatform):
     def _process_security_conf(self):
         for const_ins in self._conf._activated_construct_instance_map.values():
             const_ins.process_security_conf()
+
+    def _process_dashboards(self):
+        self.diagnostics.process_dashboards()
 
     def pause(self) -> None:
         for const_ins in self._conf._activated_construct_instance_map.values():
@@ -1577,6 +1694,8 @@ class HostPlatform(DevelopmentPlatform):
             self.routing_table.terminate()
         if not self.diagnostics.terminated:
             self.diagnostics.terminate()
+        if not self.extensions.terminated:
+            self.extensions.terminate()
         self.storage.deactivate()
         self._conf.terminate()
 
@@ -1677,6 +1796,14 @@ class RemotePlatform(DevelopmentPlatform):
         self._conf.restore_active_construct(ProcessorQueue, persisted_platform.processor_queue)
         self._conf.restore_active_construct(BatchCompute, persisted_platform.batch_compute)
         self._conf.restore_active_construct(RoutingTable, persisted_platform.routing_table)
+        self._conf.restore_active_construct(Diagnostics, persisted_platform.diagnostics)
+        # FUTURE leave restore_active_construct only when "platform extensions" release is complete
+        # case: when the parent platform has been activated with the extensions support, then we will set None here
+        if persisted_platform.extensions:
+            self._conf.restore_active_construct(CompositeExtension, persisted_platform.extensions)
+        else:  # dummy "extensions" to unblock remote platform loading
+            self._conf._active_construct_map[CompositeExtension] = CompositeExtension
+            self._extensions = self._conf.provide_extensions()
 
     # overrides
     def _provide_constructs(self) -> None:

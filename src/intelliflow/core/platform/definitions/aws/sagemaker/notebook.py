@@ -83,16 +83,24 @@ rm -rf rip_python_helper
 EOF
 
 echo 'Restarting the Jupyter server..'
-#restart jupyter-server
-sudo initctl restart jupyter-server --no-wait
+
+# restart command is dependent on current running Amazon Linux and JupyterLab
+CURR_VERSION=$(cat /etc/os-release)
+if [[ $CURR_VERSION == *$"http://aws.amazon.com/amazon-linux-ami/"* ]]; then
+    sudo initctl restart jupyter-server --no-wait
+else
+    sudo systemctl --no-block restart jupyter-server.service
+fi
 """
         return start_script
 
     def _generate_creation_script(self) -> str:
         # safety belt: this will raise if an upgrade in IF (like into 3.8+) will ignore this module.
-        miniconda_url = {"3.7": "https://repo.anaconda.com/miniconda/Miniconda3-py37_4.8.3-Linux-x86_64.sh"}[
-            f"{PYTHON_VERSION_MAJOR}.{PYTHON_VERSION_MINOR}"
-        ]
+        miniconda_url = {
+            "3.7": "https://repo.anaconda.com/miniconda/Miniconda3-py37_4.8.3-Linux-x86_64.sh",
+            "3.8": "https://repo.anaconda.com/miniconda/Miniconda3-py38_4.8.3-Linux-x86_64.sh",
+            "3.9": "https://repo.anaconda.com/miniconda/Miniconda3-py39_4.8.3-Linux-x86_64.sh",
+        }[f"{PYTHON_VERSION_MAJOR}.{PYTHON_VERSION_MINOR}"]
 
         create_script = f"""
 #!/bin/bash

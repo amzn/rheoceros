@@ -7,9 +7,9 @@ from enum import Enum, unique
 
 from intelliflow.core.entity import CoreData
 from intelliflow.core.platform.platform import Platform
-from intelliflow.core.serialization import dumps, loads
+from intelliflow.core.serialization import DeserializationError, SerializationError, dumps, loads
 
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 
 @unique
@@ -32,22 +32,35 @@ class _PersistedState(CoreData):
 
 
 class CoreApplication(ABC):
-    def __init__(self, id: ApplicationID, platform: Platform) -> None:
+    def __init__(self, id: ApplicationID, platform: Platform, enforce_runtime_compatibility: bool = True) -> None:
         assert id, "Application ID cannot be empty or None!"
         # TODO make platform (underlying conf) check ApplicationID
         self._id = id
+        self._enforce_runtime_compatibility = enforce_runtime_compatibility
+        self._incompatible_runtime = False
         self._platform: Platform = platform
+        self._platform._enforce_runtime_compatibility = enforce_runtime_compatibility
+        # platform sync/initialization should happen when context ID is set
         self._platform.context_id = id
         # now platform is bound to this context, we can use it to check existing state
         self._sync()
 
     def _sync(self) -> None:
-        if self._platform.storage.check_object([CoreApplication.__name__], _PersistedState.__name__):
-            persisted_state: _PersistedState = self._load()
-            self._state: ApplicationState = persisted_state.state
-            self._active_context: "Context" = loads(persisted_state.serialized_active_context)
-            self._active_context._deserialized_init(self._platform)
-        else:
+        synced = False
+        try:
+            if self._platform.storage.check_object([CoreApplication.__name__], _PersistedState.__name__):
+                persisted_state: _PersistedState = self._load()
+                self._state: ApplicationState = persisted_state.state
+                self._active_context: "Context" = loads(persisted_state.serialized_active_context)
+                self._active_context._deserialized_init(self._platform)
+                synced = True
+        except (ModuleNotFoundError, AttributeError, SerializationError, DeserializationError) as error:
+            self._incompatible_runtime = True
+            logger.critical(f"Active application state is not compatible! Error: {error!r}")
+            if self._enforce_runtime_compatibility:
+                raise error
+
+        if not synced:
             self._state: ApplicationState = ApplicationState.INACTIVE
             self._active_context: "Context" = None
 

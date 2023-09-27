@@ -16,6 +16,7 @@ from intelliflow.core.platform.definitions.aws.glue.script.batch.common import (
     BOOTSTRAPPER_PLATFORM_KEY_PARAM,
     CLIENT_CODE_BUCKET,
     CLIENT_CODE_PARAM,
+    EXECUTION_ID,
     INPUT_MAP_PARAM,
     JOB_NAME_PARAM,
     OUTPUT_PARAM,
@@ -33,6 +34,7 @@ class GlueDefaultABIPython:
         BOOTSTRAPPER_PLATFORM_KEY_PARAM,
         USER_EXTRA_PARAMS_PARAM,
         AWS_REGION,
+        EXECUTION_ID,
     }
 
     def __init__(self, var_args: Optional[Set[str]] = None, prologue_code: Optional[str] = None, epilogue_code: Optional[str] = None):
@@ -127,13 +129,16 @@ def create_query(database: str, table_name: str, partition_keys, all_partitions)
               SELECT * FROM {{pr_tb}}
                   {{" WHERE " + where_clause if where_clause else ""}}
             '''
-
+            
 job = Job(glueContext)
 job.init(args['{JOB_NAME_PARAM}'], args)
 
 input_map = json.loads(input_map_str)
 
 def load_input_df(input, sc, aws_region):
+    if input.get("data_type", "dataset") not in ["dataset", None]:
+        return None
+        
     if input['encryption_key']:
         # first set encryption (if defined)
         if input['resource_type'] == 'S3':
@@ -196,7 +201,7 @@ def load_input_df(input, sc, aws_region):
                 if input['data_format'] == 'parquet':
                     new_df = spark.read.parquet(resource_path)
                 else:
-                    new_df = spark.read.load(resource_path, format=input['data_format'], sep=input['delimiter'], inferSchema='true', header='true')
+                    new_df = spark.read.load(resource_path, format=input['data_format'], sep=input['delimiter'], inferSchema='true', header=input['data_header_exists'])
             # Path not found exception is considered Analysis Exception within Spark code. Please check the
             # link below for reference.
             # https://github.com/apache/spark/blob/1b609c7dcfc3a30aefff12a71aac5c1d6273b2c0/sql/catalyst/src/main/scala/org/apache/spark/sql/errors/QueryCompilationErrors.scala#L977
@@ -206,7 +211,11 @@ def load_input_df(input, sc, aws_region):
                         logger.error("{{0}} path does not exist. Since range check is not required. Continuing with next available path".format(resource_path))
                         continue
                 raise e
-        input_df = input_df.unionAll(new_df) if input_df else new_df
+        if input_df and len(input_df.columns) > 0: 
+            if len(new_df.columns) > 0: # skip empty "partition" 
+                input_df = input_df.unionAll(new_df)
+        else:
+            input_df = new_df
         if input['nearest_the_tip_in_range']:
             break
     if input_df is None:
@@ -228,10 +237,12 @@ for i, input in enumerate(input_map['data_inputs']):
     if input['alias']:
         exec('{{0}} = input_df'.format(input['alias']))
         exec('{{0}}_signal = input_signal'.format(input['alias']))
-        input_df.registerTempTable(input['alias'])
+        if input_df is not None:
+            input_df.registerTempTable(input['alias'])
     exec('input{{0}} = input_df'.format(i))
     exec('input{{0}}_signal = input_signal'.format(i))
-    input_df.registerTempTable('input{{0}}'.format(i))
+    if input_df is not None:
+        input_df.registerTempTable('input{{0}}'.format(i))
 
 # assign timers to user provided alias'
 for i, input in enumerate(input_map['timers']):
@@ -241,6 +252,13 @@ for i, input in enumerate(input_map['timers']):
         exec('{{0}}_signal = input_signal'.format(input['alias']))
     exec('timer{{0}} = "{{1}}"'.format(i, input['time']))
     exec('timer{{0}}_signal = input_signal'.format(i))
+    
+# assign other signals to user provided alias'
+for i, input in enumerate(input_map['other_signals']):
+    input_signal = Signal.deserialize(input['serialized_signal'])
+    if input['alias']:
+        exec('{{0}} = "{{1}}"'.format(input['alias'], input['time']))
+        exec('{{0}}_signal = input_signal'.format(input['alias']))
 
 output_param = json.loads(output_str)
 output_signal = Signal.deserialize(output_param['serialized_signal'])
@@ -273,7 +291,7 @@ if not output:
 
 output.write\\
       .format(output_param['data_format'])\\
-      .option("header", True)\\
+      .option("header", output_param['data_header_exists'])\\
       .option("delimiter", output_param['delimiter'])\\
       .mode("overwrite")\\
       .save(output_param['resource_materialized_path'])
@@ -281,11 +299,12 @@ output.write\\
 # save schema
 try:
     output_signal_internal = runtime_platform.storage.map_materialized_signal(output_signal)
-    # this implicitly calls _jdf.schema().json() and then json.loads, so avoiding it now directly using _jdf.
-    # schema_data = json.dumps(output.schema.jsonValue())
-    schema_data = output._jdf.schema().json()
     schema_file = output_signal_internal.resource_access_spec.data_schema_file
-    runtime_platform.storage.save(schema_data, [], output_signal_internal.get_materialized_resource_paths()[0].strip("/") + "/" + schema_file)
+    if schema_file:
+        # this implicitly calls _jdf.schema().json() and then json.loads, so avoiding it now directly using _jdf.
+        # schema_data = json.dumps(output.schema.jsonValue())
+        schema_data = output._jdf.schema().json()
+        runtime_platform.storage.save(schema_data, [], output_signal_internal.get_materialized_resource_paths()[0].strip("/") + "/" + schema_file)
 except Exception as error:
     # note: critical is not supported via Glue logger
     logger.error("RheocerOS: An error occurred while trying to create schema! Error: " + str(error))

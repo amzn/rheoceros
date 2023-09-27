@@ -2,11 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import copy
+import json
 import logging
+import os
+import socket
 import time
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Type, Union, cast
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Set, Tuple, Type, Union, cast
 
 from intelliflow.core.application.context.context import Context
 from intelliflow.core.application.context.instruction import Instruction
@@ -19,18 +22,20 @@ from intelliflow.core.application.context.node.internal.alarm.nodes import Inter
 from intelliflow.core.application.context.node.internal.metric.nodes import InternalMetricNode
 from intelliflow.core.application.context.node.internal.nodes import InternalDataNode
 from intelliflow.core.application.context.node.marshaling.nodes import MarshalerNode, MarshalingView
+from intelliflow.core.deployment import is_on_remote_dev_env
 from intelliflow.core.entity import CoreData
 from intelliflow.core.platform.compute_targets.descriptor import ComputeDescriptor
 from intelliflow.core.platform.constructs import BaseConstruct, ConstructSecurityConf, FeedBackSignalProcessingMode, RoutingTable
 from intelliflow.core.platform.definitions.compute import (
     ComputeFailedSessionState,
     ComputeFailedSessionStateType,
+    ComputeLogQuery,
     ComputeResponseType,
     ComputeSessionStateType,
 )
 from intelliflow.core.platform.development import Configuration, HostPlatform
 from intelliflow.core.platform.endpoint import DevEndpoint
-from intelliflow.core.serialization import dumps, loads
+from intelliflow.core.serialization import DeserializationError, SerializationError, dumps, loads
 from intelliflow.core.signal_processing.definitions.dimension_defs import NameType as OutputDimensionNameType
 from intelliflow.core.signal_processing.definitions.metric_alarm_defs import (
     AlarmComparisonOperator,
@@ -59,6 +64,7 @@ from intelliflow.core.signal_processing.routing_runtime_constructs import (
     RouteExecutionHook,
     RouteID,
     RoutePendingNodeHook,
+    RoutingSession,
     RuntimeLinkNode,
 )
 from intelliflow.core.signal_processing.signal import (
@@ -71,7 +77,13 @@ from intelliflow.core.signal_processing.signal import (
     SignalLinkNode,
     SignalProvider,
 )
-from intelliflow.core.signal_processing.signal_source import SignalSourceAccessSpec, SignalSourceType
+from intelliflow.core.signal_processing.signal_source import (
+    DataFrameFormat,
+    DatasetSignalSourceAccessSpec,
+    DatasetSignalSourceFormat,
+    SignalSourceAccessSpec,
+    SignalSourceType,
+)
 from intelliflow.core.signal_processing.slot import SlotType
 
 from .core_application import ApplicationID, ApplicationState, CoreApplication
@@ -95,9 +107,41 @@ class Application(CoreApplication):
         EXTERNAL_APPS_ONLY = 2
         ALL = 3
 
-    def __init__(self, id: ApplicationID, platform: HostPlatform) -> None:
-        super().__init__(id, platform)
+    class IncompatibleRuntime(Exception):
+        pass
+
+    def __init__(self, id: ApplicationID, platform: HostPlatform, enforce_runtime_compatibility: bool = True) -> None:
+        try:
+            super().__init__(id, platform, enforce_runtime_compatibility)
+        except (ModuleNotFoundError, AttributeError, SerializationError, DeserializationError) as error:
+            raise Application.IncompatibleRuntime(
+                f"Unable to load previously activated application state due to a missing or incompatible module already used at runtime",
+                error,
+            )
         self._dev_context: Context = Context()
+        if self._incompatible_runtime or platform.incompatible_runtime:
+            # add a sanity-check to make sure that active state or platform deserialization would not swallow any incompatibility while compatibility is enforced
+            assert (
+                not enforce_runtime_compatibility
+            ), "Application initialization should start with incompatible active state or platform state while runtime compatibility is enforced!"
+            # reset activated
+            logger.critical(
+                f"Terminating incompatible activated runtime [enforce_runtime_compatibility={enforce_runtime_compatibility}]..."
+            )
+            # here the goal is to make sure that we let platform (drivers) to reset incompatible data all across the system (e.g RoutingTable data)
+            self._hard_reset(id, platform)
+
+    def _hard_reset(self, id: ApplicationID, platform: HostPlatform):
+        self._state = ApplicationState.INACTIVE
+        self._active_context = Context()
+        # do a flip to reset system. we need to activate first to have an active platform that can terminate itself
+        self.activate()
+        self.terminate()
+        # re-init to resume the construction flow
+        self._incompatible_runtime = False
+        platform._incompatible_runtime = False
+        Application.__init__(self, id, platform, enforce_runtime_compatibility=True)
+        logger.critical(f"Application got reset! Development and active contexts must be empty now.")
 
     def attach(self):
         if self._active_context:
@@ -336,13 +380,21 @@ class Application(CoreApplication):
             logger.critical(f"Cannot resume the application while the state is {self._state!r}! " f"It should be PAUSED.")
 
     # overrides
-    def refresh(self) -> None:
-        # important for mount/link support (post MVP)
-        # HostPlatform does not support refresh, that is against the whole point behind
-        # forward-looking development effort. Refresh might invalidate platform/conf updates/overwrites.
-        # So for Application we intend to update the (Core state) active_context only (i.e collaborative editing against same
-        # app).
-        CoreApplication._sync(self)
+    def refresh(self, full_stack: bool = False) -> None:
+        # important for use-cases such as mount/link support (collaboration) and visualization
+        if not full_stack:
+            # HostPlatform does not support refresh, that is against the whole point behind
+            # forward-looking development effort. Refresh might invalidate platform/conf updates/overwrites.
+            # So for Application we intend to update the (Core state) active_context only (i.e collaborative editing against same
+            # app).
+            CoreApplication._sync(self)
+        else:
+            # re-loads platform / drivers for a consistent sync required for development
+            # e.g Visualization does a sync to retrieve newly activated app state. if we don't use full_stack in that
+            # case then underlying driver instances might get sync'd with the new app topology. In that case, critical
+            # in-memory state like RoutingTable::route_index won't be updated (with new node / route data) and this will
+            # cause issues in execute API (where the old node data [slot compute code for instance] will be used for execution).
+            Application.__init__(self, self._id, self._platform, self._enforce_runtime_compatibility)
 
         # now refresh the remote applications in the dev-context
         # (active context and its remote applications [if any] has already been updated)
@@ -521,6 +573,8 @@ class Application(CoreApplication):
                                                        "m2": ...
                                                    ...)
         """
+        if self.state in [ApplicationState.TERMINATING, ApplicationState.DELETED]:
+            raise RuntimeError(f"Cannot get platform metrics when the application state is {self.state!r}!")
         metric_signals: Dict[Type["BaseConstruct", List[Signal]]] = self.platform.get_metrics()
         return {const_type: {s.alias: MarshalingView(None, s, None) for s in metrics} for const_type, metrics in metric_signals.items()}
 
@@ -1033,10 +1087,17 @@ class Application(CoreApplication):
                 f"DataNode with id {id!r} already exists!" f"You might want to use 'update_data' API to modify an existing data node."
             )
 
+        external_data_desc.set_platform(self.platform)
+
         if dimension_spec is not None:
             dim_spec: DimensionSpec = (
                 DimensionSpec.load_from_pretty(dimension_spec) if not isinstance(dimension_spec, DimensionSpec) else dimension_spec
             )
+        else:
+            dim_spec: DimensionSpec = external_data_desc.provide_default_dimension_spec()
+
+        if dim_spec is not None:
+
             if dimension_filter is not None:
                 dim_filter: DimensionFilter = (
                     DimensionFilter.load_raw(dimension_filter, cast=dim_spec, error_out=True)
@@ -1060,7 +1121,7 @@ class Application(CoreApplication):
 
             dim_filter.set_spec(dim_spec)
         elif external_data_desc.requires_dimension_spec():
-            raise ValueError(f"'dimension_spec' should be provided for external data {external_data_desc!r}")
+            raise ValueError(f"'dimension_spec' must be provided for external data {external_data_desc!r}")
         else:
             dim_spec: DimensionSpec = None
             dim_filter: DimensionFilter = None
@@ -1317,6 +1378,11 @@ class Application(CoreApplication):
             # automatically create the links for inputs that have identical dimensions (if not provided by user already).
             signal_link_node.compensate_missing_links()
 
+        if any([not isinstance(link, tuple) for link in output_dim_links]):
+            raise ValueError(
+                f"'output_dim_links' parameter for node {id!r} must be a list of tuples! Each tuple must have three elements [DESTINATION, Callable, SOURCE]."
+            )
+
         # if a link has its first (DESTINATION/TARGET) entry as SignalDimensionTuple, then it is an assignment from
         #  OUTPUT to an INPUT, and that SignalDimensionTuple belongs to an input. If it is a string literal (it represents
         #  an output dimension).
@@ -1361,8 +1427,13 @@ class Application(CoreApplication):
                         source_dimension_value = linked_candidate.domain_spec.dimension_filter_spec.find_dimension_by_name(missing_dim_name)
                         # we allow mappings from dependent signals since the actual problem should be captured by
                         # cyclic dependency check. e.g output dim -> dependent dim -> output dim
-                        # so this check is meaningless to avoid zombie nodes and also counter-productive.
-                        # see the TODO at the end of this method
+                        # so avoiding independent signals to avoid zombie nodes is not the solution here.
+                        #
+                        # TODO 1 So what we need to do here is to use the new "graph analyzer" and make sure that this
+                        #  linked_candidate + source_dimension pair is directly or transitively sourced from a dimension
+                        #  from an independent signal
+                        # TODO 2 use the analyzer to make sure that this output dimension is not an upstream to this dimension
+                        #  aka cyclic relationship
                         if source_dimension:  # and \
                             # (not input_signal.is_dependent or source_dimension_value.is_material_value()):
                             linked_signal_dimension_tuple = SignalDimensionTuple(linked_candidate, source_dimension)
@@ -1392,7 +1463,7 @@ class Application(CoreApplication):
         # ask each compute target to provide compute specific (mandated) output parameters and check them against
         # user provided attrs (if any). E.g dataset header
         for compute_target in compute_targets:
-            compute_attrs: Optional[Dict[str, Any]] = compute_target.create_output_attributes(self.platform, kwargs)
+            compute_attrs: Optional[Dict[str, Any]] = compute_target.create_output_attributes(self.platform, input_signals, kwargs)
             if compute_attrs:
                 kwargs.update(compute_attrs)
 
@@ -1419,9 +1490,6 @@ class Application(CoreApplication):
             **kwargs,
         )
 
-        # TODO implement cyclic dependency check for the entire graph of inputs and the output
-        # signal_link_node.check_dependency_graph(data_node.signal(), data_node.output_dim_matrix)
-        # make check_dangling_dependents private and move it inside check_dependency_graph
         signal_link_node.check_dangling_dependents(data_node.signal(), data_node.output_dim_matrix)
 
         marshaler_node = MarshalerNode(data_node, None)
@@ -1769,6 +1837,7 @@ class Application(CoreApplication):
         processing_mode=FeedBackSignalProcessingMode.ONLY_HEAD,
         target_route_id: Optional[Union[RouteID, MarshalerNode]] = None,
         is_async=True,
+        retry_if_deferred=True,
     ) -> Optional[List["RoutingTable.Response"]]:
         """Injects a new signal or raw event into the system.
 
@@ -1793,6 +1862,8 @@ class Application(CoreApplication):
         specify a route and limit the execution scope.
         :param is_async: when 'with_activated_processor' is True, then this parameter can be used to control whether
         the remote call will be async or not.
+        :param retry_if_deferred: implicitly retry if the one of the target routes is locked or somehow the signal is
+        deferred (temporarily rejected) by the core for any reason.
         """
         if with_activated_processor and self.state != ApplicationState.ACTIVE:
             raise RuntimeError(
@@ -1811,13 +1882,51 @@ class Application(CoreApplication):
         else:
             checked_input = input if not isinstance(input, Signal) else self._check_upstream_signal(input)
 
-        return self._platform.processor.process(
+        if isinstance(checked_input, Signal) and not checked_input.domain_spec.dimension_filter_spec.is_material():
+            raise ValueError(
+                f"Cannot process unmaterialized input signal {checked_input.alias!r}! Following dimensions must "
+                f"have material values: {[ (dim_name, dim.type) for dim_name, dim in checked_input.domain_spec.dimension_spec.get_flattened_dimension_map().items()]!r}"
+            )
+
+        responses: Optional[List[RoutingTable.Response]] = self._platform.processor.process(
             checked_input,
             with_activated_processor,
             processing_mode,
             target_route_id if isinstance(target_route_id, RouteID) else self._get_route_id(target_route_id),
             is_async,
         )
+        if retry_if_deferred and responses:
+            for response in responses:
+                for route, signals in response.deferred_signals.items():
+                    for signal in signals:
+                        while True:
+                            logger.critical(
+                                f"Re-processing deferred signal {signal.resource_access_spec.path_format} on route {route.route_id!r}..."
+                            )
+                            sub_response: RoutingTable.Response = self._platform.processor.process(
+                                signal,
+                                with_activated_processor,
+                                processing_mode,
+                                route.route_id,
+                                is_async,
+                            )[0]
+                            if not sub_response.deferred_signals:
+                                # transfer the new execution context to the original response to be returned to the caller
+                                execution_contexts: Optional[
+                                    Dict["Route.ExecutionContext", List["RoutingTable.ComputeRecord"]]
+                                ] = sub_response.get_execution_contexts(route.route_id)
+                                if execution_contexts is not None:
+                                    if response.get_execution_contexts(route) is None:
+                                        response.add_route(route)
+                                    for exec_context, compute_records in execution_contexts.items():
+                                        response.add_execution_context(route, exec_context)
+                                        for comp_rec in compute_records:
+                                            response.add_compute_record(route, exec_context, comp_rec)
+                                break
+                            logger.critical(f"Could not retain the route {route.route_id!r}! Will retry in 20 seconds...")
+                            time.sleep(20)
+                response.clear_deferred_signals()
+        return responses
 
     def _get_route_id(self, route: Union[str, MarshalerNode, "Route"]) -> RouteID:
         route_id: RouteID = None
@@ -1855,7 +1964,7 @@ class Application(CoreApplication):
 
     def update_active_route_status(self, route: Union[str, MarshalerNode, "Route"]) -> None:
         route_id: RouteID = self._get_route_id(route)
-        self.platform.routing_table.check_active_route(route_id)
+        self.platform.routing_table.check_active_route(route_id, RoutingSession())
 
     def _is_data_active(self, internal_data_id: str) -> bool:
         """Checks whether the internal data has been as part of the application during the most recent activation.
@@ -1883,7 +1992,7 @@ class Application(CoreApplication):
             if updated_version:
                 active_route = cast(InternalDataNode, active_version[0].bound).create_route()
                 dev_route = cast(InternalDataNode, updated_version[0].bound).create_route()
-                if not active_route.check_integrity(dev_route):
+                if not active_route.check_integrity(dev_route) or not active_route.check_auxiliary_data_integrity(dev_route):
                     return True
 
         return False
@@ -2098,6 +2207,80 @@ class Application(CoreApplication):
             return materialized_paths[0], completed_compute_records
         return None, None
 
+    def get_compute_record_logs(
+        self,
+        compute_record_OR_materialized_view: Union["RoutingTable.ComputeRecord", FilteredView, MarshalerNode],
+        error_only: bool = True,
+        filter_pattern: Optional[str] = None,
+        time_range: Optional[Tuple[int, int]] = None,
+        limit: Optional[int] = None,
+        next_token: Optional[str] = None,
+    ) -> Optional[List[ComputeLogQuery]]:
+        """
+        Retrieves the runtime logs from the underlying compute system for the compute log records.
+
+        @param compute_record_OR_materialized_view: the compute that generates the logs. Either provide the compute
+        record retrieved from other API calls such as 'poll' or provide the materialized output view for the compute.
+        If the materialized output view is provided, then the most recent execution and its compute records are found
+        on the output and query results are returned for all of them.
+        @param error_only: narrow down the search to focus on error logs only where the underlying driver would use
+        compute specific exception, error filter patterns
+        @param filter_pattern: custom set of `filter` rules to be provided by the user based on the internal knowledge
+        of the remote copmute system and how logs are structured
+        @param time_range: absolute start and end timestamps as a tuple can be used to narrow down search interval.
+        @param limit: determine the max `records` in the query result, if the limit is higher than what can be retrieved in one cycle
+        then the returned query object will have `next_token` set.
+        @param next_token: use the token from a previously retrieved query result to get the next batch of records for the same query
+
+        @return: array of query objects for each compute record that contain records (log events/messages) and the URLs to log repositories.
+        Also, for each query, if user requested limit is higher than what can be retrieved in one cycle then `next_token` is set.
+        """
+        compute_records = None
+        if isinstance(compute_record_OR_materialized_view, (FilteredView, MarshalerNode)):
+            _, compute_records = self.poll(compute_record_OR_materialized_view)
+            if not compute_records:
+                raise ValueError("Cannot find previous executions!")
+        else:
+            compute_records = [compute_record_OR_materialized_view]
+
+        return [
+            self.platform.routing_table.get_compute_record_logs(compute_record, error_only, filter_pattern, time_range, limit, next_token)
+            for compute_record in compute_records
+        ]
+
+    def has_active_record(self, view: Union[FilteredView, MarshalerNode]):
+        node: MarshalerNode = None
+        if isinstance(view, MarshalingView):
+            node = view.marshaler_node
+        elif isinstance(view, MarshalerNode):
+            node = view
+        else:
+            logger.error(f"Please provide a data node (if it is dimensionless) or filtered material version of it.")
+            raise ValueError(f"Wrong input type {type(view)}!")
+
+        if not isinstance(node.bound, InternalDataNode):
+            raise ValueError(f"Can only check active records of internal data nodes!")
+
+        internal_data_node = cast(InternalDataNode, node.bound)
+
+        materialized_output: Signal = self._get_input_signal(view)
+        if not materialized_output.domain_spec.dimension_filter_spec.is_material():
+            logger.error(f"Input data node {internal_data_node.data_id!r} to Application::poll does not have" f" a materialized view!")
+            logger.error(f"Dimension filter: {materialized_output.domain_spec.dimension_filter_spec!r}")
+            logger.error("Please use concrete dimension values for the input.")
+            raise ValueError(f"Can poll on materialized data node views only!")
+
+        platform = self.platform
+        # support checking on data nodes imported from other (upstream) apps
+        owner_context_uuid = internal_data_node.signal().resource_access_spec.get_owner_context_uuid()
+        if owner_context_uuid != self.uuid:
+            # if the node is upstream, it should already belong to an activated upstream app.
+            platform = self._dev_context.get_upstream_app(owner_context_uuid).platform
+
+        route_record: RoutingTable.RouteRecord = platform.routing_table.optimistic_read(internal_data_node.route_id)
+
+        return route_record is not None and route_record.has_active_record_for(materialized_output)
+
     def kill(self, output: Union[MarshalingView, MarshalerNode]) -> bool:
         """Checks if there is any active computes for the target output and then attempts to kill them.
 
@@ -2154,24 +2337,7 @@ class Application(CoreApplication):
                     )
 
         logger.critical(f"Attempting to kill active executions on {materialized_output.get_materialized_resource_paths()[0]!r}")
-        # find active records and call kill on each one of them
-        active_executions = set()
-        route_record = platform.routing_table.optimistic_read(internal_data_node.route_id)
-        if route_record and route_record.has_active_record_for(materialized_output):
-            active_records = route_record.get_active_records_of(materialized_output)
-            # skip the records which did not return SUCCESS to the initial compute call (check initial response 'state')
-            active_records = [r for r in active_records if r.state.response_type == ComputeResponseType.SUCCESS]
-            active_executions.update([r.execution_context_id for r in active_records])
-            if active_records:
-                logger.critical(f"Data node {internal_data_node.data_id!r} has active execution(s) on it now.")
-                logger.critical(
-                    f"At least one of those executions is working on the same output: {materialized_output.get_materialized_resource_paths()[0]}"
-                )
-                logger.critical(f"Active compute sessions: {[record.session_state for record in active_records]!r}.")
-                logger.critical(f"Attempting to kill the active sessions...")
-                for active_record in active_records:
-                    if active_record.slot.type.is_batch_compute():
-                        platform.batch_compute.kill_session(active_record)
+        active_executions = platform.routing_table.kill(internal_data_node.route_id, materialized_output)
 
         if active_executions:
             logger.critical(
@@ -2190,10 +2356,7 @@ class Application(CoreApplication):
         )
 
     def _execute_recursive(
-        self,
-        output_node: MarshalerNode,
-        inputs: Sequence[Union[FilteredView, MarshalerNode, Signal]],
-        wait: bool,
+        self, output_node: MarshalerNode, inputs: Sequence[Union[FilteredView, MarshalerNode, Signal]], wait: bool, integrity_check: bool
     ) -> Sequence[int]:
         """Internal executor impl designed to crawl up the dependency chain of a node given as a 'target' to
         Application::execute API.
@@ -2229,12 +2392,8 @@ class Application(CoreApplication):
             link_node.receive(signal, update_ranges=False)
 
         executed_input_indexes = []
-        # we keep polling here because link_node will not do an exhaustive scan of all of the incomplete paths.
-        # - therefore we preemptively loop here, knowing that particularly for 'ranged' inputs we'd need multiple passes
-        # - this also has a positive side-effect (as compared to a one-time cached list of incomplete paths). that effect
-        # is the opportunity to sync with the outcome of executions triggered by asynchronous external events in remote
-        # orchestration.
-        while not link_node.is_ready(check_ranges=True, platform=self.platform):
+        # we set fail_fast=True so that link_node will do an exhaustive scan of all of the incomplete paths.
+        if not link_node.is_ready(check_ranges=True, platform=self.platform, fail_fast=False):
             # analyze the inputs that are not ready
             #  - if internal:
             #     - if nearest_the_tip_in_range
@@ -2245,7 +2404,9 @@ class Application(CoreApplication):
             #      error out
             for i, ready_signal in enumerate(link_node.ready_signals):
                 # we are just trying to access the reference of parent node, so picking the first link here is jut fine.
-                input_node: MarshalerNode = inst.get_inbound_links(ready_signal)[0].instruction.output_node
+                instruction = inst.get_inbound_links(ready_signal)[0].instruction
+                # instruction is None for upstream nodes
+                input_node: Optional[MarshalerNode] = instruction.output_node if instruction else None
                 analysis_result: "_SignalAnalysisResult" = link_node.range_check_state.get(ready_signal.unique_key(), None)
                 if analysis_result is None:
                     # since link_node.is_ready does not do an exhaustive scan, ready_signal might not have checked yet.
@@ -2272,18 +2433,29 @@ class Application(CoreApplication):
                             # input_node -> input_node['NA']['2021-06-21']
                             for dim_value in partition:
                                 input_view = input_view[dim_value]
-                        self.execute(target=input_view, wait=wait, recursive=True)
+                        self.execute(target=input_view, wait=wait, recursive=True, integrity_check=integrity_check)
                         # only add TIPs (represented by input signals), so in this case it is the TIP by default
                         executed_input_indexes.append(i)
                 else:
                     if analysis_result.remaining_paths:
                         # not ready
                         if not self._is_executable(ready_signal):
-                            raise ValueError(
-                                f"Recursive execution on {internal_data_node.data_id!r} cannot proceed due to missing data on external "
-                                f"input {ready_signal.alias!r}! The following paths should be available:"
-                                f"{analysis_result.remaining_paths}"
-                            )
+                            # since we force range_check = True above to reuse dependency check from within RuntimeLinkNode,
+                            # now we need to get the original ref to see if it is actually required before erroring out
+                            org_non_executable_signal = internal_data_node.signal_link_node._signals[i]
+                            # raise only when:
+                            # - user explicitly wants the range check
+                            # - or the input signal/event is required (which is basically / implicitly a range check on the TIP)
+                            if org_non_executable_signal.range_check_required or (
+                                not org_non_executable_signal.is_reference
+                                and ready_signal.get_materialized_resource_paths()[0] in analysis_result.remaining_paths
+                            ):
+                                raise ValueError(
+                                    f"Recursive execution on {internal_data_node.data_id!r} cannot proceed due to missing data on external "
+                                    f"input {ready_signal.alias!r}! The following paths should be available:"
+                                    f"{analysis_result.remaining_paths}"
+                                )
+                            continue
 
                         need_to_enforce_wait = False
                         if ready_signal.get_materialized_resource_paths()[0] in analysis_result.remaining_paths:
@@ -2297,7 +2469,8 @@ class Application(CoreApplication):
                             # 'execute_input_indexes' won't have the TIP (and this will cause injection/process call for it).
                             # if we add it to 'execute_input_indexes', then injection/process call won't happen but in that
                             # case implicit event propagation on TIP won't happen either and this would block outer context.
-                            need_to_enforce_wait = True
+                            if not ready_signal.range_check_required:
+                                need_to_enforce_wait = True
 
                         for path in analysis_result.remaining_paths:
                             # e.g ['NA', 1, '2021-06-21']
@@ -2319,6 +2492,7 @@ class Application(CoreApplication):
         ] = None,
         wait: Optional[bool] = True,
         recursive: bool = False,
+        integrity_check: bool = True,
     ) -> str:
         """Activates the application and starts an execution only against the input data node using the materialized
         input signals.
@@ -2340,6 +2514,9 @@ class Application(CoreApplication):
         target).
         :param recursive: traverse the upstream dependency chain (ancestor nodes) and execute them (if required) to
         make sure that desired execution on target would not fail due to missing data on inputs.
+        :param integrity_check: if the target data node exists already (in the active state of the app), do an integrity
+        check on its parameters and its downstream dependent nodes traversing the entire topology to detect a change
+        and to do an implicit activation accordingly.
 
         :returns a materialized/physical resource path that represents the outcome of this execution on 'target'.
 
@@ -2436,7 +2613,7 @@ class Application(CoreApplication):
             # we don't provide output and dim matrix (for references) because materialization above will guarantee to
             # have all of the inputs at this point (including references too).
             if not link_node.receive(signal):
-                if signal.clone(alias_list[i]) not in auto_generated_material_inputs:
+                if signal.clone(alias_list[i], deep=False) not in auto_generated_material_inputs:
                     raise ValueError(
                         f"Cannot execute node! Input signal with alias ({alias_list[i]!r}) and order [{i}] is "
                         f"rejected from the execution of {internal_data_node.data_id!r}. "
@@ -2464,38 +2641,71 @@ class Application(CoreApplication):
         # TODO support node declarations with RelativeVariants which would have multipled branches in their filter spec
         materialized_output: Signal = link_node.materialize_output(internal_data_node.signal(), internal_data_node.output_dim_matrix)
         if not is_route_new:
-            # however, first make sure that no other active compute record exists on the same route and on the same
-            # output. Otherwise, this possible execution will be rejected remotely (idempotency) and cause inconvenience
-            # for the client.
-            while True:
-                route_record = self.platform.routing_table.optimistic_read(internal_data_node.route_id)
-                if route_record and route_record.has_active_record_for(materialized_output):
-                    active_records = route_record.get_active_records_of(materialized_output)
-                    logger.critical(
-                        f"Data node {internal_data_node.data_id!r} has other active execution(s) on it now."
-                        f" And at least one of those executions is working on the same output: {materialized_output.get_materialized_resource_paths()[0]}"
-                        f"Active compute sessions: {[record.session_state for record in active_records]!r}."
-                        f" Will wait for it to complete first. Will check in 30 seconds..."
-                    )
-                    time.sleep(30)
+            # however, first make sure that no other active compute record exists on the same route and on the same output.
+            route_record = self.platform.routing_table.optimistic_read(internal_data_node.route_id)
+            if route_record and route_record.has_active_record_for(materialized_output):
+                active_records = route_record.get_active_records_of(materialized_output)
+                logger.critical(
+                    f"Data node {internal_data_node.data_id!r} has other active execution(s) on it now."
+                    f" And at least one of those executions is working on the same output: {materialized_output.get_materialized_resource_paths()[0]}"
+                    f"Active compute sessions: {[record.session_state for record in active_records]!r}."
+                )
+                if wait:
+                    logger.critical("Will poll this execution rather than initiating a new one...")
+                    path, records = self.poll(target)
+                    if path:
+                        return path
+                    elif records:
+                        failed_records = [
+                            compute_record
+                            for compute_record in records
+                            if compute_record.session_state and compute_record.session_state.state_type == ComputeSessionStateType.FAILED
+                        ]
+                        raise RuntimeError(f"Execution has failed! Failed records: {[failed_records]!r}")
                 else:
-                    logger.critical(f"No active execution detected! Will proceed with this execution now...")
-                    break
+                    return self._materialize_internal(materialized_output).get_materialized_resource_paths()[0]
+            else:
+                logger.critical(f"No active execution detected! Will proceed with this execution now...")
 
         # 1 - make sure that the application is activated if the node is new (only in dev-context) or updated
         if is_route_new:
             logger.critical(f"Activating the application since the node {internal_data_node.data_id!r} is new...")
             self.activate()
-        else:
+        elif integrity_check:
             updated_version = self.get_data(
                 internal_data_node.data_id, Application.QueryApplicationScope.CURRENT_APP_ONLY, Application.QueryContext.DEV_CONTEXT
             )
-            if updated_version:
-                active_route = cast(InternalDataNode, active_version[0].bound).create_route()
-                dev_route = cast(InternalDataNode, updated_version[0].bound).create_route()
-                if not active_route.check_integrity(dev_route):
-                    logger.critical(f"Activating the application since the node/route {internal_data_node.data_id!r} is updated...")
+            active_route = cast(InternalDataNode, active_version[0].bound).create_route()
+            dev_route = cast(InternalDataNode, updated_version[0].bound).create_route()
+            if not active_route.check_integrity(dev_route) or not active_route.check_auxiliary_data_integrity(dev_route):
+                logger.critical(f"Activating the application since the node/route {internal_data_node.data_id!r} is updated...")
+                self.activate()
+            else:
+                # now check the dependency tree (downstream topology)
+                active_dependency_tree: List[Instruction] = self.active_context.get_dependency_set(active_version[0])
+                dev_dependency_tree: List[Instruction] = self.dev_context.get_dependency_set(updated_version[0])
+                active_childs: Set[str] = set([instruction.symbol_tree.route_id for instruction in active_dependency_tree])
+                dev_childs: Set[str] = set([instruction.symbol_tree.route_id for instruction in dev_dependency_tree])
+                if active_childs != dev_childs:
+                    logger.critical(
+                        f"Activating the application since the downstream dependency tree (children) for node/route {internal_data_node.data_id!r} is updated! "
+                        f"active childs: {active_childs!r}, development childs: {dev_childs!r}"
+                    )
                     self.activate()
+                else:
+                    # if topology is same, then check the integrity of each node
+                    for active_child_inst in active_dependency_tree:
+                        active_child_id = active_child_inst.symbol_tree._id
+                        # TODO check other node_types (high-level _is_node_updated will be called)
+                        #   currently we don't have any other node type that would accept a data node as input
+                        #   so we can comfortably use _is_data_updated for now
+                        if self._is_data_updated(active_child_id):
+                            logger.critical(
+                                f"Activating the application since one of the child nodes ({active_child_id!r}) in the dependency tree for node/route {internal_data_node.data_id!r} is updated! "
+                            )
+                            self.activate()
+                            break
+
         # 1.2 - check upstream if 'recursive' is True, just before injecting inputs into the system
         #
         # technically we have to recurse with 'wait=True', otherwise here is the challenge:
@@ -2512,17 +2722,18 @@ class Application(CoreApplication):
         #
         # So today, we will use this condition to enforce 'wait=True' in recursive execution on an input
         # with existing TIP but a missing data in its range.
-        recursion_datum: datetime = datetime.utcnow()
-        recursively_triggered_input_indexes = self._execute_recursive(node, inputs, wait=wait) if recursive else []
-        recursively_triggered_aliases = [alias_list[i] for i in alias_list if i in recursively_triggered_input_indexes]
+        recursively_triggered_input_indexes = (
+            self._execute_recursive(node, inputs, wait=wait, integrity_check=integrity_check) if recursive else []
+        )
+        recursively_triggered_aliases = [alias_list[i] for i, _ in enumerate(alias_list) if i in recursively_triggered_input_indexes]
         if set(recursively_triggered_input_indexes).issuperset([j for j, s in enumerate(input_signals) if not s.is_dependent]):
             # necessary trigger condition is already satisfied and remote orchestration might have initiated it already.
-            # try to hook up with the execution that would have started after 'recursion_datum'.
+            # try to hook up with the execution
             logger.critical(f"All of the independent input signals {recursively_triggered_aliases!r} have been triggered recursively!")
             if wait:
                 logger.critical("Execution must have started automatically.")
                 # Processor might not have picked the last independent event yet
-                path, records = self.poll(target, datum=recursion_datum)
+                path, records = self.poll(target)
                 if path:
                     return path
                 elif records:
@@ -2536,7 +2747,7 @@ class Application(CoreApplication):
                     logger.critical(f"Execution could not be detected yet.")
                     logger.critical(f"Waiting for 60 seconds...")
                     time.sleep(60)  # TODO use Processor interval
-                    path, _ = self.poll(target, datum=recursion_datum)
+                    path, _ = self.poll(target)
                     if path:
                         return path
                     elif records:
@@ -2579,6 +2790,7 @@ class Application(CoreApplication):
                     with_activated_processor=False,
                     processing_mode=FeedBackSignalProcessingMode.ONLY_HEAD,
                     target_route_id=internal_data_node.route_id,
+                    retry_if_deferred=True,
                 )[0]
                 execution_contexts: Optional[
                     Dict["Route.ExecutionContext", List["RoutingTable.ComputeRecord"]]
@@ -2629,12 +2841,13 @@ class Application(CoreApplication):
                 # reattempt on recursively triggered inputs is not desirable (with trade-off of having a redundant
                 # pending node) but we favor better UX here.
                 if not (idempotency_check_detected or recursively_triggered_input_indexes):
-                    raise RuntimeError(
-                        f"Execution could not be started on node: {internal_data_node.data_id!r}! "
-                        f"Check inputs to verify all conditions necessary for the executions exist (e.g range_check)."
-                    )
+                    if not (recursive and not wait):
+                        raise RuntimeError(
+                            f"Execution could not be started on node: {internal_data_node.data_id!r}! "
+                            f"Check inputs to verify all conditions necessary for the executions exist (e.g range_check)."
+                        )
 
-                if recursively_triggered_input_indexes and not wait:
+                if recursive and not wait:
                     logger.critical(f"All of the ancestor nodes with missing data have been triggered asynchronously!")
                     logger.critical("Execution will start automatically once all of the inputs are satisfied.")
                     logger.critical(
@@ -2790,6 +3003,151 @@ class Application(CoreApplication):
         input_signal = self._materialize_internal(materialized_output)
         materialized_paths = input_signal.get_materialized_resource_paths()
         return materialized_paths[0]
+
+    def validate(
+        self,
+        target: Union[MarshalingView, MarshalerNode],
+        material_inputs: Optional[
+            Union[Sequence[Union[Signal, FilteredView, MarshalerNode]], Union[Signal, FilteredView, MarshalerNode]]
+        ] = None,
+    ) -> None:
+        """Evaluate runtime behaviour of this node (target) and see executions are possible.
+
+        It tries to emulate the runtime node using the materialized dimension values provided from target or
+        material_inputs (if target/output not enough or materialized). The key to emulate the runtime situation is to
+        feed independent signals into that node. So if the materialized target/output is not enough to infer those
+        independent nodes, then this will raise, similarly even with all of the materialized inputs this would still
+        raise and give the caller an idea about input/output linking problems, indicating blocked (zombie) executions
+        at runtime.
+
+        Two types of error will be captured based on the dimension values provided.
+        First, the simple compatibility (dimension_filter_spec) check against each input.
+        In other cases, analysis will do more semantical checks such as blocked/zombie runtime node behaviour that
+        indicates the impossibility of runtime executions with the dimension values provided. In all cases, analysis
+        will raise a ValueError for issues detected at this level or re-raise the nested exceptions caused by user
+        provided functions in links, etc.
+
+        :param target: Either a filtered view or a direct reference of a data node. If this input is materialized and
+        it is possible to construct the materialized versions of its inputs (depending on output dimension links, etc)
+        then second parameter 'material_inputs' is optional.
+        :param material_inputs: Materialized inputs of the input data node ('target'). This parameter can be left empty
+        in cases where 'target' (as output) would be enough to infer its independent inputs.
+        If material_inputs is partically provided (not all of the inputs), then IntelliFlow will still use them along
+        with target/output opportunistically to in In those cases, IntelliFlow can auto-generate the material versions
+        of the inputs.
+
+        Also see Application::execute
+        """
+        node: MarshalerNode = None
+        if isinstance(target, MarshalingView):
+            node = target.marshaler_node
+        elif isinstance(target, MarshalerNode):
+            node = target
+        else:
+            logger.error(f"Please provide a data node or a filtered material version of it.")
+            raise ValueError(f"Wrong input type {type(target)} for Application::execute API.")
+
+        if not isinstance(node.bound, InternalDataNode):
+            raise ValueError(f"Can only execute internal data nodes! Following input node is non-executable : {node.bound!r}")
+
+        internal_data_node = cast(InternalDataNode, node.bound)
+
+        output: Signal = self._get_input_signal(target)
+        if not material_inputs:
+            # support happy-path (when output and input signals' dimensions can be mapped trivially).
+            # this is the only case when filtering from target (if any) is used. once we get the material_inputs
+            # we will still use the runtime_link_node to extract the output filter for the sake of consistency
+            # and as a means of full-stack check (compatible) with the runtime behaviour.
+            if not output.domain_spec.dimension_filter_spec.is_material():
+                raise ValueError(
+                    f"Cannot validate unmaterialized target {internal_data_node.data_id!r} without inputs! "
+                    f"Either provide its dimensions or use 'material_inputs' parameter to help the analysis."
+                )
+
+            # this will raise an exception if the operation is not possible (any of the input dims cannot be mapped
+            #  from the output).
+            try:
+                material_inputs = internal_data_node.signal_link_node.get_materialized_inputs_for_output(
+                    output,
+                    internal_data_node.output_dim_matrix,  # verified to be materialized already
+                    # do not enforce this as we need "independent" inputs here only
+                    enforce_materialization_on_all_inputs=False,
+                )
+            except TypeError as error:
+                raise ValueError(f"Provided dimension values are rejected by the node {internal_data_node.data_id!r}! " f"Error: ", error)
+        else:
+            material_inputs = material_inputs if isinstance(material_inputs, List) else [material_inputs]
+            material_input_signals = [
+                self._get_input_signal(input) if not isinstance(input, Signal) else input for input in material_inputs
+            ]
+            if len(material_inputs) != len(internal_data_node.signal_link_node.signals):
+                if not output.domain_spec.dimension_filter_spec.is_material():
+                    # try to materialize output from other materialized inputs
+                    test_node = RuntimeLinkNode(internal_data_node.signal_link_node)
+                    for input in material_input_signals:
+                        test_node.receive(input)
+                    output = test_node.materialize_output(output, internal_data_node.output_dim_matrix, force=True)
+
+                if output.domain_spec.dimension_filter_spec.is_material():
+                    # output is materialized and we just have some of the inputs. attempt to compensate the missing inputs.
+                    # materialization handles references as well.
+                    # will raise an exception if all of the inputs cannot be mapped from others (and the output).
+                    try:
+                        material_inputs = internal_data_node.signal_link_node.get_materialized_inputs_for_output(
+                            output,  # verified to be materialized already
+                            internal_data_node.output_dim_matrix,
+                            already_materialized_inputs=material_input_signals,
+                            enforce_materialization_on_all_inputs=False,
+                        )
+                    except TypeError as error:
+                        raise ValueError(
+                            f"Provided dimension values are rejected by the node {internal_data_node.data_id!r}! " f"Error: ", error
+                        )
+
+        signal_link_node = internal_data_node.signal_link_node
+        inputs = material_inputs if isinstance(material_inputs, List) else [material_inputs]
+
+        for signal in signal_link_node.signals:
+            if not signal.is_dependent and signal not in inputs:
+                raise ValueError(
+                    f"Could not validate node {internal_data_node.data_id!r} because independent input "
+                    f"{signal.alias!r} could not be materialized from the 'target' and other 'material_inputs'."
+                    f" If you are not planning add a link to make this validation possible, then provide"
+                    f" the materialized input via 'material_inputs'."
+                )
+
+        input_signals = [self._get_input_signal(input) if not isinstance(input, Signal) else input for input in inputs]
+        input_signals = self._check_upstream(input_signals)
+
+        alias_list = [signal.alias for signal in input_signals]
+        # reset alias' (otherwise below check within RuntimeLinkNode won't work)
+        independent_input_signals = [signal.clone(None) for signal in input_signals if not signal.is_dependent]
+
+        # check the runtime behaviour of the INDEPENDENT input signals against the node.
+        # whether they will actually cause a trigger or not?
+        link_node = RuntimeLinkNode(copy.deepcopy(signal_link_node))
+        for i, signal in enumerate(independent_input_signals):
+            if not link_node.can_receive(signal):
+                raise ValueError(
+                    f"Won't be able to execute node! Input signal with alias ({alias_list[i]!r}) is "
+                    f"not compatible with target node ({internal_data_node.data_id!r})."
+                )
+            if not signal.domain_spec.dimension_filter_spec.is_material():
+                raise ValueError(
+                    f"Won't be able to execute node! Input signal with alias ({alias_list[i]!r}) could "
+                    f" not be materialized from inputs provided. If links are correct and this is expected, please provide"
+                    f" it as an 'material_input'.Following dimension filter should contain concrete/material values "
+                    f"only: {signal.domain_spec.dimension_filter_spec!r}"
+                )
+
+            # now feed the materialized signal
+            link_node.receive(signal, output, internal_data_node.output_dim_matrix)
+
+        if not link_node.is_ready():
+            raise ValueError(
+                f"Won't be able to execute node {internal_data_node.data_id!r}! Not all of the inputs will be satisfied at runtime."
+                f" Unsatisfied inputs: {[signal.unique_key() for signal in link_node.signals if signal not in link_node.ready_signals]}"
+            )
 
     def materialize(self, signal_view: Union[FilteredView, MarshalerNode], material_values: RawDimensionFilterInput = None) -> List[str]:
         """Return materialized resource path(s) for the input signal.
@@ -2981,8 +3339,475 @@ class Application(CoreApplication):
                 platform = remote_app.platform if remote_app else None
         return platform
 
+    def admin_console(self):
+        from intelliflow_visualization import EnvironmentInjectionMiddleware, app
+
+        if is_on_remote_dev_env():
+            raise NotImplementedError("Admin console generation not supported on remote dev-endpoints yet!")
+
+        def _is_port_available(host: str, port: int) -> bool:
+            import socket
+
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                try:
+                    s.bind((host, port))
+                except socket.error:
+                    return False
+            return True
+
+        # Find unbound port from 5000 to 5019
+        hostname = os.environ.get("HOSTNAME", socket.gethostname())
+        next_available_port = next((p for p in range(5000, 5020) if _is_port_available(hostname, p)), 5000)
+
+        params = {"host": hostname, "port": next_available_port, "debug": False}
+
+        app.config["intelliflow_app"] = self
+
+        app.wsgi_app = EnvironmentInjectionMiddleware(app.wsgi_app)
+        app.run(**params)
+
     def set_security_conf(self, construct_type: Type[BaseConstruct], conf: ConstructSecurityConf) -> None:
         self._dev_context.add_security_conf(construct_type, conf)
+
+    ### Convenience APIS ###
+
+    def get_routing_table(self) -> Iterable[Route]:
+        return self.platform.routing_table.get_all_routes()
+
+    def get_inactive_compute_records(
+        self,
+        route: Optional[Union[str, MarshalerNode, Route]] = None,
+        ascending: bool = True,
+        trigger_range: Optional[Tuple[int, int]] = None,
+        deactivated_range: Optional[Tuple[int, int]] = None,
+        slot_type: Optional[SlotType] = None,
+        session_state: Optional[ComputeSessionStateType] = None,
+        limit: Optional[int] = None,
+    ) -> Iterator[RoutingTable.ComputeRecord]:
+        route_id: Optional[RouteID] = self._get_route_id(route) if route else None
+
+        return self.platform.routing_table.load_inactive_compute_records(
+            route_id, ascending, trigger_range, deactivated_range, slot_type, session_state, limit
+        )
+
+    def get_active_compute_records(self, route: Optional[Union[str, MarshalerNode, Route]] = None) -> Iterator[RoutingTable.ComputeRecord]:
+        if route:
+            route_record: RoutingTable.RouteRecord = self.get_active_route(route)
+            return [compute_record for compute_record in route_record.active_compute_records] if route_record else []
+        else:
+            # optimization
+            return self.platform.routing_table.load_active_compute_records()
+
+    def get_pending_nodes(
+        self, route: Optional[Union[str, MarshalerNode, Route]] = None
+    ) -> Union[Iterator[Tuple[RouteID, "RuntimeLinkNode"]], Iterator[RuntimeLinkNode]]:
+        if route:
+            route_record: RoutingTable.RouteRecord = self.get_active_route(route)
+            return [pending_node for pending_node in route_record.route.pending_nodes] if route_record else []
+        else:
+            # optimization
+            return self.platform.routing_table.load_pending_nodes()
+
+    def preview_data(self, output: Union[MarshalingView, MarshalerNode], limit: int = None, columns: int = None) -> (Any, DataFrameFormat):
+        """Dumps the records into the console and logs and returns the data for 'limit' number of records
+
+        Strategy for the load operation is: Pandas -> Spark -> Original (collection object created for CSV, Parquet, ..)
+        """
+        # iterate=False here means that we want to whole as one single object to avoid extra iteration here.
+        data = None
+        format = None
+        import importlib
+
+        if importlib.util.find_spec("pandas") is not None:
+            data, format = next(self.load_data(output, limit, DataFrameFormat.PANDAS, iterate=False)), DataFrameFormat.PANDAS
+            import pandas as pd
+
+            with pd.option_context("max_rows", limit, "max_columns", columns):
+                try:
+                    # jupyter support
+                    display(data)
+                except:
+                    print(data)
+        elif importlib.util.find_spec("pyspark") is not None:
+            data, format = next(self.load_data(output, limit, DataFrameFormat.SPARK, iterate=False)), DataFrameFormat.SPARK
+            if limit is not None:
+                data.show(n=limit)
+            else:
+                data.show()
+        else:
+            data, format = next(self.load_data(output, limit, DataFrameFormat.ORIGINAL, iterate=False)), DataFrameFormat.ORIGINAL
+            logger.critical(f"In format: {format.value!r}")
+            logger.critical("--------------------------------------")
+            for line in data:
+                print(line)
+
+        return data, format
+
+    def load_data(
+        self,
+        output: Union[MarshalingView, MarshalerNode],
+        limit: int = None,
+        format: Union[DataFrameFormat, str] = None,
+        spark: "SparkSession" = None,
+        iterate: bool = False,
+    ) -> Iterator[Any]:
+        """Preview the output in the format (Pandas/Spark dataframe or as the original data format) for a certain number
+         of records and also return the previewed data back to the user.
+
+        :param output: Materialized view of an internal data node (it can also be upstream).
+        :param limit: limit the number of records to be loaded. API loads all data if not specified.
+        :param format: determine whether the returned frame should be in Pandas, Spark or in the native format
+        (CSV, Parquet, etc in bytes).
+        :param iterate: boolean parameter that controls how the different parts of the underlying data will be read,
+        hence the return type. if it is enabled, then the return type is an iterator of data type determined by 'format'
+         parameter.
+        :return: Depending on the 'format' and 'iterate' parameters, returns an iterator for the parts or for the merged
+         version of Spark dataframes or Pandas dataframes or the original data for the target output partition (e.g CSV)
+        """
+        node: MarshalerNode = None
+        if isinstance(output, MarshalingView):
+            node = output.marshaler_node
+        elif isinstance(output, MarshalerNode):
+            node = output
+        else:
+            logging.error(f"Please provide a data node (if it is dimensionless) or filtered material version of it.")
+            raise ValueError(f"Wrong input type {type(output)} for Application::load_data(Union[MarshalingView, MarshalerNode]).")
+
+        if limit is not None and (not isinstance(limit, int) or limit <= 0):
+            raise ValueError(f"Please provide a positive value of type 'int' as 'limit' parameter to Application::load_data API")
+
+        if format:
+            format = DataFrameFormat(format.upper())
+
+        materialized_output: Signal = self._get_input_signal(output)
+        # TODO support node declarations with RelativeVariants which would have multipled branches in their filter spec
+        #  in that case this param should be 'materialized_paths' and Application::poll will support
+        #  full range check and return multiple paths.
+        materialized_path: str = None
+        data_it: Iterator[Tuple[str, bytes]] = None
+        if isinstance(node.bound, InternalDataNode):
+            internal_data_node = cast(InternalDataNode, node.bound)
+            # at this point, we might have either an internal or upstream internal dataset here
+
+            dimension_values = json.dumps(materialized_output.domain_spec.dimension_filter_spec.pretty(), indent=10)
+            logger.critical(f"Checking the existence of output for {internal_data_node.data_id!r} on dimension values: {dimension_values}")
+            materialized_path, record = self.poll(output)
+            if not materialized_path:
+                error_str = f"Input {internal_data_node.data_id!r} does not have the output for the dimension values: {dimension_values}"
+                logger.critical(error_str)
+                yield None
+
+            platform = self._get_platform_for(internal_data_node.signal())
+
+            data_it = platform.storage.load_internal(materialized_output)
+
+        elif isinstance(node.bound, ExternalDataNode):
+            # we do this extra check here because materialize API normally allows rendering with special chars too.
+            # we currently don't allow batch load of partitions using '*', relative variants.
+            if not materialized_output.domain_spec.dimension_filter_spec.is_material():
+                logging.error(f"Input data node {node.bound.data_id!r} to Application::load_data does not have" f" a materialized view!")
+                logging.error(f"Required dimensions and current values: {node.dimensions()}")
+                logging.error("Please use concrete dimension values for the input.")
+                raise ValueError(f"Can load materialized data nodes or views only!")
+            materialized_path = self.materialize(output)[0]
+            data_it = self._load_external_data(cast(ExternalDataNode, node.bound), output, materialized_output, materialized_path, limit)
+        else:
+            error_str = f"Node type {type(node.bound)} is not supported for Application::load_data API!"
+            logger.error(error_str)
+            raise ValueError(error_str)
+
+        logging.critical(f"Loading {limit if limit is not None and limit > 0 else 'all'} records from {materialized_path!r} ...")
+        schema_file = materialized_output.resource_access_spec.data_schema_file
+        dataset_access_spec = cast(DatasetSignalSourceAccessSpec, materialized_output.resource_access_spec)
+        data_format: str = dataset_access_spec.data_format.value
+        data_delimiter: str = dataset_access_spec.data_delimiter
+        data_encoding: str = dataset_access_spec.data_encoding
+        data_header_exists: bool = dataset_access_spec.data_header_exists
+        data_compression: Optional[str] = dataset_access_spec.data_compression
+        if format == DataFrameFormat.PANDAS:
+            # Pandas
+            import pandas as pd
+            from io import BytesIO, StringIO
+
+            pandas_df_list = []
+            retrieved_so_far = 0
+            for physical_path, data in data_it:
+                if not data:
+                    continue
+
+                if schema_file and physical_path.lower().endswith(schema_file.lower()):
+                    continue
+
+                if data_format.lower() == DatasetSignalSourceFormat.CSV.value.lower():
+                    # see https://pandas.pydata.org/pandas-docs/stable/reference/api/pandas.read_csv.html
+                    # if cannot resolve delimiter, use "engine='python'" which will use csv.Sniffer
+                    df = pd.read_csv(
+                        StringIO(str(data, data_encoding)),
+                        nrows=limit - retrieved_so_far,
+                        sep=data_delimiter,
+                        engine="python" if not data_delimiter else None,
+                    )
+                    # df = pd.read_csv(BytesIO(data), sep=data_delimiter)
+                elif data_format.lower() == DatasetSignalSourceFormat.PARQUET.value.lower():
+                    try:
+                        df = pd.read_parquet(BytesIO(data))
+                    except ValueError:  # _SUCCESS file, Schema file, etc
+                        continue
+                elif data_format.lower() == DatasetSignalSourceFormat.JSON.value.lower():
+                    # TODO skip completition protocol and schema files
+                    df = pd.read_json(StringIO(str(data, data_encoding)))
+                else:
+                    raise NotImplementedError(f"Loading {data_format!r} with Pandas not supported yet!")
+                retrieved_so_far = retrieved_so_far + len(df.index)
+                stop = False
+                if limit is not None and retrieved_so_far >= limit:
+                    stop = True
+                    if retrieved_so_far > limit:
+                        # drop from end
+                        df = df[: limit - retrieved_so_far]
+                        retrieved_so_far = limit
+
+                if iterate:
+                    logger.critical(f"Returning part {physical_path!r} in Pandas Dataframe...")
+                    logger.critical(f"retrieved so far: {retrieved_so_far}/{limit if limit is not None else 'ALL'}")
+                    logger.critical("---------------------------------")
+                    yield df
+                else:
+                    pandas_df_list.append(df)
+
+                if stop:
+                    break
+
+            if not iterate:
+                # see https://pandas.pydata.org/pandas-docs/stable/reference/api/pandas.concat.html
+                merged_df = pd.concat(pandas_df_list, ignore_index=True) if len(pandas_df_list) > 1 else pandas_df_list[0]
+                logger.critical(f"Retrieved {len(merged_df.index)} records:")
+                logger.critical("--------------------------------------")
+                yield merged_df
+        elif format == DataFrameFormat.SPARK:
+            spark_created_implicitly = False
+            if not spark:
+                spark_created_implicitly = True
+                from intelliflow.mixins.local_compute.test_local_spark import LocalSparkTestMixin
+                from intelliflow.mixins.local_compute.spark_versions import IntelliFlowSparkVersion
+
+                from pyspark.sql import SparkSession
+
+                spark_mixin = LocalSparkTestMixin()
+                spark_mixin.setup(IntelliFlowSparkVersion.DEFAULT_SPARK_VER)
+                spark = SparkSession.builder.master("local[*]").appName(self.uuid).getOrCreate()
+
+                # session logic for enabling hive support should be moved to LocalSparkTestMixin
+                # try:
+                #     # try to use the current config (it might or might not be in local mode already)
+                #     conf = SparkConf()
+                #     conf.setAppName(self.uuid)
+                #     spark = SparkSession.builder.appName(self.uuid).config(conf=SparkConf()).enableHiveSupport().getOrCreate()
+                # except:
+                #     # fall-back to local mode (with as many cores as possible)
+                #     spark = SparkSession.builder.appName(self.uuid).master("local[*]").enableHiveSupport().getOrCreate()
+
+            merged_df = None
+            try:
+                # TODO might fail if root-level (driver owned credentials) does not have dev-role permissions.
+                #  it might still work if its admin (and also) from the same account (majority of the cases).
+                #  - pending on setting up Spark port on Sagemaker.
+                # TODO read the delimiter from the spec (see TODO in BasicBatchDataInputMap::dumps)
+                merged_df = spark.read.load(
+                    materialized_path,
+                    format=data_format,
+                    sep=data_delimiter,
+                    inferSchema="true",
+                    header="true" if data_header_exists else "false",
+                )
+                if limit is not None:
+                    merged_df = merged_df.limit(limit)
+            except:
+                pass
+
+            if merged_df is not None:
+                yield merged_df
+            else:
+                retrieved_so_far = 0
+                for physical_path, data in data_it:
+                    if not data:
+                        continue
+                    if schema_file and physical_path.lower().endswith(schema_file.lower()):
+                        continue
+                    if data_format.lower() == DatasetSignalSourceFormat.CSV.value.lower():
+                        df = spark.read.csv(
+                            spark.sparkContext.parallelize(data.decode(data_encoding).splitlines()),
+                            header="true" if data_header_exists else "false",
+                            inferSchema="true",
+                        )
+
+                    elif data_format.lower() == DatasetSignalSourceFormat.PARQUET.value.lower():
+                        from io import StringIO
+
+                        df = spark.read.load(
+                            StringIO(str(data, data_encoding)),
+                            format=data_format.lower(),
+                            inferSchema="true",
+                            header="true" if data_header_exists else "false",
+                        )
+                    else:
+                        raise NotImplementedError(f"Loading {data_format!r} with Spark not supported yet!")
+
+                    df_count = df.count()
+                    retrieved_so_far = retrieved_so_far + df_count
+                    stop = False
+                    if limit is not None and retrieved_so_far >= limit:
+                        stop = True
+                        if retrieved_so_far > limit:
+                            # drop from end
+                            df = df.limit(df_count - (retrieved_so_far - limit))
+                            retrieved_so_far = limit
+
+                    if iterate:
+                        logger.critical(f"Returning part {physical_path!r} in Spark Dataframe...")
+                        logger.critical(f"retrieved so far: {retrieved_so_far}/{limit if limit is not None else 'ALL'}")
+                        logger.critical("---------------------------------")
+                        yield df
+                    else:
+                        merged_df = merged_df.unionAll(df) if merged_df else df
+
+                    if stop:
+                        break
+
+                if not iterate:
+                    logger.critical(f"Retrieved and merged {retrieved_so_far} records from all of the partitions.")
+                    logger.critical("--------------------------------------")
+                    yield merged_df
+            if spark_created_implicitly:
+                spark.sparkContext.stop()
+
+        elif data_format.lower() == DatasetSignalSourceFormat.CSV.value.lower():
+            # TODO make sure IntelliFlow BatchCompute enforces utf-8
+            #  or 'encoding' should be added to data access spec declaration.
+            import csv
+
+            all_data = []
+            retrieved_so_far = 0
+            if limit is not None:
+                limit = limit if not data_header_exists else limit + 1
+            for physical_path, data in data_it:
+                if not data:
+                    continue
+                if schema_file and physical_path.lower().endswith(schema_file.lower()):
+                    continue
+
+                csv_data = list(csv.reader(data.decode(data_encoding).splitlines()))
+                retrieved_so_far = retrieved_so_far + len(csv_data)
+                stop = False
+                if limit is not None and retrieved_so_far >= limit:
+                    stop = True
+                    if retrieved_so_far > limit:
+                        csv_data = csv_data[: limit - retrieved_so_far]
+                        retrieved_so_far = limit
+
+                if iterate:
+                    logger.critical(f"Returning CSV part {physical_path!r} as a list of tuples of {len(csv_data[0])} elements ...")
+                    logger.critical(f"retrieved so far: {retrieved_so_far}/{limit if limit is not None else 'ALL'}")
+                    logger.critical("---------------------------------")
+                    for line in csv_data:
+                        logger.critical(line)
+                    yield csv_data
+                else:
+                    # check header
+                    if data_header_exists and len(all_data) > 0 and all_data[0] == csv_data[0]:
+                        # skip
+                        all_data.extend(csv_data[1:])
+                    else:
+                        all_data.extend(csv_data)
+
+                if stop:
+                    break
+
+            if not iterate:
+                logger.critical(f"Retrieved {len(all_data)} records:")
+                yield all_data
+        else:
+            logger.critical(f"Transformation for data format {data_format!r} is not supported.")
+            logger.critical(f"Defaulting to limitless iteration over raw partition data.")
+            yield from data_it
+
+    def _load_external_data(
+        self,
+        external_data_node: ExternalDataNode,
+        output: Union[MarshalingView, MarshalerNode],
+        materialized_output: Signal,
+        materialized_path: str,
+        limit: int = None,
+    ) -> Iterator[Tuple[str, bytes]]:
+        """Load external data in an Application and Platform impl specific way.
+
+        Return type is same as 'Storage::load_internal' which is used for the load operation of internal data.
+        """
+        raise NotImplementedError(f"Application::_load_external_data is not provided by this Application impl {type(self)}")
+
+    # custom dashboarding
+    # TODO convert dashboarding parameters to well-defined types
+    def create_dashboard(self, id: str, **kwargs) -> None:
+        if self.dev_context.get_dashboard(id):
+            raise ValueError(f"Dashboard with the same id {id!r} already exists!")
+
+        initial_data: Dict[str, Any] = self.platform.diagnostics.create_dashboard(**kwargs)
+        self.dev_context.add_dashboard(id, initial_data)
+
+    def create_text_widget(self, dashboard_id: str, markdown: str, **kwargs) -> None:
+        if not self.dev_context.get_dashboard(dashboard_id):
+            raise ValueError(f"Dashboard with the id {id!r} does not exist! Please create it with `create_dashboard` first.")
+        current_data = self._dev_context.get_dashboard(dashboard_id)
+        self.platform.diagnostics.add_text_widget(current_data, markdown, **kwargs)
+
+    def create_alarm_status_widget(
+        self, dashboard_id: str, title: str, alarms: List[Union[FilteredView, MarshalerNode, Signal]], **kwargs
+    ) -> None:
+        if not self.dev_context.get_dashboard(dashboard_id):
+            raise ValueError(f"Dashboard with the id {id!r} does not exist! Please create it with `create_dashboard` first.")
+
+        if not alarms:
+            raise ValueError(f"Please provide at least one alarm signal for the alarm status widget!")
+
+        alarm_signals = [self._get_input_signal(filtered_view) for filtered_view in alarms]
+        alarm_signals = self._check_upstream(alarm_signals)
+
+        # validate signal type
+        for s in alarm_signals:
+            if not s.type.is_alarm():
+                raise ValueError(f"Input {s.alias!r} must be an alarm!")
+
+        current_data = self._dev_context.get_dashboard(dashboard_id)
+        self.platform.diagnostics.add_alarm_status_widget(current_data, title, alarm_signals, **kwargs)
+
+    def create_alarm_widget(
+        self, dashboard_id: str, alarm: Union[FilteredView, MarshalerNode, Signal], title: Optional[str] = None, **kwargs
+    ) -> None:
+        """Convenience wrapper for alarms only"""
+        self.create_metric_widget(dashboard_id, [alarm], title, **kwargs)
+
+    def create_metric_widget(
+        self, dashboard_id: str, metrics_or_alarm: List[Union[FilteredView, MarshalerNode, Signal]], title: Optional[str] = None, **kwargs
+    ) -> None:
+        if not self.dev_context.get_dashboard(dashboard_id):
+            raise ValueError(f"Dashboard with the id {id!r} does not exist! Please create it with `create_dashboard` first.")
+
+        if not metrics_or_alarm:
+            raise ValueError(f"Please provide at least one metric signal or a single alarm for the metric widget!")
+
+        metric_signals_or_alarm = [self._get_input_signal(filtered_view) for filtered_view in metrics_or_alarm]
+        metric_signals_or_alarm = self._check_upstream(metric_signals_or_alarm)
+
+        # validate signal type
+        for s in metric_signals_or_alarm:
+            if not (s.type.is_metric() or s.type.is_alarm()):
+                raise ValueError(f"Input {s.alias!r} should be either a metric or an alarm!")
+            if s.type.is_metric():
+                # at this point metric signals should be materialized by the client (name, stats, period)
+                self.platform.diagnostics.check_metric_materialization(s)
+
+        current_data = self._dev_context.get_dashboard(dashboard_id)
+        self.platform.diagnostics.add_metric_widget(current_data, metric_signals_or_alarm, title, **kwargs)
 
 
 __test__ = {name: value for name, value in locals().items() if name.startswith("test_")}

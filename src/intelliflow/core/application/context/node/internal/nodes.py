@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import copy
-from abc import ABC, abstractmethod
+from abc import abstractmethod
+from textwrap import dedent
 from typing import Any, Callable, ClassVar, Dict, List, Optional, Sequence, Union
 from uuid import uuid4
 
@@ -11,7 +12,7 @@ from intelliflow.core.application.context.node.filtered_views import FilteredVie
 from intelliflow.core.permission import Permission
 from intelliflow.core.platform.compute_targets.descriptor import ComputeDescriptor as ComputeTargetDescriptor
 from intelliflow.core.platform.development import HostPlatform
-from intelliflow.core.serialization import dumps
+from intelliflow.core.serialization import SerializationError, dumps
 from intelliflow.core.signal_processing import Signal, Slot
 from intelliflow.core.signal_processing.definitions.compute_defs import ABI, Lang
 from intelliflow.core.signal_processing.dimension_constructs import DimensionSpec
@@ -76,14 +77,27 @@ class InternalDataNode(DataNode):
     class BatchComputeDescriptor(ComputeDescriptor):
         # overrides
         def __init__(self, code: str, lang: Lang, abi: ABI, permissions: List[Permission], retry_count: int, **kwargs) -> None:
+            # This should be the best place we can format user code. We can't move this into base class
+            # ComputeDescriptor, because `code` in InlinedComputeDescriptor is a serialized(encoded) string of user's
+            # Callable, and the "encoded" string can contain '\n'.
+            if type(code) == str and lang == Lang.PYTHON:
+                # `code` can be either of type `str`, or its subclass (`SlotCode`)
+                # We don't do formatting when input is `SlotCode`, because in practice, `SlotCode` is typically created
+                # to represent code from a python module, or in another language (e.g. Scala), in which case indentation
+                # does not cause problems
+                # If we decide to format SlotCode as well, notice applying any `str` methods on `SlotCode` will return
+                # a new `str` object (rather than a SlotCode object) and cause we lose code metadata info.
+                code = dedent(code).strip("\r\n")
             super().__init__(SlotType.ASYNC_BATCH_COMPUTE, code, lang, abi, permissions, retry_count, **kwargs)
 
         # overrides
-        def create_output_attributes(self, platform: "HostPlatform", user_attrs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        def create_output_attributes(
+            self, platform: "HostPlatform", inputs: List[Signal], user_attrs: Dict[str, Any]
+        ) -> Optional[Dict[str, Any]]:
             """Compute descriptor asks the related construct/driver for default compute args (that would possibly be passed
             into nodes/routes).
             """
-            return platform.batch_compute.provide_output_attributes(self.create_slot(None), user_attrs)
+            return platform.batch_compute.provide_output_attributes(inputs, self.create_slot(None), user_attrs)
 
     def __init__(
         self,
@@ -129,16 +143,19 @@ class InternalDataNode(DataNode):
     @classmethod
     def _check_hook_type(cls, route_hook: Optional[Union[ComputeTargetDescriptor, Callable, Slot]]) -> Optional[Slot]:
         if route_hook:
-            if isinstance(route_hook, ComputeTargetDescriptor):
-                return route_hook.create_slot(None)
-            elif isinstance(route_hook, Callable):
-                return InternalDataNode.InlinedComputeDescriptor(route_hook).create_slot(None)
-            elif isinstance(route_hook, Slot):
-                return route_hook
-            else:
-                raise ValueError(
-                    f"Wrong type {type(route_hook)} provided as hook! It should be either a <ComputeDescriptor>, <Callable> or <Slot>."
-                )
+            try:
+                if isinstance(route_hook, ComputeTargetDescriptor):
+                    return route_hook.create_slot(None)
+                elif isinstance(route_hook, Callable):
+                    return InternalDataNode.InlinedComputeDescriptor(route_hook).create_slot(None)
+                elif isinstance(route_hook, Slot):
+                    return route_hook
+                else:
+                    raise ValueError(
+                        f"Wrong type {type(route_hook)} provided as hook! It should be either a <ComputeDescriptor>, <Callable> or <Slot>."
+                    )
+            except SerializationError as se:
+                raise ValueError(f"Hook is not serializable! Hook: ({route_hook!r}). Error: ", se)
 
     def _check_execution_callables(self, execution_hook: Optional[RouteExecutionHook]) -> Optional[RouteExecutionHook]:
         """Check the callables and convert them to Slots by reusing InlinedComputeDescriptor

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # helps modules that won't be as part of the deployed bundle to use InlinedCompute.
-# ex: test, test_integration, etc.
+# ex: test, integration_tests, etc.
 import uuid
 from typing import Any, ClassVar, Dict
 
@@ -78,6 +78,9 @@ class InlinedComputeRetryVerifier(IInlinedCompute):
 
         assert params.get("dimensions", None) is not None, "Output 'dimensions' map not in InlinedCompute params"
         assert params.get("dimensions_map", None) is not None, "Output 'dimensions_map' map not in InlinedCompute params"
+        assert params.get("routing_table", None) is not None, "'routing_table' not in InlinedCompute params"
+        assert params.get("platform", None) is not None, "'platform' not in InlinedCompute params"
+        assert params.get("runtime_platform", None) is not None, "'runtime_platform' not in InlinedCompute params"
 
         s3 = params[AWSCommonParams.BOTO_SESSION].resource("s3")
         bucket = get_bucket(s3, self._storage_bucket)

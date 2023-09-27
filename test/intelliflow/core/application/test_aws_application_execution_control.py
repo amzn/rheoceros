@@ -41,10 +41,10 @@ class TestAWSApplicationExecutionControl(AWSTestBase):
             "detail": {},
         }
 
-    def _create_test_application(self, id_or_app: Union[str, Application]):
+    def _create_test_application(self, id_or_app: Union[str, Application], **params):
         if isinstance(id_or_app, str):
             id = id_or_app
-            app = AWSApplication(id, self.region)
+            app = AWSApplication(id, self.region, **params)
         else:
             app = id_or_app
             id = app.id
@@ -79,12 +79,12 @@ class TestAWSApplicationExecutionControl(AWSTestBase):
 
         app.create_data(
             id="DUCSI_WITH_SO",
-            inputs={"DEXML_DUCSI": ducsi_data["*"][:-2], "SHIP_OPTIONS": ship_options},
+            inputs={"DEXML_DUCSI": ducsi_data["*"][:-1], "SHIP_OPTIONS": ship_options},
             compute_targets=[
                 BatchCompute(
-                    "output=DEXML_DUCSI.sample(True, 0.00001).join(SHIP_OPTIONS.select('ship_option'), DEXML_DUCSI.customer_ship_option == SHIP_OPTIONS.ship_option).limit(10)",
+                    "output=DEXML_DUCSI.sample(True, 0.0000001).join(SHIP_OPTIONS.select('ship_option'), DEXML_DUCSI.customer_ship_option == SHIP_OPTIONS.ship_option).limit(10)",
                     WorkerType=GlueWorkerType.G_1X.value,
-                    NumberOfWorkers=10,
+                    NumberOfWorkers=70,
                     GlueVersion="1.0",
                 )
             ],
@@ -205,6 +205,7 @@ class TestAWSApplicationExecutionControl(AWSTestBase):
         app.activate()
         # mock batch_compute response
         def compute(
+            route: Route,
             materialized_inputs: List[Signal],
             slot: Slot,
             materialized_output: Signal,
@@ -237,6 +238,7 @@ class TestAWSApplicationExecutionControl(AWSTestBase):
         ship_options = app.get_data("ship_options", context=Application.QueryContext.DEV_CONTEXT)[0]
         # mock again
         def compute(
+            route: Route,
             materialized_inputs: List[Signal],
             slot: Slot,
             materialized_output: Signal,
@@ -275,6 +277,7 @@ class TestAWSApplicationExecutionControl(AWSTestBase):
 
         # initiate another trigger on 'REPEAT_DUCSI' with a different partition (12-26)
         def compute(
+            route: Route,
             materialized_inputs: List[Signal],
             slot: Slot,
             materialized_output: Signal,
@@ -297,6 +300,7 @@ class TestAWSApplicationExecutionControl(AWSTestBase):
         #   we will have to use related app API to force update RoutingTable status.
         # only active record remaining should be the most recent one (12-26):
         def compute(
+            route: Route,
             materialized_inputs: List[Signal],
             slot: Slot,
             materialized_output: Signal,
@@ -327,6 +331,9 @@ class TestAWSApplicationExecutionControl(AWSTestBase):
         assert DimensionFilter.check_equivalence(
             active_output.domain_spec.dimension_filter_spec, DimensionFilter.load_raw({1: {"2020-12-26": {}}})
         )
+        assert app.has_active_record(app["REPEAT_DUCSI"][1]["2020-12-26"])
+        assert not app.has_active_record(app["REPEAT_DUCSI"][1]["2020-12-25"])
+        assert not app.has_active_record(app["REPEAT_DUCSI"][1]["2020-12-27"])
 
         self.patch_aws_stop()
 
@@ -381,6 +388,7 @@ class TestAWSApplicationExecutionControl(AWSTestBase):
         repeat_ducsi = app["REPEAT_DUCSI"]
         # mock batch_compute APIs to make the route active.
         def compute(
+            route: Route,
             materialized_inputs: List[Signal],
             slot: Slot,
             materialized_output: Signal,
@@ -431,6 +439,7 @@ class TestAWSApplicationExecutionControl(AWSTestBase):
         # despite the result of the previous successful execution from above.
         # trigger update (a new execution) on same partition again.
         def compute(
+            route: Route,
             materialized_inputs: List[Signal],
             slot: Slot,
             materialized_output: Signal,
@@ -563,10 +572,13 @@ class TestAWSApplicationExecutionControl(AWSTestBase):
 
         # data is not ready yet
         assert app.poll(eureka_data_from_parent["NA"]["2020-12-26"]) == (None, None)
+        # also test the ability to check active records from parent app
+        assert not app.has_active_record(eureka_data_from_parent["NA"]["2020-12-26"])
         assert app.poll(upstream_app["eureka_default_selection_data_over_two_days"]["NA"]["2020-12-26"]) == (None, None)
 
         # trigger upstream execution on 'eureka_default_selection_data_over_two_days' by injecting its two inputs.
         def compute(
+            route: Route,
             materialized_inputs: List[Signal],
             slot: Slot,
             materialized_output: Signal,
@@ -599,9 +611,52 @@ class TestAWSApplicationExecutionControl(AWSTestBase):
         processor_thread = threading.Thread(target=next_cycle, args=())
         processor_thread.start()
 
+        assert app.has_active_record(eureka_data_from_parent["NA"]["2020-12-26"])
         assert app.poll(eureka_data_from_parent["NA"]["2020-12-26"])[0].endswith(
             "internal_data/eureka_default_selection_data_over_two_days/NA/26-12-2020"
         )
+
+        self.patch_aws_stop()
+
+    def test_application_has_active_compute_record_validations(self):
+        """Capture corner-cases for Application::has_active_records which are not handled in other test-cases.
+        For other cases such as checking the records for an upstream data node please other test-cases
+        (e.g test_application_poll_on_upstream_data)
+        """
+        self.patch_aws_start(glue_catalog_has_all_tables=True)
+
+        app = self._create_test_application("has_act_recs")
+        # - bad input type
+        with pytest.raises(ValueError):
+            app.has_active_record(int)
+
+        # - yes even a signal is not supported, since active record checking requires app-level (front-end) information that
+        # can be provided by node types.
+        with pytest.raises(ValueError):
+            app.has_active_record(
+                Signal(
+                    SignalType.INTERNAL_PARTITION_CREATION,
+                    SignalSourceAccessSpec(SignalSourceType.INTERNAL, "/internal_data/data/{}", {}),
+                    SignalDomainSpec(None, None, None),
+                )
+            )
+
+        # - external data node not allowed
+        with pytest.raises(ValueError):
+            app.has_active_record(app.get_data("DEXML_DUCSI", context=Application.QueryContext.DEV_CONTEXT)[0])
+
+        # - try to check active records on an inactive application.
+        repeat_ducsi = app.get_data("REPEAT_DUCSI", context=Application.QueryContext.DEV_CONTEXT)[0]
+
+        # - input filter is not materialized
+        with pytest.raises(ValueError):
+            app.has_active_record(repeat_ducsi[1]["*"])
+
+        assert not app.has_active_record(repeat_ducsi[1]["2020-12-26"])
+
+        app.activate()
+
+        assert not app.has_active_record(repeat_ducsi[1]["2020-12-26"])
 
         self.patch_aws_stop()
 
@@ -659,6 +714,7 @@ class TestAWSApplicationExecutionControl(AWSTestBase):
         # now check the happy-path to be a reference against false-negatives in the previous steps
         # show that 'REPEAT_DUCSI' can execute well if materialized.
         def compute(
+            route: Route,
             materialized_inputs: List[Signal],
             slot: Slot,
             materialized_output: Signal,
@@ -704,6 +760,7 @@ class TestAWSApplicationExecutionControl(AWSTestBase):
         # now check the happy-path to be a reference against false-negatives in the previous steps
         # show that 'REPEAT_DUCSI' can execute well if materialized.
         def compute(
+            route: Route,
             materialized_inputs: List[Signal],
             slot: Slot,
             materialized_output: Signal,
@@ -794,6 +851,7 @@ class TestAWSApplicationExecutionControl(AWSTestBase):
         # now check the happy-path to be a reference against false-negatives in the previous steps
         # show that 'REPEAT_DUCSI' can execute well if materialized.
         def compute(
+            route: Route,
             materialized_inputs: List[Signal],
             slot: Slot,
             materialized_output: Signal,
@@ -947,6 +1005,12 @@ class TestAWSApplicationExecutionControl(AWSTestBase):
             ],
         )
 
+        app.validate(tommy_daily_etl, tommy_daily["us"]["20210526"])
+        # expose the linking issue if the LONG typed hour dimension on the input is different
+        # User provided link will raise this as expected at runtime
+        with pytest.raises(RuntimeError):
+            app.validate(tommy_daily_etl, tommy_daily["us"]["111"])
+
         # show how simple it is to rely on auto spec adaptation from the first input and auto-input linking since
         # both inputs also match on dimension type (datetime) and name ('day' [PIPELINE_DAY_DIMENSION])
         tommy_daily_etl2 = app.create_data(
@@ -1041,6 +1105,163 @@ class TestAWSApplicationExecutionControl(AWSTestBase):
 
         self.patch_aws_stop()
 
+    def test_application_execute_implicit_activation(self):
+        self.patch_aws_start(glue_catalog_has_all_tables=True)
+
+        app = AWSApplication("exec-act", self.region)
+
+        # temporary hack until we have a testing anchor on Application,
+        # to track activate calls without disturbing the internal sequence.
+        app._activate_original = app.activate
+
+        def activate_hook():
+            app._activate_original()
+
+        app.activate = MagicMock(side_effect=activate_hook)
+
+        assert app.activate.call_count == 0
+
+        def my_lambda_reactor(input_map: Dict[str, Signal], materialized_output: Signal, params: "ConstructParamsDict") -> Any:
+            from intelliflow.core.platform.definitions.aws.common import CommonParams as AWSCommonParams
+
+            pass
+
+        node_1_1 = app.create_data(id=f"Node_1_1", compute_targets=[InlinedCompute(my_lambda_reactor), NOOPCompute])
+
+        def on_exec_begin_hook(
+            routing_table: "RoutingTable",
+            route_record: "RoutingTable.RouteRecord",
+            execution_context: "Route.ExecutionContext",
+            current_timestamp_in_utc: int,
+            **params,
+        ):
+            pass
+
+        app.execute(node_1_1)
+        # verify that activation was called implicitly
+        assert app.activate.call_count == 1
+
+        app.execute(node_1_1)
+        # verify that activation NOT called the second time
+        assert app.activate.call_count == 1
+
+        node_1_2 = app.create_data(
+            id=f"Node_1_2",
+            inputs=[node_1_1],
+            compute_targets=[NOOPCompute],
+            execution_hook=RouteExecutionHook(on_exec_begin=on_exec_begin_hook),
+        )
+
+        app.execute(node_1_1)
+        # verify that activation was called implicitly due to change in the dependency tree of the first node (a new child added)
+        assert app.activate.call_count == 2
+
+        def on_exec_begin_hook_new(*args, **params):
+            print("new hook")
+
+        # change the hook and verify implicit activation
+        node_1_2 = app.update_data(
+            id=f"Node_1_2",
+            inputs=[node_1_1],
+            compute_targets=[NOOPCompute],
+            execution_hook=RouteExecutionHook(on_exec_begin=on_exec_begin_hook_new),
+        )
+
+        app.execute(node_1_1)
+        # verify that activation was called implicitly due to change in the hook of second node
+        assert app.activate.call_count == 3
+
+        def on_exec_failure_hook(
+            routing_table: "RoutingTable",
+            route_record: "RoutingTable.RouteRecord",
+            execution_context_id: str,
+            materialized_inputs: List[Signal],
+            materialized_output: Signal,
+            current_timestamp_in_utc: int,
+            **params,
+        ) -> None:
+            pass
+
+        node_1_3 = app.create_data(
+            id=f"Node_1_3",
+            inputs=[node_1_1],
+            compute_targets=[InlinedCompute(lambda input_map, output, params: int("foo"))],
+            execution_hook=RouteExecutionHook(on_failure=on_exec_failure_hook),
+        )
+
+        app.execute(node_1_1)
+        # verify that activation was called implicitly due to change in the dependency tree of the first node (a new child added)
+        assert app.activate.call_count == 4
+
+        # update the first node and verify that no activation should occur
+        node_1_1 = app.update_data(id=f"Node_1_1", compute_targets=[InlinedCompute(my_lambda_reactor), NOOPCompute])
+
+        app.execute(node_1_1)
+        # no activation!
+        assert app.activate.call_count == 4
+
+        def new_reactor(*args, **kwargs):
+            pass
+
+        # update the first node to change compute target
+        node_1_1 = app.update_data(
+            id=f"Node_1_1", compute_targets=[InlinedCompute(new_reactor), InlinedCompute(my_lambda_reactor), NOOPCompute]
+        )
+
+        app.execute(node_1_1)
+        # verify that activation was called implicitly due to change in the dependency tree of the first node (a new child added)
+        assert app.activate.call_count == 5
+
+        app.execute(node_1_1)
+        # verify that activation should not occur
+        assert app.activate.call_count == 5
+
+        def retry_hook(*args, **kwargs):
+            pass
+
+        # verify that a new hook should trigger implicit activation
+        node_1_1 = app.update_data(
+            id=f"Node_1_1",
+            compute_targets=[InlinedCompute(new_reactor), InlinedCompute(my_lambda_reactor), NOOPCompute],
+            execution_hook=RouteExecutionHook(on_compute_retry=retry_hook),
+        )
+
+        app.execute(node_1_1)
+        # verify that activation should occur
+        assert app.activate.call_count == 6
+
+        # patch the 3rd node with same hook
+        node_1_3 = app.patch_data("Node_1_3", execution_hook=RouteExecutionHook(on_failure=on_exec_failure_hook))
+
+        app.execute(node_1_1)
+        # verify that activation should not occur
+        assert app.activate.call_count == 6
+
+        # patch the 3rd node with a new hook (new callback)
+        node_1_3 = app.patch_data(
+            "Node_1_3", execution_hook=RouteExecutionHook(on_failure=on_exec_failure_hook, on_compute_retry=retry_hook)
+        )
+
+        app.execute(node_1_1)
+        # verify that activation should occur
+        assert app.activate.call_count == 7
+
+        # remove hook altogether and verify that there will be activation again
+        node_1_3 = app.patch_data("Node_1_3", execution_hook=RouteExecutionHook())
+
+        app.execute(node_1_1)
+        # verify that activation should occur
+        assert app.activate.call_count == 8
+
+        # finally execute on other nodes and verify that no activation would occur
+        app.execute(node_1_2)
+        with pytest.raises(RuntimeError):
+            app.execute(node_1_3)  # designed to fail (execute maps execution failure to runtime on user side)
+        # verify that activation should NOT occur
+        assert app.activate.call_count == 8
+
+        self.patch_aws_stop()
+
     def test_application_kill_batch_compute(self):
         """
         This test wants to capture the orchestration behaviour when user wants to forcefully kill an execution on a
@@ -1068,6 +1289,7 @@ class TestAWSApplicationExecutionControl(AWSTestBase):
         kill_state: Dict[str, bool] = dict()
 
         def compute(
+            route: Route,
             materialized_inputs: List[Signal],
             slot: Slot,
             materialized_output: Signal,
@@ -1103,12 +1325,15 @@ class TestAWSApplicationExecutionControl(AWSTestBase):
         app.update_active_routes_status()  # still will return PROCESSING
         assert len(app.get_active_route("test_node").active_compute_records) == 1
         assert len(app.get_active_route("test_node2").active_compute_records) == 1
+        assert app.has_active_record(test_node)
+        assert app.has_active_record(test_node_with_dimensions["2021-10-25"])
 
         # now kill it
         assert app.kill(test_node)
 
         app.update_active_routes_status()  # next cycle will get STOPPED from get_session_state and end the 1st exec.
         assert len(app.get_active_routes()) == 1
+        assert not app.has_active_record(test_node)
         assert len(app.get_active_route("test_node").active_compute_records) == 0
         assert len(app.get_active_route("test_node2").active_compute_records) == 1
         # now check with poll

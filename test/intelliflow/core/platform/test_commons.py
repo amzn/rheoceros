@@ -2,11 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+from unittest.mock import MagicMock
 
 import boto3
 import mock
 import pytest
-from mock import MagicMock
 from moto import (
     mock_applicationautoscaling,
     mock_autoscaling,

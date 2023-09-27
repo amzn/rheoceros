@@ -199,19 +199,16 @@ class AWSS3StorageBasic(AWSConstructMixin, Storage):
         return completely_wiped_out
 
     def is_internal(self, source_type: SignalSourceType, resource_path: str) -> bool:
-        if source_type == SignalSourceType.S3 and S3SignalSourceAccessSpec.from_url("", resource_path).bucket == self._bucket_name:
-            return True
+        if source_type == SignalSourceType.S3:
+            s3_access_spec = S3SignalSourceAccessSpec.from_url("", resource_path)
+            if s3_access_spec.bucket == self._bucket_name and s3_access_spec.folder == InternalDatasetSignalSourceAccessSpec.FOLDER:
+                return True
         return False
 
     def map_incoming_event(self, source_type: SignalSourceType, resource_path: str) -> Optional[SignalSourceAccessSpec]:
-        if source_type == SignalSourceType.S3:
-            s3_access_spec = S3SignalSourceAccessSpec.from_url("", resource_path)
-            if s3_access_spec.bucket == self._bucket_name:
-                if s3_access_spec.folder == InternalDatasetSignalSourceAccessSpec.FOLDER:
-                    mapped_path = resource_path.replace(f"s3://{self._bucket_name}", "")
-                    return SignalSourceAccessSpec(SignalSourceType.INTERNAL, mapped_path, None)
-                    # return InternalDatasetSignalSourceAccessSpec(s3_access_spec.get_partition_keys()[1],
-                    #                                             *s3_access_spec.get_partition_keys()[2:])
+        if self.is_internal(source_type, resource_path):
+            mapped_path = resource_path.replace(f"s3://{self._bucket_name}", "")
+            return SignalSourceAccessSpec(SignalSourceType.INTERNAL, mapped_path, None)
         return None
 
     def map_internal_data_access_spec(self, data_access_spec: SignalSourceAccessSpec) -> SignalSourceAccessSpec:
@@ -1027,7 +1024,7 @@ class AWSS3StorageBasic(AWSConstructMixin, Storage):
         # a concern to be consistent with what we always do in termination to revert whatever was done in the activation.
         exponential_retry(
             put_cmk_policy,
-            ["DependencyTimeoutException", "KMSInternalException"],
+            ["DependencyTimeoutException", "KMSInternalException", "AccessDeniedException"],
             self._kms,
             self._cmk_id,
             self._account_id,

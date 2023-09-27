@@ -26,7 +26,7 @@ import intelliflow.api as flow
 from intelliflow.api import *
 
 region = "us-east-1" #TODO read from ENV
-stage = "development-yunusko"
+stage = "beta"
 app_name = f"eureka-{stage}"
 flow.init_basic_logging("./eureka_main_interactive_mode")
 
@@ -50,11 +50,11 @@ app.process({
             "s3":{
                 "s3SchemaVersion":"1.0",
                 "bucket":{
-                    "name":"dex-ml-eureka-model-training-data",
-                    "arn":"arn:aws:s3:::dex-ml-eureka-model-training-data"
+                    "name":"eureka-model-training-data",
+                    "arn":"arn:aws:s3:::eureka-model-training-data"
                 },
                 "object":{
-                    "key":"cradle_eureka_p3/v8_00/training-data/NA/2020-08-01/_SUCCESS",
+                    "key":"eureka_p3/v8_00/training-data/NA/2020-08-01/_SUCCESS",
                 }
             }
         }
