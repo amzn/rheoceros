@@ -11,7 +11,7 @@ flow.init_basic_logging()
 region_id = 1
 marketplace_id = 1
 
-app = AWSApplication(app_name, "us-east-1", "842027028048")
+app = AWSApplication(app_name, "us-east-1")
 
 timer = app.add_timer("adex_timer",  # node IDs should use in Python/Scala variable naming scheme (convert '-' to '_')
                       "rate(5 minutes)",
@@ -63,7 +63,7 @@ adex_kickoff_job = app.create_data(id="ADEX_BladeKickOffJob",
                                                        """
                                                         ,
                                                         external_library_paths=[
-                                                            "s3://if-awsglue-adex-ml-230392972774-us-east-1/batch/DexmlBladeGlue-super.jar"
+                                                            "s3://{JAR_BUCKET}/batch/DexmlBladeGlue-super.jar"
                                                         ]
                                                         ),
                                            lang=Lang.SCALA,

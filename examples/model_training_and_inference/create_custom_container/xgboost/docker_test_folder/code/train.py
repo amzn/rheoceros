@@ -26,7 +26,7 @@ def _train(args):
     print(f"Loading data from {str(train_dir)}, files: {[str(f) for f in train_dir.iterdir()]}")
 
     df = dd.read_csv(str(train_dir / "*.csv")).compute()
-    # df = dd.read_csv('s3://test-sample-modeling-us-east-1/df_train/snapshot_date=2022-02-01-2022-03-02/*.csv').compute()
+    # df = dd.read_csv('s3://{EXT_TRAINING_DATA_BUCKET}/df_train/snapshot_date=2022-02-01-2022-03-02/*.csv').compute()
 
     print(f"Preparing training data")
 

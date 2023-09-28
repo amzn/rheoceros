@@ -52,7 +52,7 @@ pdex_smart_filtering_data = app.marshal_external_data(
         # first partition key is marketplace, e.g. "NA"
         "{}",
         # second partition key is day, e.g. "2022-07-23"
-        "pdex-smart-filtering-merged-with-header-v1.2-{}",
+        "xdex-smart-filtering-merged-with-header-v1.2-{}",
         # third partition key is index number, e.g. 0
         "{}",
         dataset_format=DataFormat.CSV,
@@ -64,7 +64,7 @@ pdex_smart_filtering_data = app.marshal_external_data(
     # When this S3Dataset is materialized (i.e. 3 placeholders are filled with actual values), S3Dataset will point to
     # f"s3://{pdex_data_s3_bucket}/{pdex_data_folder}/{1st_partition_value}/{2nd_partition_value}/{3rd_partition_value}".
     # For example, if marketplace is set to "NA", day is set to "2022-07-23", index is set to 0, then the target S3
-    # folder is f"s3://inconsistency-data-123/output/DORE/NA/pdex-smart-filtering-merged-with-header-v1.2-2022-07-23/0/"
+    # folder is f"s3://{BUCKET}/output/DORE/NA/xdex-smart-filtering-merged-with-header-v1.2-2022-07-23/0/"
     dimension_spec={
         "region": {
             "type": DimensionType.STRING,
@@ -90,7 +90,6 @@ pdex_smart_filtering_data = app.marshal_external_data(
 )
 
 # Adding daily timer to trigger data preprocessing job to run daily. More info:
-# https://quip-amazon.com/wYxFAiNxaT08/RheocerOS-User-Guide#temp:C:MRRdf30e754420852a3bab1dc016
 daily_timer = app.add_timer("daily_timer", "rate(1 day)",
                             # override the dimension name in this timer from "time" (default) to "day"
                             time_dimension_id="day",

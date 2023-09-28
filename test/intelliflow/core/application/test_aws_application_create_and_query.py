@@ -36,9 +36,9 @@ class TestAWSApplicationBuild(AWSTestBase):
         eureka_offline_training_data = app.add_external_data(
             "eureka_training_data",
             S3(
-                "321129071393",
-                "dex-olaf-eureka-model-training-data",
-                "cradle_eureka_p3/v8_00/training-data-prod",
+                "123456789012",
+                "test-model-training-data",
+                "data_p3/v8_00/training-data-prod",
                 StringVariant("NA", "region"),
                 AnyDate("my_day_my_way", {"format": "%Y-%m-%d"}),
                 **{"key1": 1, "key2": {}}
@@ -47,9 +47,9 @@ class TestAWSApplicationBuild(AWSTestBase):
 
         eureka_offline_all_data = app.marshal_external_data(
             S3Dataset(
-                "321129071393",
-                "dex-olaf-eureka-model-training-data",
-                "cradle_eureka_p3/v8_00/all-data-prod",
+                "123456789012",
+                "test-model-training-data",
+                "data_p3/v8_00/all-data-prod",
                 "partition_day={}",
                 dataset_format=DataFormat.CSV,
                 **{"key1": 1, "key2": {}}

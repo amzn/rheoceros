@@ -34,9 +34,8 @@ DYNAMODB_PRIMARY_KEY_LENGTH_LIMITATION = 2043
 # Why 200? This is because currently this node has 25 workers and hence 192 vCPU's using above formula. Buffer is 8.
 PARTITION_COUNT_BEFORE_DDB_DUMP = 200
 
-# Add new test row into dynamoDB, recommend by QUZen team: https://sim.amazon.com/issues/DEXMLDEV-2733
-# This long query string should not be search by customer, it is dummy keyword, only used for QUZen Integration test
-QU_INTEGRATION_TEST_KEY = "DummyQueryOnlyForDEXIntegrationPointTestInQUZen"
+# Add new test row into dynamoDB
+QU_INTEGRATION_TEST_KEY = "DummyQueryOnlyForIntegrationPointTest"
 
 ddb_table_name = args["dynamodb_table"]
 
@@ -48,14 +47,12 @@ ddb_table_name = args["dynamodb_table"]
 
 dex_data_daily = dex_data_daily.withColumn("marketplace_id", lit(1))
 
-# Add new test row into dynamoDB, recommend by QUZen team: https://sim.amazon.com/issues/DEXMLDEV-2733
+# Add new test row into dynamoDB
 dex_smoothing_schema = [
     "marketplace_id",
     "keywords",
-    "intent_score",
+    "score",
 ]
-# Only add US test data here, QUZen integration point was partitioned by region (NA, EU, FE)
-# not need test for every marketplace
 test_row = spark.createDataFrame([(1, QU_INTEGRATION_TEST_KEY, 2)], dex_smoothing_schema)
 dex_data_daily_added = dex_data_daily.union(test_row)
 
@@ -65,7 +62,7 @@ dynamodb_dump_data = (
         "value",
         to_json(
             struct(
-                "intent_score",
+                "score",
             )
         ),
     )
