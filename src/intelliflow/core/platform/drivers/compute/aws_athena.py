@@ -20,6 +20,7 @@ from intelliflow.core.signal_processing.routing_runtime_constructs import Route
 from intelliflow.core.signal_processing.signal import SignalDomainSpec, SignalType
 from intelliflow.core.signal_processing.signal_source import (
     DATA_FORMAT_KEY,
+    DATA_TYPE_KEY,
     DATASET_FORMAT_KEY,
     DATASET_HEADER_KEY,
     DATASET_SCHEMA_TYPE_KEY,
@@ -28,6 +29,7 @@ from intelliflow.core.signal_processing.signal_source import (
     DatasetSchemaType,
     DatasetSignalSourceAccessSpec,
     DatasetSignalSourceFormat,
+    DataType,
     GlueTableSignalSourceAccessSpec,
     InternalDatasetSignalSourceAccessSpec,
     S3SignalSourceAccessSpec,
@@ -103,6 +105,7 @@ from ...definitions.compute import (
     ComputeFailedResponseType,
     ComputeFailedSessionState,
     ComputeFailedSessionStateType,
+    ComputeLogQuery,
     ComputeResourceDesc,
     ComputeResponse,
     ComputeResponseType,
@@ -183,7 +186,12 @@ class AWSAthenaBatchCompute(AWSConstructMixin, BatchCompute):
         self._athena = None
         self._glue = None
 
-    def provide_output_attributes(self, slot: Slot, user_attrs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def provide_output_attributes(self, inputs: List[Signal], slot: Slot, user_attrs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if user_attrs.get(DATA_TYPE_KEY, DataType.DATASET) != DataType.DATASET:
+            raise ValueError(
+                f"{DATA_TYPE_KEY!r} must be defined as {DataType.DATASET} or left undefined for {self.__class__.__name__} output!"
+            )
+
         data_format_value = user_attrs.get(DATASET_FORMAT_KEY, user_attrs.get(DATA_FORMAT_KEY, None))
         # default to PARQUET
         data_format = DatasetSignalSourceFormat.PARQUET if data_format_value is None else DatasetSignalSourceFormat(data_format_value)
@@ -201,6 +209,7 @@ class AWSAthenaBatchCompute(AWSConstructMixin, BatchCompute):
                     )
 
         return {
+            DATA_TYPE_KEY: DataType.DATASET,
             DATASET_HEADER_KEY: not header_not_supported,  # we cannot control CTAS header generation (so ignore usr setting to False)
             DATASET_SCHEMA_TYPE_KEY: DatasetSchemaType.ATHENA_CTAS_SCHEMA_JSON,
             DATASET_FORMAT_KEY: data_format,
@@ -216,6 +225,7 @@ class AWSAthenaBatchCompute(AWSConstructMixin, BatchCompute):
 
     def compute(
         self,
+        route: Route,
         materialized_inputs: List[Signal],
         slot: Slot,
         materialized_output: Signal,
@@ -453,10 +463,11 @@ class AWSAthenaBatchCompute(AWSConstructMixin, BatchCompute):
             ctas_table_name = create_output_table_name(
                 active_compute_record.materialized_output.alias, active_compute_record.execution_context_id
             )
-            response = get_table_metadata(self._athena, self._database_name, ctas_table_name)
-            schema_data = json.dumps(response["TableMetadata"]["Columns"])
             schema_file = output.resource_access_spec.data_schema_file
-            self.get_platform().storage.save(schema_data, [], path.strip(path_sep) + path_sep + schema_file)
+            if schema_file:
+                response = get_table_metadata(self._athena, self._database_name, ctas_table_name)
+                schema_data = json.dumps(response["TableMetadata"]["Columns"])
+                self.get_platform().storage.save(schema_data, [], path.strip(path_sep) + path_sep + schema_file)
 
             # 2- activate completion, etc
             if output.domain_spec.integrity_check_protocol:
@@ -1063,7 +1074,6 @@ class AWSAthenaBatchCompute(AWSConstructMixin, BatchCompute):
                     "glue:BatchGet*",
                 ],
             ),
-            # ConstructPermission(["*"], ["athena:*"])
             ConstructPermission(
                 ["*"],
                 [
@@ -1105,6 +1115,13 @@ class AWSAthenaBatchCompute(AWSConstructMixin, BatchCompute):
                     "athena:BatchGetQueryExecution",
                     "athena:GetWorkGroup",
                 ],
+            ),
+            # and finally: full-authorization on activation and (local) compute time permissions (on its own resources)
+            ConstructPermission(
+                [
+                    f"arn:aws:glue:{params[AWSCommonParams.REGION]}:{params[AWSCommonParams.ACCOUNT_ID]}:job/{cls.GLUE_JOB_NAME_FORMAT.format(cls.__name__, '*', '*', '*', params[AWSCommonParams.REGION])}"
+                ],
+                ["glue:*"],
             ),
         ]
 
@@ -1222,7 +1239,7 @@ class AWSAthenaBatchCompute(AWSConstructMixin, BatchCompute):
                     create_or_update_func = create_glue_job if not job_name else update_glue_job
                     exponential_retry(
                         create_or_update_func,
-                        self.GLUE_CLIENT_RETRYABLE_EXCEPTION_LIST,
+                        self.GLUE_CLIENT_RETRYABLE_EXCEPTION_LIST.union("AccessDeniedException"),
                         self._glue,
                         lang_abi_job_name,
                         description,
@@ -1306,7 +1323,7 @@ class AWSAthenaBatchCompute(AWSConstructMixin, BatchCompute):
                 # the materialized view of the input within the CTAS query for the actual code.
                 # Here we are applying the validation to all signal types (not only datasets) since we have
                 # a future plan to support all of the input signals as queryable temp lookup views/tables, yes
-                # even the timers, alarms, etc (as virtual tables with one data row).
+                # even the timers, notifications (which have 'time' dimension similar to timers), alarms, etc (as virtual tables with one data row).
                 dummy_exec_id = str(uuid.uuid4())
                 for signal in route.link_node.signals:
                     # this raise ValueError if alias has a bad format (bad chars). check the impl to understand more.
@@ -1345,6 +1362,8 @@ class AWSAthenaBatchCompute(AWSConstructMixin, BatchCompute):
                 SignalSourceType.CW_ALARM,
                 SignalSourceType.CW_COMPOSITE_ALARM,
                 SignalSourceType.CW_METRIC,
+                # notifications
+                SignalSourceType.SNS,
             ]
             for s in signals
         ):
@@ -1441,11 +1460,12 @@ class AWSAthenaBatchCompute(AWSConstructMixin, BatchCompute):
     def _revert_security_conf(selfs, security_conf: ConstructSecurityConf, prev_security_conf: ConstructSecurityConf) -> None:
         pass
 
+    # overrides
     def describe_compute_record(self, active_compute_record: "RoutingTable.ComputeRecord") -> Optional[Dict[str, Any]]:
         execution_details = dict()
         if active_compute_record.session_state and active_compute_record.session_state.executions:
             final_execution_details = active_compute_record.session_state.executions[::-1][0].details
-            if final_execution_details["QueryExecution"]:
+            if "QueryExecution" in final_execution_details and final_execution_details["QueryExecution"]:
                 execution_details["details"] = final_execution_details["QueryExecution"]
                 query_execution_id = execution_details["details"]["QueryExecutionId"]
                 execution_details["details"][
@@ -1463,3 +1483,22 @@ class AWSAthenaBatchCompute(AWSConstructMixin, BatchCompute):
             execution_details.update({"slot": slot})
 
         return execution_details
+
+    # overrides
+    def get_compute_record_logs(
+        self,
+        compute_record: "RoutingTable.ComputeRecord",
+        error_only: bool = True,
+        filter_pattern: Optional[str] = None,
+        time_range: Optional[Tuple[int, int]] = None,
+        limit: Optional[int] = None,
+        next_token: Optional[str] = None,
+    ) -> Optional[ComputeLogQuery]:
+        if compute_record.session_state:
+            if compute_record.session_state.executions:
+                final_execution_details = compute_record.session_state.executions[::-1][0].details
+                if final_execution_details:
+                    query_execution_id = final_execution_details["QueryExecutionId"]
+
+                    output_url = f"https://{self.region}.console.aws.amazon.com/athena/home?region={self.region}#/query-editor/history/{query_execution_id}"
+                    return ComputeLogQuery(None, [output_url])

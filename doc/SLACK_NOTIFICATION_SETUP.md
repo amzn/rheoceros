@@ -65,3 +65,13 @@ curl -X POST -H "Content-Type: application/json" -d "{\"Content\":\"hello\"}" <h
 ```
 
 If all goes well you should receive a post in channel, you are good to go!
+
+## 7. Store workflow URL in AWS Secrets Manager
+
+In order to avoid hardcoding workflow URL in your code, IF Slack class supports `AWSSecret` object (or the secret ARN string) as a valid element to its "recipient_list".
+
+When creating the new secret, pay attention to the following:
+
+- Secret type: "Other type of secret (API key, OAuth token, other)"
+- Use `slack_workflow_url` as the *key* and the newly created workflow URL as the *value*
+- Pass the secret ARN as an element in IF Slack constructor's `recipient_list` parameter

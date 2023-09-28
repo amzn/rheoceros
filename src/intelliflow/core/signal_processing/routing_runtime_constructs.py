@@ -5,10 +5,11 @@ import copy
 import logging
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
-from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple, Union, cast
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union, cast
 from uuid import uuid4
 
 from intelliflow.core.entity import CoreData
+from intelliflow.core.platform.compute_targets.descriptor import ComputeDescriptor
 from intelliflow.core.platform.definitions.aws.glue import catalog as glue_catalog
 from intelliflow.core.platform.definitions.compute import ComputeSessionStateType
 from intelliflow.core.serialization import Serializable, dumps, loads
@@ -137,8 +138,13 @@ class _SignalRangeAnalyzer(_SignalAnalyzer):
 
                     session = platform.routing_table.session
                     region = platform.routing_table.region
-                    glue = session.client("glue", region_name=region)
-                    if glue_catalog.is_partition_present(glue, database, table, [str(d) for d in dimension_values]):
+                    if dimension_values:
+                        glue = session.client("glue", region_name=region)
+                        if glue_catalog.is_partition_present(glue, database, table, [str(d) for d in dimension_values]):
+                            completed_paths.add(path)
+                    else:
+                        # cannot even call GetPartition with no partitions
+                        # it is the entire table and we assume it is ready
                         completed_paths.add(path)
 
                 elif signal.resource_access_spec.source == SignalSourceType.S3:
@@ -204,7 +210,7 @@ class _SignalRangeAnalyzer(_SignalAnalyzer):
                 )
 
             if completed_paths and signal.nearest_the_tip_in_range:
-                # OPTIMIZATION we just care about the completition of at least one path within the range
+                # OPTIMIZATION we just care about the completion of at least one path within the range
                 # Downstream compute impls (drivers AWS Glue, etc) should use the same flag to pick
                 # the 'nearest' resource (e.g partition). So separation of concerns applied here.
                 break
@@ -290,7 +296,7 @@ class RuntimeLinkNode(SignalLinkNode):
         # duplicate feedback / reaction back to the Route.
         return []
 
-    def is_ready(self, check_ranges: Optional[bool] = False, platform: Optional["Platform"] = None) -> bool:
+    def is_ready(self, check_ranges: Optional[bool] = False, platform: Optional["Platform"] = None, fail_fast: bool = True) -> bool:
         if len(self._signals) != len(self._ready_signals):
             return False
 
@@ -298,13 +304,13 @@ class RuntimeLinkNode(SignalLinkNode):
             if not self.range_check_complete:
                 if not platform:
                     raise ValueError("Platform should be provided to RuntimeLinkNode::is_ready when check_ranges is True!")
-                self._range_check_complete = self._check_ranges(platform)
+                self._range_check_complete = self._check_ranges(platform, fail_fast)
 
             return self.range_check_complete
         else:
             return True
 
-    def _check_ranges(self, platform: "Platform") -> bool:
+    def _check_ranges(self, platform: "Platform", fail_fast: bool = True) -> bool:
         # OPTIMIZATION: it is possible that unique materialized paths can still overlap among different inputs
         # (and their ranges) use this global view of completed (already checked) paths to skip redundant IO.
         common_completed_paths: Set[str] = {
@@ -331,14 +337,17 @@ class RuntimeLinkNode(SignalLinkNode):
             self.range_check_state[ready_signal.unique_key()] = result
             return result
 
+        complete: bool = True
         for ready_signal in self._ready_signals:
             if ready_signal.range_check_required:
                 prev_result: _SignalAnalysisResult = self.range_check_state.get(ready_signal.unique_key(), None)
                 result: _SignalAnalysisResult = _update_analysis_result(self, prev_result)
                 common_completed_paths.update(result.completed_paths)
                 if result.remaining_paths:
-                    # OPTIMIZATION: break immediately, no need to waste resources scanning rest.
-                    return False
+                    complete = False
+                    if fail_fast:
+                        # OPTIMIZATION: break immediately, no need to waste resources scanning rest.
+                        break
             elif ready_signal.nearest_the_tip_in_range:
                 prev_result: _SignalAnalysisResult = self.range_check_state.get(ready_signal.unique_key(), None)
                 # check completion condition for nearest check is not True. if any of the completed paths are done, then
@@ -349,9 +358,11 @@ class RuntimeLinkNode(SignalLinkNode):
                     if not result.completed_paths:
                         # this is enough for us to confidently say it is not ready for
                         # nearest_the_tip_in_range = True case.
-                        return False
+                        complete = False
+                        if fail_fast:
+                            break
 
-        return True
+        return complete
 
     def transfer_ranges(self, other_nodes: Set["RuntimeLinkNode"]) -> None:
         """Transfers range_check state from other nodes if they maintain it or merely use the ready signals
@@ -729,7 +740,7 @@ class RouteExecutionHook(CoreData):
             if (not self.on_exec_skipped and other.on_exec_skipped) or not self.on_exec_skipped.check_integrity(other.on_exec_skipped):
                 return False
 
-        if self.on_compute_success or other.on_exec_skipped:
+        if self.on_compute_success or other.on_compute_success:
             if (not self.on_compute_success and other.on_compute_success) or not self.on_compute_success.check_integrity(
                 other.on_compute_success
             ):
@@ -847,10 +858,21 @@ class RoutePendingNodeHook(CoreData):
         )
 
 
-class _ChainedHookCallback(Callable):
+class _ChainedHookCallback(Callable, ComputeDescriptor, Slot):
     def __init__(self, callback: str, *hook: Union[RouteExecutionHook, RoutePendingNodeHook]):
         self._hooks = list(hook)
         self._callback = callback
+        permissions = []
+        for hook in self._hooks:
+            callback = getattr(hook, self._callback)
+            if callback:
+                if isinstance(callback, Slot) and callback.permissions:
+                    permissions = permissions + callback.permissions
+                elif isinstance(callback, ComputeDescriptor):
+                    slot = callback.create_slot(None)
+                    if slot.permissions:
+                        permissions = permissions + slot.permissions
+        super().__init__(SlotType.SYNC_INLINED, dumps(self), None, None, dict(), None, permissions, 0)
 
     def __call__(self, *args, **kwargs):
         for hook in self._hooks:
@@ -865,6 +887,58 @@ class _ChainedHookCallback(Callable):
                         code(*args, **kwargs)
                 else:
                     callback(*args, **kwargs)
+
+    # overwrites (ComputeDescriptor)
+    def parametrize(self, platform: "HostPlatform") -> None:
+        for hook in self._hooks:
+            callback = getattr(hook, self._callback)
+            if callback and isinstance(callback, ComputeDescriptor):
+                callback.parametrize(platform)
+
+    # overwrites (ComputeDescriptor)
+    def create_output_attributes(
+        self, platform: "HostPlatform", inputs: List[Signal], user_attrs: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        compute_attrs = {}
+        for hook in self._hooks:
+            callback = getattr(hook, self._callback)
+            if callback and isinstance(callback, ComputeDescriptor):
+                attrs = callback.create_output_attributes(platform, inputs, user_attrs)
+                if attrs:
+                    compute_attrs.update(attrs)
+
+    # overwrites (ComputeDescriptor)
+    def create_slot(self, output_signal: Signal) -> Slot:
+        return self
+
+    # overwrites (ComputeDescriptor)
+    def activation_completed(self, platform: "HostPlatform") -> None:
+        for hook in self._hooks:
+            callback = getattr(hook, self._callback)
+            if callback and isinstance(callback, ComputeDescriptor):
+                callback.activation_completed(platform)
+
+    def describe_slot(self) -> Dict[str, Any]:
+        description = {}
+        for i, hook in enumerate(self._hooks):
+            hook_key: str = f"hook-{i}"
+            callback = getattr(hook, self._callback)
+            if callback:
+                if isinstance(callback, ComputeDescriptor):
+                    hook_desc = callback.describe_slot()
+                    hook_desc.update(
+                        {
+                            "descriptor_type": callback.__class__.__name__,
+                        }
+                    )
+                    description.update(hook_desc)
+                elif isinstance(callback, Slot):
+                    description.update({hook_key: callback.describe_code()})
+                else:
+                    description.update({hook_key: type(callback).__name__})
+        if description:
+            description.update({"callback": self._callback})
+        return description
 
 
 class RoutingSession(CoreData):
@@ -1053,7 +1127,7 @@ class Route(Serializable):
             if not slot.check_integrity(other.slots[i]):
                 return False
 
-        # TODO check hooks and pending node TTL
+        # see check_auxiliary_data_integrity on why "check hooks and pending node TTL" are not here
 
         return True
 

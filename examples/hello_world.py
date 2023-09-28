@@ -19,6 +19,7 @@ flow.init_basic_logging()
 app = AWSApplication("hello-world", "us-east-1")
 
 
+
 def example_inline_compute_code(input_map, output, params):
     """ Function to be called within RheocerOS core.
     Below parameters and also inputs as local variables in both
@@ -51,8 +52,9 @@ node_1_1 = app.create_data(id=f"Node_1_1",
                            ]
                            )
 
+email_address = "your_own_email_address"  # e.g "if-test-list@amazon.com"
 email_obj = EMAIL(sender="if-test-list@amazon.com",  # sender from the same account
-                  recipient_list=["yunusko@amazon.com"])
+                  recipient_list=[email_address])
 
 node_1_2 = app.create_data(id=f"Node_1_2",
                            inputs=[node_1_1],
@@ -68,7 +70,5 @@ app.execute(node_1_1)
 # test event propagation in AWS
 path, comp_records = app.poll(node_1_2)
 assert path
-
-
 
 

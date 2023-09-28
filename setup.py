@@ -14,10 +14,15 @@ options_value = {}
 
 # use 'requirements.txt' as baseline here + virtualenv for bundling
 REQUIRED_PACKAGES = [
-    'boto3 >= 1.20.9',
-    'python-dateutil >= 2.8.1',
-    'dill >= 0.3.3',
+    'boto3 >= 1.26.57',
+    'python-dateutil >= 2.8.2',
+    'dill >= 0.3.4',
     'packaging >= 21.0',
+    'requests >= 2.25.1',
+    'responses >= 0.10.6',
+    'shortuuid >= 1.0.11',
+    'overrides >= 7.4.0',
+    'validators >= 0.20.0',
     'virtualenv'
 ]
 

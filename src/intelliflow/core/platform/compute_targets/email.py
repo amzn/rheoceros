@@ -96,6 +96,10 @@ class EmailAction(RoutingComputeInterface.IInlinedCompute, RoutingHookInterface.
     def create_slot(self, output_signal: Signal) -> Slot:
         return Slot(SlotType.SYNC_INLINED, dumps(self), None, None, dict(), None, self._permissions, 0)
 
+    def describe_slot(self) -> Dict[str, Any]:
+        # donot expose any sensitive detail, the class type here is enough for high-level description of this action
+        return {name: repr(value) for name, value in self._email.__dict__.items()}
+
     # overrides (ComputeDescriptor::activation_completed):w
     def activation_completed(self, platform: "HostPlatform") -> None:
         """System calls this to allow descriptor to know that system is up&running, all of the underlying resources

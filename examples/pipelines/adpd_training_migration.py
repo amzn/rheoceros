@@ -15,6 +15,7 @@ PIPELINE_DAY_DIMENSION="day"
 ADPD_RANGE_IN_DAYS = 7
 REGION_ID = 1
 MARKETPLACE_ID = 1
+ANALYTICS_DATA_BUCKET = "<YOUR_DATA_BUCKET>"
 PERFECTMILE_TABLE_MAP = {1: "d_perfectmile_package_items_na", 2: "d_perfectmile_package_items_eu"}
 
 app = AWSApplication("adpd-pipeline", HostPlatform(AWSConfiguration.builder()
@@ -47,7 +48,7 @@ date_list = list(date - timedelta(days=i) for i in range({ADPD_RANGE_IN_DAYS}))
 
 def create_path(date_list):
     date_list = [d.strftime('%Y-%m-%d') for d in date_list]
-    denorm_archive_s3_path_start = 's3://fulfillmentdataanalytics-splitparquetresults-aabbccdd/denormalized_archive/creation_date='
+    denorm_archive_s3_path_start = 's3://{ANALYTICS_DATA_BUCKET}/denormalized_archive/creation_date='
     denorm_archive_s3_path_end = '/region_id={REGION_ID}/system=F2P/'
     s3_path = list()
     hours = ['-00', '-01', '-02', '-03', '-04', '-05', '-06', '-07', '-08', '-09', '-10', '-11', '-12', '-13', '-14',

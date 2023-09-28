@@ -3,28 +3,75 @@
 
 import json
 import logging
+from enum import Enum, unique
 
 from botocore.exceptions import ClientError
+
+from intelliflow.core.platform.definitions.aws.common import get_code_for_exception
 
 logger = logging.getLogger(__name__)
 
 
-def create_table(ddb_resource, table_name, key_schema, attribute_def, provisioned_throughput):
+@unique
+class BillingMode(str, Enum):
+    PAY_PER_REQUEST = "PAY_PER_REQUEST"
+    PROVISIONED = "PROVISIONED"
+
+
+def create_table(
+    ddb_resource,
+    table_name,
+    key_schema,
+    attribute_def,
+    provisioned_throughput=None,
+    local_secondary_index=None,
+    billing_mode: BillingMode = BillingMode.PAY_PER_REQUEST,
+    **extra_args,
+):
     """
     https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/dynamodb.html#DynamoDB.Client.create_table
-    :param ddb_resource:
-    :param table_name:
-    :param key_schema:
-    :param attribute_def:
-    :param provisioned_throughput:
-    :return:
     """
+    args = {"TableName": table_name, "KeySchema": key_schema, "AttributeDefinitions": attribute_def, "BillingMode": billing_mode.value}
+    if billing_mode == BillingMode.PROVISIONED:
+        args.update({"ProvisionedThroughput": provisioned_throughput})
+
+    if local_secondary_index:
+        args.update({"LocalSecondaryIndexes": local_secondary_index})
+
+    if extra_args:
+        # overwrite if any overlap
+        args.update(extra_args)
+
     try:
-        table = ddb_resource.create_table(
-            TableName=table_name, KeySchema=key_schema, AttributeDefinitions=attribute_def, ProvisionedThroughput=provisioned_throughput
-        )
+        table = ddb_resource.create_table(**args)
         table.meta.client.get_waiter("table_exists").wait(TableName=table_name)
         logger.info("Successfully created the table: %s", table_name)
+        return table
+    except ClientError:
+        raise
+
+
+def update_table(
+    ddb_table,
+    attribute_def,
+    provisioned_throughput=None,
+    billing_mode: BillingMode = BillingMode.PAY_PER_REQUEST,
+    **extra_args,
+):
+    """
+    https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/dynamodb.html#DynamoDB.Client.update_table
+    """
+    args = {"AttributeDefinitions": attribute_def, "BillingMode": billing_mode.value}
+    if billing_mode == BillingMode.PROVISIONED:
+        args.update({"ProvisionedThroughput": provisioned_throughput})
+
+    if extra_args:
+        # overwrite if any overlap
+        args.update(extra_args)
+
+    try:
+        table = ddb_table.update(**args)
+        logger.info("Successfully updated the table: %s", ddb_table.table_name)
         return table
     except ClientError:
         raise
@@ -56,9 +103,11 @@ def get_ddb_item(table, key):
         response = table.get_item(Key=key)
         logger.info("Got successful response for Key: %s from Table %s", json.dumps(key), table.table_name)
         return response
-    except ClientError:
-        logger.exception("Got exception during get_item operation on key: %s and table: %s", json.dumps(key), table.table_name)
-        raise
+    except ClientError as error:
+        error_code = get_code_for_exception(error)
+        if error_code not in ["ResourceNotFoundException"]:
+            logger.exception("Got exception during get_item operation on key: %s and table: %s", json.dumps(key), table.table_name)
+            raise error
 
 
 def put_ddb_item(table, item):

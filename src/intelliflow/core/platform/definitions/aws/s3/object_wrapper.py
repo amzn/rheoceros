@@ -2,11 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
-from typing import Sequence
+from typing import Any, Dict, Optional, Sequence, Union
 
 from botocore.exceptions import ClientError
 
-from intelliflow.core.platform.definitions.aws.common import exponential_retry
+from intelliflow.core.platform.definitions.aws.common import MAX_SLEEP_INTERVAL_PARAM, exponential_retry
+from intelliflow.utils.digest import calculate_bytes_sha256
 
 logger = logging.getLogger(__name__)
 
@@ -21,21 +22,65 @@ def build_object_key(folders: Sequence[str], object_name: str) -> str:
     return "/".join(folders + [object_name])
 
 
-def object_exists(s3, bucket, object_key):
+def get_object_metadata(s3, bucket: str, object_key: str) -> Dict[str, Any]:
+    """
+    Fetch S3 object's information as dict, which contains metadata, or None if object is not available.
+    :param s3: S3 client.
+    :param bucket: The bucket to receive the data, as str.
+    :param object_key: The key of the object in the bucket, as str
+    :return dict structure of object's metadata, or None if such object is not accessible/not-exist.
+    """
     try:
-        exponential_retry(
+        return exponential_retry(
             s3.meta.client.head_object,
             ["403"],  # retry on 'Forbidden': eventual consistency during app activation
-            Bucket=bucket.name,
+            Bucket=bucket,
             Key=object_key,
+            RequestPayer="requester",
+            **{MAX_SLEEP_INTERVAL_PARAM: 257},  # use a longer duration than usual
         )
     except ClientError as ex:
         if ex.response["Error"]["Code"] == "404":
-            return False
-        logger.exception("Couldn't head-object '%s' from bucket '%s'! Exception: '%s'.", object_key, bucket.name, str(ex))
+            return None
+        logger.exception("Couldn't head-object '%s' from bucket '%s'! Exception: '%s'.", object_key, bucket, str(ex))
         raise
 
-    return True
+
+def get_object_sha256_hash(s3, bucket: str, object_key: str) -> Optional[str]:
+    """
+    Fetch S3 object's SHA256 digest/hash or None if object is not available or such metadata was not specified when
+    object was uploaded.
+    :param s3: S3 client.
+    :param bucket: The bucket to receive the data, as str.
+    :param object_key: The key of the object in the bucket, as str
+    :return SHA256 as str or None if there's no such object
+    """
+    remote_object_metadata = get_object_metadata(s3, bucket, object_key)
+    metadata_section = remote_object_metadata["Metadata"] if remote_object_metadata is not None else None
+    return metadata_section["sha256"] if metadata_section is not None else None
+
+
+def object_exists(s3, bucket, object_key: str) -> bool:
+    """
+    Check if object is available.
+    :param s3: S3 client.
+    :param bucket: The S3 bucket as str.
+    :param object_key: The key of the object in the bucket.
+    :return true if the object exists and accessible, None if not exist or not accessible.
+    """
+    if "*" not in object_key:
+        return None is not get_object_metadata(s3, bucket.name, object_key)
+    else:
+        key_parts = object_key.split("*")
+        root_part = key_parts[0]
+        key_other_parts = key_parts[1:]
+        objects_in_folder = list_objects(bucket, root_part)
+        for object in objects_in_folder:
+            key = object.key.replace(root_part, "")
+            # TODO use regex
+            if all([other_key_part in key for other_key_part in key_other_parts]):
+                return True
+        return False
 
 
 def put_file(bucket, object_key, file_name):
@@ -59,16 +104,22 @@ def put_file(bucket, object_key, file_name):
             put_data.close()
 
 
-def put_object(bucket, object_key, put_data):
+def put_object(bucket, object_key: str, put_data: Union[str, bytes]) -> bool:
     """
     Upload data to a bucket and identify it with the specified object key.
-    :param bucket: The bucket to receive the data.
+    If the object is bytes, its SHA256 digest will be associated as object's metadata.
+    :param bucket: The S3 bucket to receive the data. as boto3 resource.
     :param object_key: The key of the object in the bucket.
-    :param put_data: The data as str to upload.
+    :param put_data: The data to upload, file path or bytes.
+    :return true if put operation succeed.
     """
     try:
         obj = bucket.Object(object_key)
-        obj.put(Body=put_data)
+        if isinstance(put_data, bytes):
+            sha256_digest = calculate_bytes_sha256(put_data)
+            obj.put(Body=put_data, Metadata={"sha256": sha256_digest})
+        else:
+            obj.put(Body=put_data)
         obj.wait_until_exists()
         logger.info("Put object '%s' to bucket '%s'.", object_key, bucket.name)
         return True
@@ -85,7 +136,7 @@ def get_object(bucket, object_key):
     :return: The object data in bytes.
     """
     try:
-        body = bucket.Object(object_key).get()["Body"].read()
+        body = exponential_retry(bucket.Object(object_key).get()["Body"].read, {"ReadTimeoutError", "IncompleteReadError"})
         logger.info("Got object '%s' from bucket '%s'.", object_key, bucket.name)
     except ClientError:
         logger.exception(("Couldn't get object '%s' from bucket '%s'.", object_key, bucket.name))

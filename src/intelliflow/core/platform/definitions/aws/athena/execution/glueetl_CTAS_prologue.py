@@ -377,7 +377,7 @@ for i, input in enumerate(input_map['data_inputs']):
           wait=True,
           poll_interval_in_secs=3)
         
-# TODO support TIMER, CW ALARM and METRIC inputs as lookup tables in Athena executions
+# TODO support TIMER, NOTIFICATION, CW ALARM and METRIC inputs as lookup tables in Athena executions
 # input_map['timers'], etc
 
 job.commit()

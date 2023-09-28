@@ -57,14 +57,11 @@ class SignalType(Enum):
     _AMZN_RESERVED_1 = 2
     _AMZN_RESERVED_2 = 6
     EXTERNAL_GLUE_TABLE_PARTITION_UPDATE = 7
+    EXTERNAL_SNS_NOTIFICATION = 8
     INTERNAL_PARTITION_CREATION = 3
     LOCAL_FOLDER_CREATION = 4
 
     TIMER_EVENT = 5
-
-    # SAGEMAKER_TRAINING_JOB_COMPLETION
-    # SAGEMAKER_TRAINING_JOB_START
-    # SAGEMAKER_TRAINING_JOB_FAILURE
 
     # BACKFILLING SUPPORT for internal marshaled data coming from the same application
     # requesting trigger on upstream routes/records.
@@ -362,8 +359,8 @@ class Signal(Serializable["Signal"]):
             alias,
         )
 
-    def clone(self, alias: str) -> "Signal":
-        clone = copy.deepcopy(self)
+    def clone(self, alias: str, deep: bool = True) -> "Signal":
+        clone = copy.deepcopy(self) if deep else self
         return Signal(
             clone.type,
             clone.resource_access_spec,
@@ -392,9 +389,9 @@ class Signal(Serializable["Signal"]):
             return self.filter(new_filter)
         return None
 
-    def create_from_spec(self, access_spec: SignalSourceAccessSpec) -> "Signal":
+    def create_from_spec(self, access_spec: SignalSourceAccessSpec, signal_type: Optional[SignalType] = None) -> "Signal":
         return Signal(
-            self.type,
+            self.type if not signal_type else signal_type,
             access_spec,
             self.domain_spec,
             self.alias,
@@ -418,7 +415,9 @@ class Signal(Serializable["Signal"]):
                 return None
 
         # extract actual/pyhsical resource
-        signal_source: SignalSource = self.resource_access_spec.extract_source(materialized_resource_path)
+        signal_source: SignalSource = self.resource_access_spec.extract_source(
+            materialized_resource_path, self.get_required_resource_name()
+        )
 
         if signal_source:
             # check protocol
@@ -611,7 +610,32 @@ class Signal(Serializable["Signal"]):
             full_path = full_path + self.resource_access_spec.path_delimiter() + required_resource_name
         elif self.resource_access_spec.path_format_requires_resource_name():
             full_path = full_path + self.resource_access_spec.path_delimiter() + "_resource"
-        return self.resource_access_spec.extract_source(full_path).dimension_values
+        return self.resource_access_spec.extract_source(full_path, self.get_required_resource_name()).dimension_values
+
+    def dimension_values(self, dimension_name: str) -> List[Any]:
+        """Gets the entire range of values for the input dimension from the underlying dimension_filter_spec"""
+        if not self.domain_spec.dimension_spec.find_dimension_by_name(dimension_name):
+            raise ValueError(
+                f"Dimension {dimension_name!r} cannot be found on signal {self.alias!r}! It should be one of these dimensions: {[key for key in self.domain_spec.dimension_spec.get_flattened_dimension_map().keys()]!r}"
+            )
+        dimension_variants: List["DimensionsVariant"] = self.domain_spec.dimension_filter_spec.get_dimension_variants(dimension_name)
+        return [dim.transform().value for dim in dimension_variants]
+
+    def dimension_values_map(self) -> Dict[str, List[Any]]:
+        """Get range of values for each dimension from the underlying dimension_filter_spec"""
+        return {key: self.dimension_values(key) for key in self.domain_spec.dimension_spec.get_flattened_dimension_map().keys()}
+
+    def dimension_type_map(self) -> Dict[str, List[Any]]:
+        """Get type for each dimension from the underlying dimension_spec"""
+        return {key: dim.type.value for key, dim in self.domain_spec.dimension_spec.get_flattened_dimension_map().items()}
+
+    def tip_value(self, dimension_name: str) -> Any:
+        """Gets the TIP value from a range of variants of input dimension"""
+        return self.dimension_values(dimension_name)[0]
+
+    def __getitem__(self, dimension_name: str) -> Any:
+        """Convenience wrapper around "tip_value" method to provide the TIP value of a dimension from the underlying dimension_filter_spec"""
+        return self.tip_value(dimension_name)
 
     def tip(self) -> "Signal":
         """Return the TIP of the signal as a new Signal if its dimension_filter represents a range.
@@ -893,6 +917,15 @@ class SignalLinkNode:
                 # first check if these unlinked dimensions are already materialized.
                 # 'b'
                 for unlinked_dim in unlinked_dimensions:
+
+                    # FUTURE consider following logic if we observe materialized ref dim not being detected here
+                    # (e.g "*" being detected on top of a range of materialized values). this should not occur anymore (but legit though).
+                    # already_materialized_variants = [variant for variant in input_signal.domain_spec.dimension_filter_spec.get_dimension_variants(required.dimension.name)
+                    #                                  if variant.is_material_value()]
+                    # #then use the first variant
+                    # if already_materialized_variants
+                    #  dimension_variant = already_materialized_variants[0]
+
                     dimension_variant = cast(
                         DimensionVariant, input_signal.domain_spec.dimension_filter_spec.find_dimension_by_name(unlinked_dim.dimension.name)
                     )
@@ -1152,6 +1185,7 @@ class SignalLinkNode:
         #  - Remaining (n - 1) iterations should only do 'a'.
         for input_signal, current_signal_mappers in transitive_check_list:
             signal_mappers: List[DimensionVariantMapper] = current_signal_mappers
+            own_signal_mappers: List[DimensionVariantMapper] = []
             # gather all of the mappers from the materialized list (redundants won't be a problem).
             # 'a'
             for materialized_input in materialized_inputs:
@@ -1204,7 +1238,7 @@ class SignalLinkNode:
                             unlinked_dim.dimension, unlinked_dim.dimension, DIMENSION_VARIANT_IDENTICAL_MAP_FUNC
                         )
                         input_signal.feed([mapper_from_own_filter])
-                        signal_mappers.append(mapper_from_own_filter)
+                        own_signal_mappers.append(mapper_from_own_filter)
                         satisfied_dimensions.add(unlinked_dim)
 
                 # check again
@@ -1265,9 +1299,10 @@ class SignalLinkNode:
             unlinked_dimensions = required_dimensions - satisfied_dimensions
 
             if not unlinked_dimensions:
-                # enforce the TIP on mappers against possible ranges.
+                # enforce the TIP on mappers against possible ranges (on values mapped from other signals).
                 for mapper in signal_mappers:
                     mapper.set_materialized_value(mapper.mapped_values[0])
+                signal_mappers.extend(own_signal_mappers)
 
                 # if any of the dimensions of the input signal is not mapped, then this will fail.
                 new_input_filter = DimensionFilter.materialize(
@@ -1320,22 +1355,50 @@ class SignalLinkNode:
                                 break
                         if not satisfied:
                             # lhs = dst_signal.clone(None)
-                            lhs = dst_signal
-                            left_dim: Optional[Dimension] = lhs.domain_spec.dimension_spec.find_dimension_by_name(src_dim)
+                            left_dim: Optional[Dimension] = dst_signal.domain_spec.dimension_spec.find_dimension_by_name(src_dim)
                             if left_dim:
-                                logger.info(
-                                    f"Auto-linking dimension {src_dim!r} from source: {src_signal.alias!r} to: {dst_signal.alias!r}"
-                                )
-                                # rhs = src_signal.clone(None)
-                                rhs = src_signal
-                                right_dim = rhs.domain_spec.dimension_spec.find_dimension_by_name(src_dim)
-                                self.add_link(
-                                    SignalDimensionLink(
-                                        SignalDimensionTuple(lhs, left_dim),
-                                        DIMENSION_VARIANT_IDENTICAL_MAP_FUNC,
-                                        SignalDimensionTuple(rhs, right_dim),
+                                # make sure there are no existing non-trivial reverse links from left_dim to src_dim
+                                # Note/Reminder: in the follow if-statement, each dim_link object is of type SignalDimensionLink
+                                #  rhs_dim: means the source for that link. it is a pair of source Signal and Dimension(s)
+                                #  lhs_dim: means the destination for that link. it is a pair of destination/target Signal and Dimension.
+                                avoid_auto_link = False
+                                for dim_link in self._link_matrix:
+                                    if (
+                                        # reset alias to capture non-trivial links from other versions of both lhs and rhs
+                                        dim_link.rhs_dim.signal == dst_signal.clone(None, deep=False)
+                                        and dim_link.lhs_dim.signal == src_signal.clone(None, deep=False)
+                                        and any(lhs_dim.name == src_dim for lhs_dim in dim_link.lhs_dim.dimensions)
+                                        and any(rhs_dim.name == left_dim.name for rhs_dim in dim_link.rhs_dim.dimensions)
+                                    ) or (
+                                        # and other direction too
+                                        dim_link.lhs_dim.signal == dst_signal.clone(None, deep=False)
+                                        and dim_link.rhs_dim.signal == src_signal.clone(None, deep=False)
+                                        and any(rhs_dim.name == src_dim for rhs_dim in dim_link.rhs_dim.dimensions)
+                                        and any(lhs_dim.name == left_dim.name for lhs_dim in dim_link.lhs_dim.dimensions)
+                                    ):
+                                        # - when dst_signal has any other dim in the mapping then it is still a non-trivial mapping
+                                        # - when the mapper function is not equality
+                                        if len(dim_link.rhs_dim.dimensions) > 1 or not dim_link.is_equality():
+                                            logger.critical(
+                                                f"Cannot auto-link dimension {src_dim!r} from source: {src_signal.alias!r} to: {dst_signal.alias!r}! "
+                                                f"The reason is an existing non-trivial reverse link from {dst_signal.alias!r} to {src_signal.alias!r} "
+                                                f"over the same dimension. Link {dim_link!r}"
+                                            )
+                                            avoid_auto_link = True
+                                            break
+
+                                if not avoid_auto_link:
+                                    logger.info(
+                                        f"Auto-linking dimension {src_dim!r} from source: {src_signal.alias!r} to: {dst_signal.alias!r}"
                                     )
-                                )
+                                    right_dim = src_signal.domain_spec.dimension_spec.find_dimension_by_name(src_dim)
+                                    self.add_link(
+                                        SignalDimensionLink(
+                                            SignalDimensionTuple(dst_signal, left_dim),
+                                            DIMENSION_VARIANT_IDENTICAL_MAP_FUNC,
+                                            SignalDimensionTuple(src_signal, right_dim),
+                                        )
+                                    )
 
     def can_receive(self, signal: Signal):
         return signal in self._signals

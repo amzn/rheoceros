@@ -95,6 +95,27 @@ output = spark.sql("select * from adpd_shadow_data").limit(1)
                                          Timeout=10 * 60  # 10 hours
                                      )
                                  ])
+# This example shows that using SparkSQL API, one can input multiple statements which will be executed sequentially
+adpd_shadow_json_SparkSql = app.create_data("adpd_shadow_json3",
+                                 inputs=[adpd_shadow_json_AS_SIGNAL],
+                                 compute_targets=[
+                                     SparkSQL(
+                                         # adpd_shadow_data alias comes from signal decl( the 'id'), you can overwrite it above using a map instead of an array
+                                         # 'adpd_shadow_data' will contain daily adpd shadow prod data only because no relative range has defined as the last dimension.
+                                         f"""
+CREATE TEMP VIEW TEST_VIEW AS (
+    select *
+    from adpd_shadow_data
+    where FC = 'DFW7'
+);
+select * from TEST_VIEW limit 10
+                                         """,
+                                         GlueVersion="2.0",
+                                         WorkerType=GlueWorkerType.G_1X.value,
+                                         NumberOfWorkers=50,
+                                         Timeout=10 * 60  # 10 hours
+                                     )
+                                 ])
 
 daily_timer = app.add_timer("daily_timer",
                             "rate(1 day)",

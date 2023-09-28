@@ -268,7 +268,7 @@ object {self.CLASS_NAME} {{
                         try {{
                                 new_df = spark.read.format(input("data_format").asInstanceOf[String])
                                                    .option("delimiter", input("delimiter").asInstanceOf[String])
-                                                   .option("header", "true")
+                                                   .option("header", input("data_header_exists").asInstanceOf[Boolean])
                                                    .option("inferSchema", "true")
                                                    .load(resource_path)
                         }}
@@ -279,7 +279,13 @@ object {self.CLASS_NAME} {{
                             case e: AnalysisException => {{
                                 if (e.message.contains("Path does not exist") && (!input("range_check_required").asInstanceOf[Boolean])) {{
                                     logger.error("%s path does not exist. Since range check is not required. Continuing with next available path.".format(resource_path))
-                                    break
+                                }} else {{
+                                    throw e
+                                }}
+                            }}     
+                            case e : java.lang.NullPointerException => {{
+                                if (!input("range_check_required").asInstanceOf[Boolean]) {{
+                                    logger.error("%s path does not exist. Since range check is not required. Continuing with next available path.".format(resource_path))
                                 }} else {{
                                     throw e
                                 }}
@@ -287,10 +293,12 @@ object {self.CLASS_NAME} {{
                         }}
                     }}
                 }}  //breakable
-                if (input_df == null) {{
+                if (input_df == null || input_df.columns.size == 0) {{
                     input_df = new_df
                 }} else {{
-                    input_df = input_df.unionAll(new_df)
+                    if (new_df != null && new_df.columns.size > 0) {{  // skip empty "partition" 
+                        input_df = input_df.unionAll(new_df)
+                    }}
                 }}
                 if (input_df != null && input("nearest_the_tip_in_range").asInstanceOf[Boolean]) {{
                     break
@@ -309,20 +317,23 @@ object {self.CLASS_NAME} {{
     // assign input dataframes to user provided alias'
     for ((input_raw, i) <- input_map("data_inputs").asInstanceOf[Seq[Any]].zipWithIndex) {{
         val input: Map[String, Any] = input_raw.asInstanceOf[Map[String, Any]]
-        var input_df: Dataset[Row] = load_input_df(input, sc, aws_region)
+        val data_type: String = input("data_type").asInstanceOf[String]
+        if (data_type == "dataset" || data_type == null) {{
+            var input_df: Dataset[Row] = load_input_df(input, sc, aws_region)
             
-        val alias: String = input("alias").asInstanceOf[String]
-        if (alias.length() > 0) {{
-            input_df.registerTempTable(alias)
-            input_table(alias) = input_df
-            variables += s"val ${{alias}} = ${{"inputTable(" + s""""${{alias}}"""" + ")"}}.asInstanceOf[org.apache.spark.sql.Dataset[org.apache.spark.sql.Row]]"
+            val alias: String = input("alias").asInstanceOf[String]
+            if (alias.length() > 0) {{
+                input_df.registerTempTable(alias)
+                input_table(alias) = input_df
+                variables += s"val ${{alias}} = ${{"inputTable(" + s""""${{alias}}"""" + ")"}}.asInstanceOf[org.apache.spark.sql.Dataset[org.apache.spark.sql.Row]]"
+            }}
+            input_df.registerTempTable(f"input$i%s")
+            inputs += input_df
+            variables += s"val ${{"input" + i.toString}} = ${{"inputs(" + i.toString + ")"}}.asInstanceOf[org.apache.spark.sql.Dataset[org.apache.spark.sql.Row]]"
         }}
-        input_df.registerTempTable(f"input$i%s")
-        inputs += input_df
-        variables += s"val ${{"input" + i.toString}} = ${{"inputs(" + i.toString + ")"}}.asInstanceOf[org.apache.spark.sql.Dataset[org.apache.spark.sql.Row]]"
     }}
 
-    //// TODO assign timers to user provided alias'
+    //// TODO assign timers, other signals to user provided alias'
     //for (input, i) <- input_map("timers").asInstanceOf(List[Map[String, Any]]).zipWithIndex) {{
     //    if (input("alias").length() > 0) {{
     //        exec("{{0}} = "{{1}}"".format(input('alias'), input('time')))
@@ -384,7 +395,7 @@ object {self.CLASS_NAME} {{
 
     output.write
           .format(output_param("data_format").asInstanceOf[String])
-          .option("header", "true")
+          .option("header", output_param("data_header_exists").asInstanceOf[Boolean])
           .option("delimiter", output_param("delimiter").asInstanceOf[String])
           .mode("overwrite")
           .save(output_param("resource_materialized_path").asInstanceOf[String])

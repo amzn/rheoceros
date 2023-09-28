@@ -36,10 +36,18 @@ class TestSignalLinkNode:
 
     signal_link_node_2 = SignalLinkNode([TestSignal.signal_internal_1, TestSignal.signal_s3_1.clone("test_signal_from_S3")])
     signal_link_node_2_without_link = copy.deepcopy(signal_link_node_2)
+    signal_link_node_2_with_non_trivial_link = copy.deepcopy(signal_link_node_2)
     signal_link_node_2.add_link(
         SignalDimensionLink(
             signal_dimension_tuple(TestSignal.signal_internal_1, "dim_1_1"),
             DIMENSION_VARIANT_IDENTICAL_MAP_FUNC,
+            signal_dimension_tuple(TestSignal.signal_s3_1, "dim_1_1"),
+        )
+    )
+    signal_link_node_2_with_non_trivial_link.add_link(
+        SignalDimensionLink(
+            signal_dimension_tuple(TestSignal.signal_internal_1, "dim_1_1"),
+            lambda dim_1_1: dim_1_1 + 1,
             signal_dimension_tuple(TestSignal.signal_s3_1, "dim_1_1"),
         )
     )
@@ -50,6 +58,57 @@ class TestSignalLinkNode:
             TestSignal.signal_internal_complex_1.clone("upstream_data_ranged").filter({"*": {"_:-2": {}}}, transfer_spec=True),
             TestSignal.signal_s3_1,
         ]
+    )
+
+    # non-trivial N-1 mapping (despite that the mapper func is trivial equality)
+    signal_link_node_3_complex_with_non_trivial_link = copy.deepcopy(signal_link_node_3_complex)
+    signal_link_node_3_complex_with_non_trivial_link.add_link(
+        SignalDimensionLink(
+            signal_dimension_tuple(TestSignal.signal_s3_1, "dim_1_1"),
+            lambda a, b: a,
+            SignalDimensionTuple(
+                TestSignal.signal_internal_complex_1,
+                # multiple dimensions
+                TestSignal.signal_internal_complex_1.domain_spec.dimension_spec.find_dimension_by_name("dim_1_1"),
+                TestSignal.signal_internal_complex_1.domain_spec.dimension_spec.find_dimension_by_name("dim_1_2"),
+            ),
+        )
+    )
+
+    signal_link_node_3_complex_with_non_trivial_link_diff_order = SignalLinkNode(
+        [
+            TestSignal.signal_internal_complex_1,
+            TestSignal.signal_s3_1,
+            TestSignal.signal_internal_complex_1.clone("upstream_data_ranged").filter({"*": {"_:-2": {}}}, transfer_spec=True),
+        ]
+    )
+    signal_link_node_3_complex_with_non_trivial_link_diff_order.add_link(
+        SignalDimensionLink(
+            signal_dimension_tuple(TestSignal.signal_s3_1, "dim_1_1"),
+            lambda a, b: a,
+            SignalDimensionTuple(
+                TestSignal.signal_internal_complex_1.clone(None),
+                # multiple dimensions
+                TestSignal.signal_internal_complex_1.domain_spec.dimension_spec.find_dimension_by_name("dim_1_1"),
+                TestSignal.signal_internal_complex_1.domain_spec.dimension_spec.find_dimension_by_name("dim_1_2"),
+            ),
+        )
+    )
+
+    signal_link_node_3_complex_with_non_trivial_link_2 = SignalLinkNode(
+        [
+            TestSignal.signal_s3_1,
+            TestSignal.signal_internal_complex_1,
+            TestSignal.signal_internal_complex_1.clone("upstream_data_ranged").filter({"*": {"_:-2": {}}}, transfer_spec=True),
+        ]
+    )
+    # reverse the direction for non-trivial link
+    signal_link_node_3_complex_with_non_trivial_link_2.add_link(
+        SignalDimensionLink(
+            signal_dimension_tuple(TestSignal.signal_internal_complex_1, "dim_1_1"),
+            lambda a: a + a,
+            signal_dimension_tuple(TestSignal.signal_s3_1, "dim_1_1"),
+        )
     )
 
     def test_signal_link_node_init(self):
@@ -515,7 +574,7 @@ class TestSignalLinkNode:
         cloned_complex_node.compensate_missing_links()
         # 4 links should be created between;
         # - two common dimensions of input1 and input2
-        # - one common dimension between input3 and input, input2
+        # - one common dimension between input3 and input1, and input2 and input3
         assert len(cloned_complex_node.link_matrix) == 4
         assert not cloned_complex_node.get_dim_mappers(from_signal=None, to_signal=None)
         assert not cloned_complex_node.get_dim_mappers(from_signal=None, to_signal=TestSignal.signal_internal_complex_1)
@@ -567,6 +626,84 @@ class TestSignalLinkNode:
         assert (
             len(cloned_complex_node.get_dim_mappers(from_signal=TestSignal.signal_s3_1, to_signal=TestSignal.signal_internal_complex_1))
             == 1
+        )
+
+    def test_signal_link_node_compensate_missing_links_avoid_nontrivial_reverse_links(self):
+        # does not add redundant links over existing non-trivial links
+        cloned_node = copy.deepcopy(self.signal_link_node_2_with_non_trivial_link)
+        assert len(cloned_node.link_matrix) == 1
+        cloned_node.compensate_missing_links()
+        # nothing changes
+        assert len(cloned_node.link_matrix) == 1
+        assert len(cloned_node.get_dim_mappers(from_signal=TestSignal.signal_s3_1, to_signal=TestSignal.signal_internal_1)) == 1
+
+        # use a node with three inputs
+        # - input1:
+        # - input2 (aliased version of input1)
+        # - input3
+        # non-trivial link is from input1 to input3
+        # there should not be auto-link between input2-input3 and also from input3 to input1 due to no-trivial link from
+        # input1 to input3.
+        link_node_permutations = [
+            self.signal_link_node_3_complex_with_non_trivial_link,
+            self.signal_link_node_3_complex_with_non_trivial_link_diff_order,
+        ]
+        for link_node in link_node_permutations:
+            cloned_node = copy.deepcopy(link_node)
+            assert len(cloned_node.link_matrix) == 1
+            cloned_node.compensate_missing_links()
+            # only two more links between the two versions of "signal_internal_complex_1" is added.
+            # not anything from signal_s3_1("dim_1_1") back to any of those signals (with different alias)
+            assert len(cloned_node.link_matrix) == 3
+            assert len(cloned_node.get_dim_mappers(from_signal=TestSignal.signal_internal_complex_1, to_signal=TestSignal.signal_s3_1)) == 1
+            assert (
+                len(
+                    cloned_node.get_dim_mappers(
+                        from_signal=TestSignal.signal_internal_complex_1,
+                        to_signal=TestSignal.signal_internal_complex_1.clone("upstream_data_ranged"),
+                    )
+                )
+                == 2
+            )
+            assert (
+                len(
+                    cloned_node.get_dim_mappers(
+                        from_signal=TestSignal.signal_internal_complex_1.clone("upstream_data_ranged"),
+                        to_signal=TestSignal.signal_internal_complex_1,
+                    )
+                )
+                == 2
+            )
+            # and due to non-trival connection, the reverse link should not be automatically established
+            assert not cloned_node.get_dim_mappers(from_signal=TestSignal.signal_s3_1, to_signal=TestSignal.signal_internal_complex_1)
+            assert not cloned_node.get_dim_mappers(
+                from_signal=TestSignal.signal_s3_1, to_signal=TestSignal.signal_internal_complex_1.clone("upstream_data_ranged")
+            )
+
+        cloned_node = copy.deepcopy(self.signal_link_node_3_complex_with_non_trivial_link_2)
+        assert len(cloned_node.link_matrix) == 1
+        cloned_node.compensate_missing_links()
+        # only two more links between the two versions of "signal_internal_complex_1" is added.
+        # not anything from any of those back onto signal_s3_1("dim_1_1")
+        assert len(cloned_node.link_matrix) == 3
+        assert len(cloned_node.get_dim_mappers(from_signal=TestSignal.signal_internal_complex_1, to_signal=TestSignal.signal_s3_1)) == 0
+        assert len(cloned_node.get_dim_mappers(from_signal=TestSignal.signal_s3_1, to_signal=TestSignal.signal_internal_complex_1)) == 1
+        assert (
+            len(
+                cloned_node.get_dim_mappers(
+                    from_signal=TestSignal.signal_s3_1, to_signal=TestSignal.signal_internal_complex_1.clone("upstream_data_ranged")
+                )
+            )
+            == 1
+        )
+        assert (
+            len(
+                cloned_node.get_dim_mappers(
+                    from_signal=TestSignal.signal_internal_complex_1,
+                    to_signal=TestSignal.signal_internal_complex_1.clone("upstream_data_ranged"),
+                )
+            )
+            == 2
         )
 
     def test_signal_link_node_can_receive(self):

@@ -22,6 +22,7 @@ class TestSlackComputeTarget(AWSTestBase):
     bad_url = "https://badurl.slack.com"
     good_url_1 = "https://hooks.slack.com/workflows/1/"
     good_url_2 = "https://hooks.slack.com/workflows/2/"
+    good_url_as_aws_secret = "arn:aws:secretsmanager:us-east-1:123456789012:secret:if-my-app-slack-workflow-url-5wjhy3"
     good_url_base_but_does_not_exist = "https://hooks.slack.com/workflows/does_not_exsit/"
     good_url_base_but_connection_error = "https://hooks.slack.com/workflows/connection_issue/"
     good_url_base_but_time_out = "https://hooks.slack.com/workflows/time_out/"
@@ -82,6 +83,13 @@ class TestSlackComputeTarget(AWSTestBase):
         slack_action_obj = slack_obj.action(recipient_list=[self.good_url_2], message=message_after)
         assert slack_action_obj.slack.recipient_list[0] == self.good_url_2
         assert slack_action_obj.slack.message == message_after
+
+    def test_slack_aws_secret(self):
+        slack_obj = Slack(recipient_list=[self.good_url_1, self.good_url_as_aws_secret], message="message")
+        assert slack_obj.aws_secret_arns == [self.good_url_as_aws_secret]
+        assert slack_obj.raw_workflow_urls == [self.good_url_1]
+        slack_action_obj = slack_obj.action()
+        assert slack_action_obj.permissions
 
     @responses.mock.activate
     def test_slack_should_throw_exception_when_posting_to_url_with_bad_token(self):

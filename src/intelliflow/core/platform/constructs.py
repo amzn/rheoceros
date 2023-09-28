@@ -18,6 +18,7 @@ from intelliflow.core.platform.definitions.compute import (
     ComputeFailedSessionState,
     ComputeFailedSessionStateType,
     ComputeInternalError,
+    ComputeLogQuery,
     ComputeResourceDesc,
     ComputeResponse,
     ComputeResponseType,
@@ -746,7 +747,7 @@ class Storage(BaseConstruct, ABC):
         if self.is_internal(source_type, resource_path):
             spec = self.map_incoming_event(source_type, resource_path)
             internal_spec = InternalDatasetSignalSourceAccessSpec.create_from_external(materialized_signal.resource_access_spec, spec)
-            return materialized_signal.create_from_spec(internal_spec)
+            return materialized_signal.create_from_spec(internal_spec, SignalType.INTERNAL_PARTITION_CREATION)
 
     @abstractmethod
     def map_incoming_event(self, source_type: SignalSourceType, resource_path: str) -> Optional[SignalSourceAccessSpec]:
@@ -841,7 +842,7 @@ class BatchCompute(BaseConstruct, ABC):
         """
         ...
 
-    def provide_output_attributes(self, slot: Slot, user_attrs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def provide_output_attributes(self, inputs: List[Signal], slot: Slot, user_attrs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """validates user attrs and then proceeds to interpret slot to provide default output attrs mandated by
         the compute operations in this driver (e.g output dataset attrs after batch compute runs / new partitions)."""
         ...
@@ -849,6 +850,7 @@ class BatchCompute(BaseConstruct, ABC):
     @abstractmethod
     def compute(
         self,
+        route: Route,
         materialized_inputs: List[Signal],
         slot: Slot,
         materialized_output: Signal,
@@ -903,7 +905,36 @@ class BatchCompute(BaseConstruct, ABC):
         pass
 
     def describe_compute_record(self, active_compute_record: "RoutingTable.ComputeRecord") -> Optional[Dict[str, Any]]:
-        return dict()
+        execution_details = dict()
+        if active_compute_record.session_state and active_compute_record.session_state.executions:
+            last_execution_details = active_compute_record.session_state.executions[-1]
+            # TODO last_execution_details sometimes shows up as None. This should not happen. Not critical but routing
+            #  should change
+            if last_execution_details:
+                execution_details.update({"details": last_execution_details.details.copy()})
+
+        # Extract SLOT info
+        if active_compute_record.slot:
+            slot = dict()
+            slot["type"] = active_compute_record.slot.type
+            slot["lang"] = active_compute_record.slot.code_lang
+            slot["code"] = active_compute_record.slot.code
+            slot["code_abi"] = active_compute_record.slot.code_abi
+
+            execution_details.update({"slot": slot})
+
+        return execution_details
+
+    def get_compute_record_logs(
+        self,
+        compute_record: "RoutingTable.ComputeRecord",
+        error_only: bool = True,
+        filter_pattern: Optional[str] = None,
+        time_range: Optional[Tuple[int, int]] = None,
+        limit: Optional[int] = None,
+        next_token: Optional[str] = None,
+    ) -> Optional[ComputeLogQuery]:
+        pass
 
     @abstractmethod
     def query_external_source_spec(
@@ -953,6 +984,10 @@ class CompositeBatchCompute(BatchCompute):
 
         self._removed_drivers = []
 
+    @property
+    def removed_drivers(self) -> List[BatchCompute]:
+        return self._removed_drivers
+
     def _load_drivers_list(self, params: ConstructParamsDict) -> List[Type[BatchCompute]]:
         drivers_priority_list: List[Type[BatchCompute]] = params.get(self.BATCH_COMPUTE_DRIVERS_PARAM, None)
         if not drivers_priority_list:
@@ -980,14 +1015,14 @@ class CompositeBatchCompute(BatchCompute):
             f"Consider extending it if you are willing to create your own composite BatchCompute driver."
         )
 
-    def provide_output_attributes(self, slot: Slot, user_attrs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def provide_output_attributes(self, inputs: List[Signal], slot: Slot, user_attrs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         driver: BatchCompute = self._find_batch_compute(slot)
         if driver is None:
             raise ValueError(
                 f"Cannot find a BatchCompute compatible with slot {slot!r}! One or more parameters in compute/slot definition might be missing. "
                 f"Check the following BatchCompute specs: {[repr(bc.driver_spec().pretty()) for bc in self._drivers]}."
             )
-        return driver.provide_output_attributes(slot, user_attrs)
+        return driver.provide_output_attributes(inputs, slot, user_attrs)
 
     def _find_batch_compute(self, slot: Slot) -> Optional[BatchCompute]:
         if slot.type.is_batch_compute():
@@ -1084,6 +1119,7 @@ class CompositeBatchCompute(BatchCompute):
 
     def compute(
         self,
+        route: Route,
         materialized_inputs: List[Signal],
         slot: Slot,
         materialized_output: Signal,
@@ -1097,7 +1133,7 @@ class CompositeBatchCompute(BatchCompute):
                 f"Slot: {slot!r},"
                 f"Active BatchCompute drivers: {self._drivers_priority_list!r}"
             )
-        return driver.compute(materialized_inputs, slot, materialized_output, execution_ctx_id, retry_session_desc)
+        return driver.compute(route, materialized_inputs, slot, materialized_output, execution_ctx_id, retry_session_desc)
 
     def can_retry(self, active_compute_record: "RoutingTable.ComputeRecord") -> bool:
         driver: BatchCompute = self._get_driver(active_compute_record.slot, active_compute_record.state.resource_desc.driver_type)
@@ -1368,6 +1404,18 @@ class CompositeBatchCompute(BatchCompute):
         driver: BatchCompute = self._get_driver(active_compute_record.slot, active_compute_record.state.resource_desc.driver_type)
         return driver.describe_compute_record(active_compute_record)
 
+    def get_compute_record_logs(
+        self,
+        compute_record: "RoutingTable.ComputeRecord",
+        error_only: bool = True,
+        filter_pattern: Optional[str] = None,
+        time_range: Optional[Tuple[int, int]] = None,
+        limit: Optional[int] = None,
+        next_token: Optional[str] = None,
+    ) -> Optional[ComputeLogQuery]:
+        driver: BatchCompute = self._get_driver(compute_record.slot, compute_record.state.resource_desc.driver_type)
+        return driver.get_compute_record_logs(compute_record, error_only, filter_pattern, time_range, limit, next_token)
+
 
 class Diagnostics(BaseConstruct, ABC):
     """Abstraction for system wide diagnostics signal (i.e Metric, Alarm, Logs) management, runtime retrieval
@@ -1467,6 +1515,71 @@ class Diagnostics(BaseConstruct, ABC):
 
         def __getitem__(self, slice_filter: Any) -> "Diagnostics.MetricAction":
             return self
+
+    def __init__(self, params: ConstructParamsDict) -> None:
+        super().__init__(params)
+        self._pending_dashboards: Dict[str, Any] = dict()
+        self._processed_dashboards: Dict[str, Any] = dict()
+
+    def _deserialized_init(self, params: ConstructParamsDict) -> None:
+        super()._deserialized_init(params)
+        # TODO remove after custom dashboard release (temporary backwards compatibility)
+        if not getattr(self, "_pending_dashboards", None):
+            self._pending_dashboards: Dict[str, Any] = dict()
+        if not getattr(self, "_processed_dashboards", None):
+            self._processed_dashboards: Dict[str, Any] = dict()
+
+    # dashboard editing functions used before activation
+    @abstractmethod
+    def create_dashboard(self, **kwargs) -> Dict[str, Any]:
+        ...
+
+    @abstractmethod
+    def add_text_widget(self, current_data: Dict[str, Any], markdown: str, **kwargs) -> None:
+        ...
+
+    @abstractmethod
+    def add_alarm_status_widget(self, current_data: Dict[str, Any], title: str, alarms: List[Signal], **kwargs) -> None:
+        ...
+
+    @abstractmethod
+    def add_metric_widget(
+        self, current_data: Dict[str, Any], metric_signals_or_alarm: List[Signal], title: Optional[str] = None, **kwargs
+    ) -> None:
+        ...
+
+    def hook_dashboards(self, dashboards: Dict[str, Any]) -> None:
+        self._pending_dashboards = dashboards
+
+    def process_dashboards(self) -> None:
+        if not self.terminated:
+            self._process_dashboards(self._pending_dashboards, self._processed_dashboards)
+
+    def rollback(self) -> None:
+        # roll back activation, something bad has happened (probably in another Construct) during app launch
+        super().rollback()
+        self._revert_dashboards(self._pending_dashboards, self._processed_dashboards)
+
+    @abstractmethod
+    def _revert_dashboards(selfs, dashboards: Dict[str, Any], prev_dashboards: Dict[str, Any]) -> None:
+        ...
+
+    @abstractmethod
+    def _process_dashboards(self, new_dashboards: Dict[str, Any], current_dashboards: Dict[str, Any]) -> None:
+        ...
+
+    def activation_completed(self) -> None:
+        super().activation_completed()
+        # now we can safely adapt the new state. whole app got into new configuration consistently.
+        self._processed_dashboards = self._pending_dashboards
+        self._pending_dashboards = None
+
+    def transfer_transaction_history(self, prev_construct: "BaseConstruct") -> None:
+        super().transfer_transaction_history(prev_construct)
+        if getattr(prev_construct, "_processed_dashboards", None):
+            self._processed_dashboards = prev_construct._processed_dashboards
+        else:
+            self._processed_dashboards: Dict[str, Any] = dict()
 
     @classmethod
     def check_metric_materialization(cls, metric_signal: Signal, for_emission=False) -> None:
@@ -1704,6 +1817,392 @@ class Diagnostics(BaseConstruct, ABC):
         ...
 
 
+class Extension(BaseConstruct, ABC):
+    def __init__(self, params: ConstructParamsDict) -> None:
+        super().__init__(params)
+        self._desc = None
+
+    @property
+    def desc(self) -> "Extension.Descriptor":
+        return self._desc
+
+    @desc.setter
+    def desc(self, extension_desc: "Extension.Descriptor") -> None:
+        self._desc = extension_desc
+
+    def _deserialized_init_ext(self, extension_desc: "Extension.Descriptor", params: ConstructParamsDict) -> None:
+        """Reloaded during the initialization of an existing (previously activated) application for development"""
+        # user might have updated the descriptor (mainly "extension_params")
+        self.desc = extension_desc
+        self._deserialized_init(params)
+
+    @classmethod
+    @abstractmethod
+    def provide_devtime_permissions_ext(
+        cls, extension_desc: "Extension.Descriptor", params: ConstructParamsDict
+    ) -> List[ConstructPermission]:
+        ...
+
+    # overrides
+    def _provide_route_metrics(self, route: Route) -> List[ConstructInternalMetricDesc]:
+        return []
+
+    # overrides
+    def _provide_internal_metrics(self) -> List[ConstructInternalMetricDesc]:
+        return []
+
+    # overrides
+    def _provide_internal_alarms(self) -> List[Signal]:
+        return []
+
+    class Descriptor(Serializable):
+        def __init__(self, extension_id: str, **kwargs) -> None:
+            assert extension_id, "Platform Extension ID must be provided!"
+            self._extension_id = extension_id
+            self._extension_params: Dict[str, Any] = dict(kwargs)
+
+        def __eq__(self, other):
+            return type(self) == type(other) and self._extension_id == other._extension_id
+
+        def __ne__(self, other):
+            return not self.__eq__(other)
+
+        def __hash__(self) -> int:
+            return hash(self._extension_id)
+
+        @property
+        def extension_id(self) -> str:
+            return self._extension_id
+
+        @property
+        def extension_params(self) -> Dict[str, Any]:
+            return self._extension_params
+
+        def create(self, params: ConstructParamsDict) -> "Extension":
+            extension = self.provide_extension_type()(params)
+            extension.desc = self
+            return extension
+
+        @classmethod
+        @abstractmethod
+        def provide_extension_type(cls) -> Type["Extension"]:
+            ...
+
+
+class CompositeExtension(BaseConstruct):
+    """Provides abstraction to the rest of the platform by encapsulating all the underlying
+    Extensions"""
+
+    EXTENSIONS_PARAM = "PLATFORM_EXTENSIONS"
+
+    def __init__(self, params: ConstructParamsDict) -> None:
+        """
+        Must be initiated with CompositeExtension.EXTENSIONS_PARAM defined with 'params'.
+        """
+        super().__init__(params)
+        self._extension_descriptors = self._load_extension_descriptors(params)
+        # now instantiate the drivers!
+        self._extensions_map: Dict[str, Extension] = {desc.extension_id: desc.create(params) for desc in self._extension_descriptors}
+
+        if not all([isinstance(driver, Extension) for driver in self._extensions_map.values()]):
+            raise ValueError(
+                f"{self.__class__.__name__} must be instantiated with {self.EXTENSIONS_PARAM!r} "
+                f"param defined properly as a list of descriptor (<Extension.Descriptor>) objects."
+            )
+
+        self._removed_extensions = []
+
+    @property
+    def extensions_map(self) -> Dict[str, Extension]:
+        return self._extensions_map
+
+    @property
+    def removed_extensions(self) -> List[Extension]:
+        return self._removed_extensions
+
+    def _load_extension_descriptors(self, params: ConstructParamsDict) -> List[Extension.Descriptor]:
+        extensions_list: List[Extension.Descriptor] = params.get(self.EXTENSIONS_PARAM, [])
+
+        for i, desc in enumerate(extensions_list):
+            for j, desc2 in enumerate(extensions_list):
+                if i != j and (desc.extension_id == desc2.extension_id or desc == desc2):
+                    raise ValueError(f"Some of the platform extensions conflict with each other!")
+
+        return extensions_list
+
+    def _deserialized_init(self, params: ConstructParamsDict) -> None:
+        """Reloaded during the initialization of an existing (previously activated) application for development"""
+        super()._deserialized_init(params)
+        # in between different development sessions, the drivers list might be changed by the user
+        current_extension_descriptors = self._extension_descriptors
+        self._extension_descriptors = self._load_extension_descriptors(params)
+        self._removed_extensions = []
+        if current_extension_descriptors != self._extension_descriptors:
+            logger.critical(
+                f"New {self.EXTENSIONS_PARAM!r} list is different than its previously activated"
+                f" version. Platform will align to the changeset..."
+            )
+
+            new_extensions = []
+            for desc in self._extension_descriptors:
+                if desc in set(self._extension_descriptors) - set(current_extension_descriptors):
+                    # new driver (use the constructor to initiate the driver)
+                    new_extensions.append(desc.create(params))
+                else:
+                    # existing driver
+                    extension = self._extensions_map[desc.extension_id]
+                    # kept by the user (driver instance is deserialized, just let it know about it)
+                    extension._deserialized_init_ext(desc, params)
+                    new_extensions.append(extension)
+
+            for desc in current_extension_descriptors:
+                if desc in set(current_extension_descriptors) - set(self._extension_descriptors):
+                    # 1- extension is totally gone, 2- ID changed 3- or Type has change (new driver using the same ID)
+                    extension = self._extensions_map[desc.extension_id]
+                    # still need to do this to keep the sane operation of the driver till the 'terminate' call
+                    extension._deserialized_init_ext(desc, params)
+                    self._removed_extensions.append(extension)
+
+            self._extensions_map = {ext._desc.extension_id: ext for ext in new_extensions}
+
+            if not all([isinstance(driver, Extension) for driver in self._extensions_map.values()]):
+                raise ValueError(
+                    f"{self.__class__.__name__} must be instantiated with {self.EXTENSIONS_PARAM!r} "
+                    f"param defined properly as a list of types extending <Extension.Descriptor>."
+                )
+        else:
+            # wake up / update existing extensions with new extension_params
+            #  E.g user changes the cloud parameter for a resource managed by an existing extension
+            for desc in self._extension_descriptors:
+                extension = self._extensions_map[desc.extension_id]
+                extension._deserialized_init_ext(desc, params)
+
+    def _serializable_copy_init(self, org_instance: "BaseConstruct") -> None:
+        super()._serializable_copy_init(org_instance)
+        self._extensions_map = {ext_id: driver.serializable_copy() for ext_id, driver in self._extensions_map.items()}
+        # unique to this abstract driver impl:
+        # -  reset the entire _params dict since in this generic scope we cannot eliminate serialization unfriendly fields.
+        # -  this abstract impl cannot assume anything about the platform (AWS, etc).
+        # to be restored in runtime_init as well (_deserialized_init takes care of complete param restoration already).
+        self._params = None
+
+    def update_serialized_cross_refs(self, original_to_serialized_map: Dict["BaseConstruct", "BaseConstruct"]):
+        super().update_serialized_cross_refs(original_to_serialized_map)
+        for driver in self._get_extensions():
+            driver.update_serialized_cross_refs(original_to_serialized_map)
+
+    def __getitem__(self, extension_id: str) -> Extension:
+        return self._extensions_map[extension_id]
+
+    def _get_extensions(self) -> List[Extension]:
+        return list(self._extensions_map.values())
+
+    def dev_init(self, platform: "DevelopmentPlatform") -> None:
+        super().dev_init(platform)
+        for driver in self._get_extensions() + self._removed_extensions:
+            driver.dev_init(platform)
+
+    def runtime_init(self, platform: "RuntimePlatform", context_owner: "BaseConstruct") -> None:
+        # not critical, clone runtime params from Processor
+        # for future extensions in this driver, which would need to rely on params.
+        self._params = dict(platform.storage._params)
+        super().runtime_init(platform, context_owner)
+        for driver in self._get_extensions():
+            driver.runtime_init(platform, context_owner)
+
+    def provide_runtime_trusted_entities(self) -> List[str]:
+        entities = []
+        for driver in self._get_extensions():
+            entities.extend(driver.provide_runtime_trusted_entities())
+        return entities
+
+    def provide_runtime_default_policies(self) -> List[str]:
+        policies = []
+        for driver in self._get_extensions():
+            policies.extend(driver.provide_runtime_default_policies())
+        return policies
+
+    def provide_runtime_permissions(self) -> List[ConstructPermission]:
+        permissions = []
+        for driver in self._get_extensions():
+            permissions.extend(driver.provide_runtime_permissions())
+        return permissions
+
+    @classmethod
+    def provide_devtime_permissions(cls, params: ConstructParamsDict) -> List[ConstructPermission]:
+        # no need to validate the list here, will go through the validation eventually in __init__
+        permissions = []
+        extensions_list: List[Extension.Descriptor] = params.get(cls.EXTENSIONS_PARAM, [])
+        if extensions_list:
+            for desc in extensions_list:
+                permissions.extend(desc.provide_extension_type().provide_devtime_permissions_ext(desc, params))
+        return permissions
+
+    def _provide_system_metrics(self) -> List[Signal]:
+        metrics = []
+        for driver in self._get_extensions():
+            metrics.extend(driver._provide_system_metrics())
+        return metrics
+
+    def _provide_internal_metrics(self) -> List[ConstructInternalMetricDesc]:
+        metrics = []
+        for driver in self._get_extensions():
+            metrics.extend(driver._provide_internal_metrics())
+        return metrics
+
+    def _provide_route_metrics(self, route: Route) -> List[ConstructInternalMetricDesc]:
+        metrics = []
+        for driver in self._get_extensions():
+            metrics.extend(driver._provide_route_metrics(route))
+        return metrics
+
+    def _provide_internal_alarms(self) -> List[Signal]:
+        alarms = []
+        for driver in self._get_extensions():
+            alarms.extend(driver._provide_internal_alarms())
+        return alarms
+
+    def activate(self) -> None:
+        for driver in self._get_extensions():
+            driver.activate()
+        self._terminate_removed_drivers()
+        super().activate()
+
+    def _terminate_removed_drivers(self) -> None:
+        """If this development session has started with a different drivers list, then terminate the removed drivers.
+        See how '_removed_extensions' are detected in '_deserialized_init'.
+        """
+        if self._removed_extensions:
+            logger.critical(f"Terminating removed Extension drivers {[type(driver) for driver in self._removed_extensions]!r} ...")
+            for driver in self._removed_extensions:
+                driver.terminate()
+            logger.critical("Termination for removed Extension drivers done!")
+            self._removed_extensions = []
+
+    def _update_bootstrapper(self, bootstrapper: "RuntimePlatform") -> None:
+        for driver in self._get_extensions():
+            driver._update_bootstrapper(bootstrapper)
+
+    def rollback(self) -> None:
+        for driver in self._get_extensions():
+            driver.rollback()
+        super().rollback()
+
+    def terminate(self) -> None:
+        for driver in self._get_extensions():
+            driver.terminate()
+        self._terminate_removed_drivers()
+        super().terminate()
+
+    def check_update(self, prev_construct: "BaseConstruct") -> None:
+        super().check_update(prev_construct)
+        for driver in self._get_extensions():
+            driver.check_update(prev_construct)
+
+    def process_signals(self) -> None:
+        super().process_signals()
+        for driver in self._get_extensions():
+            driver.process_signals()
+
+    def process_connections(self) -> None:
+        super().process_connections()
+        for driver in self._get_extensions():
+            driver.process_connections()
+
+    def process_security_conf(self) -> None:
+        super().process_security_conf()
+        for driver in self._get_extensions():
+            driver.process_security_conf()
+
+    def process_downstream_connection(self, downstream_platform: "DevelopmentPlatform") -> UpstreamGrants:
+        conf_grants: UpstreamGrants = super().process_downstream_connection(downstream_platform)
+        for driver in self._get_extensions():
+            conf_grants << driver.process_downstream_connection(downstream_platform)
+        return conf_grants
+
+    def terminate_downstream_connection(self, downstream_platform: "DevelopmentPlatform") -> UpstreamRevokes:
+        conf_revokes: UpstreamRevokes = super().terminate_downstream_connection(downstream_platform)
+        for driver in self._get_extensions():
+            conf_revokes << driver.terminate_downstream_connection(downstream_platform)
+        return conf_revokes
+
+    def hook_external(self, signals: List[Signal]) -> None:
+        super().hook_external(signals)
+        for driver in self._get_extensions():
+            driver.hook_external(signals)
+
+    def hook_internal(self, route: "Route") -> None:
+        super().hook_internal(route)
+        for driver in self._get_extensions():
+            driver.hook_internal(route)
+
+    def hook_internal_signal(self, signal: "Signal") -> None:
+        super().hook_internal_signal(signal)
+        for driver in self._get_extensions():
+            driver.hook_internal_signal(signal)
+
+    def connect_construct(self, construct_resource_type: str, construct_resource_path: str, other: "BaseConstruct") -> None:
+        super().connect_construct(construct_resource_type, construct_resource_path, other)
+        for driver in self._get_extensions():
+            driver.connect_construct(construct_resource_type, construct_resource_path, other)
+
+    def hook_security_conf(
+        self, security_conf: ConstructSecurityConf, platform_security_conf: Dict[Type["BaseConstruct"], ConstructSecurityConf]
+    ) -> None:
+        super().hook_security_conf(security_conf, platform_security_conf)
+        for driver in self._get_extensions():
+            driver.hook_security_conf(security_conf, platform_security_conf)
+
+    def _process_external(self, new_signals: Set[Signal], current_signals: Set[Signal]) -> None:
+        for driver in self._get_extensions():
+            driver._process_external(new_signals, current_signals)
+
+    def _process_internal(self, new_routes: Set[Route], current_routes: Set[Route]) -> None:
+        for driver in self._get_extensions():
+            driver._process_internal(new_routes, current_routes)
+
+    def _process_internal_signals(self, new_signals: Set[Signal], current_signals: Set[Signal]) -> None:
+        for driver in self._get_extensions():
+            driver._process_internal_signals(new_signals, current_signals)
+
+    def _process_construct_connections(
+        self, new_construct_conns: Set["_PendingConnRequest"], current_construct_conns: Set["_PendingConnRequest"]
+    ) -> None:
+        for driver in self._get_extensions():
+            driver._process_construct_connections(new_construct_conns, current_construct_conns)
+
+    def _process_security_conf(self, new_security_conf: ConstructSecurityConf, current_security_conf: ConstructSecurityConf) -> None:
+        for driver in self._get_extensions():
+            driver._process_security_conf(new_security_conf, current_security_conf)
+
+    def _revert_external(self, signals: Set[Signal], prev_signals: Set[Signal]) -> None:
+        for driver in self._get_extensions():
+            driver._revert_external(signals, prev_signals)
+
+    def _revert_internal(self, routes: Set[Route], prev_routes: Set[Route]) -> None:
+        for driver in self._get_extensions():
+            driver._revert_internal(routes, prev_routes)
+
+    def _revert_internal_signals(self, signals: Set[Signal], prev_signals: Set[Signal]) -> None:
+        for driver in self._get_extensions():
+            driver._revert_internal_signals(signals, prev_signals)
+
+    def _revert_construct_connections(
+        self, construct_conns: Set["_PendingConnRequest"], prev_construct_conns: Set["_PendingConnRequest"]
+    ) -> None:
+        for driver in self._get_extensions():
+            driver._revert_construct_connections(construct_conns, prev_construct_conns)
+
+    def _revert_security_conf(self, security_conf: ConstructSecurityConf, prev_security_conf: ConstructSecurityConf) -> None:
+        for driver in self._get_extensions():
+            driver._revert_security_conf(security_conf, prev_security_conf)
+
+    def activation_completed(self) -> None:
+        super().activation_completed()
+        for driver in self._get_extensions():
+            driver.activation_completed()
+
+
 FEEDBACK_SIGNAL_TYPE_EVENT_KEY: str = "if_internal_feedback_signal"
 FEEDBACK_SIGNAL_PROCESSING_MODE_KEY: str = "if_internal_feedback_signal_process_mode"
 
@@ -1795,6 +2294,7 @@ class ProcessingUnit(BaseConstruct, ABC):
         processing_mode=FeedBackSignalProcessingMode.ONLY_HEAD,
         target_route_id: Optional[RouteID] = None,
         is_async=True,
+        filter=False,
     ) -> Optional[List["RoutingTable.Response"]]:
         """Injects a new signal or raw event into the system.
 
@@ -2032,6 +2532,14 @@ class RoutingTable(BaseConstruct, ABC):
 
     See implementations under `driver` module to have a better idea.
     """
+
+    # 240 seconds is based on max Processor core time during very large scale operation with "is_synchronized = False".
+    # This is conservatively assuming that the entire cycle was spent on a single route.
+    # Here it is safer to reject retain attempts rather than force retaining a lock due a smaller duration here.
+    # Orchestration should find a way to redrive rejected events but if we allow premature retains then the problem
+    # is concurrent access.
+    DEFAULT_LOCK_DURATION_IN_SECS: ClassVar[int] = 240
+    DEFAULT_LOCK_RETAIN_ATTEMPT_DURATION_IN_SECS: ClassVar[int] = 64
 
     class RouteIndex:
         """Immutable index to find matching Routes against an incoming Signal.
@@ -2286,10 +2794,20 @@ class RoutingTable(BaseConstruct, ABC):
     class Response(Serializable):
         def __init__(self) -> None:
             self._routes: Dict[Route, Dict[Route.ExecutionContext, List["RoutingTable.ComputeRecord"]]] = dict()
+            # events that could not be processed against some of the routes for reasons such as "locking", etc.
+            # TODO defer events that cannot be processed due to expired RoutingSession
+            self._deferred_signals: Dict[Route, Set[Signal]] = dict()
 
         @property
         def routes(self) -> Dict[Route, Dict[Route.ExecutionContext, List["RoutingTable.ComputeRecord"]]]:
             return self._routes
+
+        @property
+        def deferred_signals(self) -> Dict[Route, Set[Signal]]:
+            return self._deferred_signals
+
+        def clear_deferred_signals(self) -> None:
+            self._deferred_signals.clear()
 
         def dump(self) -> Dict[Any, Any]:
             return {r.route_id: {e.id: repr(records) for e, records in e_dict.items()} for r, e_dict in self._routes.items()}
@@ -2301,6 +2819,9 @@ class RoutingTable(BaseConstruct, ABC):
             status of those executions, materialized inputs/outputs.
             """
             return {r.route_id: [e.id for e in e_dict.keys()] for r, e_dict in self._routes.items()}
+
+        def defer_signal(self, route: Route, signal: Signal) -> None:
+            self._deferred_signals.setdefault(route, set()).add(signal)
 
         def add_route(self, route: Route) -> None:
             execution_contexts: Dict[Route.ExecutionContext, List["RoutingTable.ComputeRecord"]] = dict()
@@ -2376,7 +2897,16 @@ class RoutingTable(BaseConstruct, ABC):
                                     f" active compute records (if any) will be tombstoned as inactive and also"
                                     f" its pending execution candidates (if any) will be deleted."
                                 )
-                                self._lock(current.route_id)
+                                logger.critical(
+                                    f"Retaining lock on route {current.route_id!r} (max wait time={RoutingTable.DEFAULT_LOCK_DURATION_IN_SECS!r})..."
+                                )
+                                if not self._lock(
+                                    current.route_id, retain_attempt_duration_in_secs=RoutingTable.DEFAULT_LOCK_DURATION_IN_SECS
+                                ):
+                                    # this can happen during the 'activation', we can halt the activation sequence with no side effects to runtime here.
+                                    raise RuntimeError(
+                                        f"Route {current.route_id!r} is locked by a remote Processor! Could not retain it now. Please try again later."
+                                    )
                                 # load and check active records,
                                 # we won't track them anymore, move them to historical db
                                 route_record = self._load(current.route_id)
@@ -2388,7 +2918,11 @@ class RoutingTable(BaseConstruct, ABC):
                                         )
                                         # FUTURE consider forcefully stopping these to eliminate implicit event binding
                                         # upon their probable successful completion. Currently (as of 11/2020) not a big concern.
-                                        self._save_inactive_compute_records(route_record.route, list(route_record.active_compute_records))
+                                        active_compute_records = list(route_record.active_compute_records)
+                                        for ac in active_compute_records:
+                                            if not ac.deactivated_timestamp_utc:
+                                                ac.deactivated_timestamp_utc = self._current_timestamp_in_utc()
+                                        self._save_inactive_compute_records(route_record.route, active_compute_records)
                             except AttributeError as attr_err:
                                 # TODO METRICS_SUPPORT
                                 logger.critical(
@@ -2410,7 +2944,18 @@ class RoutingTable(BaseConstruct, ABC):
                             # intentionally separating the logic from integrity check above to avoid complexity,
                             # reuse will be handled in a different refactoring scope.
                             try:
-                                self._lock(current.route_id)
+                                logger.warning(
+                                    f"Detected change in auxiliary data of route {new.route_id!r}! " f"Will publish new changes..."
+                                )
+                                logger.critical(
+                                    f"Retaining lock on route {current.route_id!r} (max wait time={RoutingTable.DEFAULT_LOCK_DURATION_IN_SECS!r})..."
+                                )
+                                if not self._lock(
+                                    current.route_id, retain_attempt_duration_in_secs=RoutingTable.DEFAULT_LOCK_DURATION_IN_SECS
+                                ):
+                                    raise RuntimeError(
+                                        f"Route {current.route_id!r} is locked by a remote Processor! Could not retain it now. Please try again later."
+                                    )
                                 route_record = self._load(current.route_id)
                                 route_record.route.transfer_auxiliary_data(new)
                                 self._save(route_record)
@@ -2431,7 +2976,9 @@ class RoutingTable(BaseConstruct, ABC):
 
     def _provide_route_metrics(self, route: Route) -> List[ConstructInternalMetricDesc]:
         return [
-            ConstructInternalMetricDesc(id="routing_table.receive", metric_names=["RouteHit", "RouteLoadError", "RouteSaveError"]),
+            ConstructInternalMetricDesc(
+                id="routing_table.receive", metric_names=["RouteHit", "RouteDeferred", "RouteLoadError", "RouteSaveError"]
+            ),
             ConstructInternalMetricDesc(
                 id="routing_table.receive.hook",
                 metric_names=[
@@ -2487,7 +3034,9 @@ class RoutingTable(BaseConstruct, ABC):
                 extra_sub_dimensions={"filter_mode": "True"},
             ),
             ConstructInternalMetricDesc(id="routing_table.event.type", metric_names=["InternalStorage", "InternalDiagnostics", "External"]),
-            ConstructInternalMetricDesc(id="routing_table.receive", metric_names=["RouteHit", "RouteLoadError", "RouteSaveError"]),
+            ConstructInternalMetricDesc(
+                id="routing_table.receive", metric_names=["RouteHit", "RouteDeferred", "RouteLoadError", "RouteSaveError"]
+            ),
             # emit collective (not route specific) version of some of the hooks
             ConstructInternalMetricDesc(
                 id="routing_table.receive.hook",
@@ -2586,18 +3135,27 @@ class RoutingTable(BaseConstruct, ABC):
         elif route_and_signal_map:
             logger.info("Found matching routes for incoming signal:")
             self.metric("routing_table.receive")["RouteHit"].emit(len(route_and_signal_map.keys()))
+            deferred_count: int = 0
             for route, incoming_signal in route_and_signal_map.items():
-                if routing_session.is_expired():
-                    break
-
                 if target_route_id and route.route_id != target_route_id:
                     logger.critical(f"Skipping route={route.route_id} since this session targets {target_route_id!r} only.")
+                    continue
+
+                if routing_session.is_expired():
+                    self.metric("routing_table.receive", route=route)["RouteDeferred"].emit(1)
+                    deferred_count = deferred_count + 1
+                    response.defer_signal(route, incoming_signal)
                     continue
 
                 logger.critical(f"Processing route={route.route_id}")
                 self.metric("routing_table.receive", route=route)["RouteHit"].emit(1)
                 # blocking wait / synchronous access to a specific Route
-                self._lock(route.route_id)
+                if not self._lock(route.route_id):
+                    self.metric("routing_table.receive", route=route)["RouteDeferred"].emit(1)
+                    logger.critical(f"Could not retain lock for route={route.route_id}! Will process it later for this signal.")
+                    deferred_count = deferred_count + 1
+                    response.defer_signal(route, incoming_signal)
+                    continue
                 route_record: RoutingTable.RouteRecord = self._load(route.route_id)
                 if not route_record:
                     logger.info(f"First time checking on this route.")
@@ -2632,6 +3190,9 @@ class RoutingTable(BaseConstruct, ABC):
 
                 self._save(route_record, suppress_errors_and_emit=True)
                 self._release(route_record.route.route_id)
+
+            if deferred_count > 0:
+                self.metric("routing_table.receive")["RouteDeferred"].emit(deferred_count)
 
         return response
 
@@ -2737,7 +3298,11 @@ class RoutingTable(BaseConstruct, ABC):
                             # FUTURE convert whole BATCH_COMPUTE to REMOTE_COMPUTE (batch + async normal combined)
                             try:
                                 compute_response = self.get_platform().batch_compute.compute(
-                                    materialized_inputs, slot, materialized_output, execution_ctx_id=execution_context.id
+                                    route_record.route,
+                                    materialized_inputs,
+                                    slot,
+                                    materialized_output,
+                                    execution_ctx_id=execution_context.id,
                                 )
                             except Exception as error:
                                 logger.critical(
@@ -2867,6 +3432,7 @@ class RoutingTable(BaseConstruct, ABC):
             self.check_active_route(route, routing_session)
 
     def check_active_route(self, route: Union[RouteID, Route], routing_session: RoutingSession) -> None:
+        retained: bool = False
         try:
             if not isinstance(route, Route):
                 route_id = route
@@ -2874,14 +3440,15 @@ class RoutingTable(BaseConstruct, ABC):
             else:
                 route_id = cast(Route, route).route_id
             route_record: RoutingTable.RouteRecord = None
-            self._lock(route_id)
-            route_record = self._load(route_id)
-            if route_record:
-                self._check_active_compute_records_for(route_record, routing_session)
-                self._check_ready_pending_nodes_for(
-                    route, route_record, routing_session
-                )  # do this before expiration check (next), graceful
-                self._check_pending_nodes_for(route_record, routing_session)
+            if self._lock(route_id, retain_attempt_duration_in_secs=32):  # wait shorter. less critical during a routine check
+                retained = True
+                route_record = self._load(route_id)
+                if route_record:
+                    self._check_active_compute_records_for(route_record, routing_session)
+                    self._check_ready_pending_nodes_for(
+                        route, route_record, routing_session
+                    )  # do this before expiration check (next), graceful
+                    self._check_pending_nodes_for(route_record, routing_session)
         except Exception as err:
             logger.critical(
                 f"Encountered error: '{str(err)}',  while checking the status of route: {route_id!r}"
@@ -2890,7 +3457,21 @@ class RoutingTable(BaseConstruct, ABC):
         finally:
             if route_record:
                 self._save(route_record, suppress_errors_and_emit=True)
-            self._release(route_id)
+            if retained:
+                self._release(route_id)
+
+    @classmethod
+    def _check_if_active_compute_force_stopped(cls, active_record: "RoutingTable.ComputeRecord"):
+        if active_record.state.response_type == ComputeResponseType.FAILED:
+            state = cast(ComputeFailedResponse, active_record.state)
+            if state.failed_response_type in [ComputeFailedResponseType.TRANSIENT_FORCE_STOPPED, ComputeFailedResponseType.FORCE_STOPPED]:
+                return True
+        elif active_record.session_state and not active_record.session_state.state_type.is_active():
+            if active_record.session_state.state_type == ComputeSessionStateType.FAILED and cast(
+                ComputeFailedSessionState, active_record.session_state
+            ).failed_type in [ComputeFailedSessionStateType.TRANSIENT_FORCE_STOPPED, ComputeFailedResponseType.FORCE_STOPPED]:
+                return True
+        return False
 
     def _check_active_compute_records_for(self, route_record: "RoutingTable.RouteRecord", routing_session: RoutingSession) -> None:
         """Update the status of active compute records and detect completions and feed the platform
@@ -2914,27 +3495,32 @@ class RoutingTable(BaseConstruct, ABC):
                     else:
                         most_recent_session_desc: ComputeSessionDesc = state.session_desc
 
-                    try:
-                        internal_session_state: ComputeSessionState = self.get_platform().batch_compute.get_session_state(
-                            most_recent_session_desc, active_compute_record
-                        )
-                    except Exception as error:
-                        # BatchCompute non-transient exceptions are permanent failures for orchestration,
-                        # don't disrupt the overall flow and move on
-                        internal_session_state = ComputeFailedSessionState(
-                            ComputeFailedSessionStateType.COMPUTE_INTERNAL,
-                            most_recent_session_desc,
-                            [
-                                ComputeExecutionDetails(
-                                    active_compute_record.trigger_timestamp_utc,
-                                    self._current_timestamp_in_utc(),
-                                    {
-                                        "ErrorMessage": "Marked as failure due to unexpected error in compute session state retrieval: "
-                                        + str(error)
-                                    },
-                                )
-                            ],
-                        )
+                    if not self._check_if_active_compute_force_stopped(active_compute_record):
+                        try:
+                            internal_session_state: ComputeSessionState = self.get_platform().batch_compute.get_session_state(
+                                most_recent_session_desc, active_compute_record
+                            )
+                        except Exception as error:
+                            # BatchCompute non-transient exceptions are permanent failures for orchestration,
+                            # don't disrupt the overall flow and move on
+                            internal_session_state = ComputeFailedSessionState(
+                                ComputeFailedSessionStateType.COMPUTE_INTERNAL,
+                                most_recent_session_desc,
+                                [
+                                    ComputeExecutionDetails(
+                                        active_compute_record.trigger_timestamp_utc,
+                                        self._current_timestamp_in_utc(),
+                                        {
+                                            "ErrorMessage": "Marked as failure due to unexpected error in compute session state retrieval: "
+                                            + str(error)
+                                        },
+                                    )
+                                ],
+                            )
+                    else:
+                        # just skip the call to BC if it was force-killed and get ready to deactivate this record
+                        # see "RoutingTable::kill" for more details
+                        internal_session_state = active_compute_record.session_state
 
                     if active_compute_record.session_state:
                         # transfer/keep previous exec history for this compute record
@@ -2976,6 +3562,7 @@ class RoutingTable(BaseConstruct, ABC):
                         elif (
                             internal_session_state.state_type == ComputeSessionStateType.FAILED
                             and active_compute_record.number_of_attempts_on_failure < active_compute_record.slot.max_retry_count
+                            and not self._check_if_active_compute_force_stopped(active_compute_record)
                         ):
                             next_attempt = active_compute_record.number_of_attempts_on_failure + 1
                             logger.critical(
@@ -3043,6 +3630,7 @@ class RoutingTable(BaseConstruct, ABC):
                     )
                     try:
                         compute_response = self.get_platform().batch_compute.compute(
+                            route_record.route,
                             active_compute_record.materialized_inputs,
                             active_compute_record.slot,
                             active_compute_record.materialized_output,
@@ -3245,6 +3833,7 @@ class RoutingTable(BaseConstruct, ABC):
             args = params = dict(self._params)
             dimensions = dimensions_map = create_output_dimension_map(materialized_output)
             params.update({"dimensions": dimensions, "dimensions_map": dimensions})
+            params.update({"routing_table": self, "platform": self.get_platform(), "runtime_platform": self.get_platform()})
             # now setup convenience local variables
             input_map: Dict[str, Signal] = {}
             for i, input_signal in enumerate(materialized_inputs):
@@ -3523,7 +4112,12 @@ class RoutingTable(BaseConstruct, ABC):
         return True
 
     @abstractmethod
-    def _lock(self, route_id: RouteID) -> None:
+    def _lock(
+        self,
+        route_id: RouteID,
+        lock_duration_in_secs: int = DEFAULT_LOCK_DURATION_IN_SECS,
+        retain_attempt_duration_in_secs: int = DEFAULT_LOCK_RETAIN_ATTEMPT_DURATION_IN_SECS,
+    ) -> bool:
         pass
 
     @abstractmethod
@@ -3564,22 +4158,28 @@ class RoutingTable(BaseConstruct, ABC):
         ...
 
     @abstractmethod
-    def query_inactive_records(
-        self,
-        slot_types: Set[SlotType],
-        trigger_range: Tuple[int, int],
-        deactivated_range: Tuple[int, int],
-        elapsed_range: Tuple[int, int],
-        response_states: Set[Enum],
-        response_sub_states: Set[Enum],
-        session_states: Set[Enum],
-        session_sub_states: Set[Enum],
-        ascending: bool = False,
-    ) -> Iterator[Tuple[Route, "RoutingTable.ComputeRecord"]]:
+    def load_active_compute_records(
+        self, route_id: Optional[RouteID] = None, ascending: bool = False
+    ) -> Iterator["RoutingTable.ComputeRecord"]:
         ...
 
     @abstractmethod
-    def load_inactive_compute_records(self, route_id: RouteID, ascending: bool = True) -> Iterator["RoutingTable.ComputeRecord"]:
+    def load_pending_nodes(
+        self, route_id: Optional[RouteID] = None, ascending: bool = False
+    ) -> Union[Iterator[Tuple[RouteID, "RuntimeLinkNode"]], Iterator["RuntimeLinkNode"]]:
+        ...
+
+    @abstractmethod
+    def load_inactive_compute_records(
+        self,
+        route_id: Optional[RouteID] = None,
+        ascending: bool = True,
+        trigger_range: Tuple[int, int] = None,
+        deactivated_range: Tuple[int, int] = None,
+        slot_type: SlotType = None,
+        session_state: ComputeSessionStateType = None,
+        limit: Optional[int] = None,
+    ) -> Iterator["RoutingTable.ComputeRecord"]:
         """Load historical records from the secondary storage (where we will keep the historical records)"""
         ...
 
@@ -3593,11 +4193,18 @@ class RoutingTable(BaseConstruct, ABC):
         ...
 
     def load_inactive_compute_record(
-        self, route_id: RouteID, materialized_output: Signal, datum: Optional[datetime] = None
+        self,
+        route_id: RouteID,
+        materialized_output: Signal,
+        datum: Optional[datetime] = None,
+        trigger_range: Tuple[int, int] = None,
+        deactivated_range: Tuple[int, int] = None,
+        slot_type: SlotType = None,
+        session_state: ComputeSessionStateType = None,
     ) -> Optional["RoutingTable.ComputeRecord"]:
         if datum is not None:
             datum = int(datum.timestamp())
-        inactive_records = self.load_inactive_compute_records(route_id, ascending=False)
+        inactive_records = self.load_inactive_compute_records(route_id, False, trigger_range, deactivated_range, slot_type, session_state)
         if inactive_records:
             for inactive_record in inactive_records:
                 if (datum is None or inactive_record.trigger_timestamp_utc >= datum) and DimensionFilter.check_equivalence(
@@ -3609,3 +4216,94 @@ class RoutingTable(BaseConstruct, ABC):
     def describe_compute_record(self, compute_record: "RoutingTable.ComputeRecord") -> Optional[Dict[str, Any]]:
         if compute_record.slot.type.is_batch_compute():
             return self.get_platform().batch_compute.describe_compute_record(compute_record)
+
+    def get_compute_record_logs(
+        self,
+        compute_record: "RoutingTable.ComputeRecord",
+        error_only: bool = True,
+        filter_pattern: Optional[str] = None,
+        time_range: Optional[Tuple[int, int]] = None,
+        limit: Optional[int] = None,
+        next_token: Optional[str] = None,
+    ) -> Optional[ComputeLogQuery]:
+        if compute_record.slot.type.is_batch_compute():
+            return self.get_platform().batch_compute.get_compute_record_logs(
+                compute_record, error_only, filter_pattern, time_range, limit, next_token
+            )
+
+    def kill(self, route_id: RouteID, materialized_output: Signal) -> Set[str]:
+        active_executions = set()
+
+        route_record: RoutingTable.RouteRecord = None
+        retained: bool = False
+        modified: bool = False
+        try:
+            if not self._lock(route_id, retain_attempt_duration_in_secs=16):
+                raise RuntimeError(f"Route {route_id!r} is locked by Processor! Could not retain it now. Please try again later.")
+            retained = True
+
+            # find active records and call kill on each one of them
+            route_record = self._load(route_id)
+            if route_record and route_record.has_active_record_for(materialized_output):
+                active_records = route_record.get_active_records_of(materialized_output)
+                active_executions.update([r.execution_context_id for r in active_records])
+                if active_records:
+                    logger.critical(f"Route {route_id!r} has active execution(s) on it now.")
+                    logger.critical(
+                        f"At least one of those executions is working on the same output: {materialized_output.get_materialized_resource_paths()[0]}"
+                    )
+                    logger.critical(f"Active compute sessions: {[record.session_state for record in active_records]!r}.")
+                    logger.critical(f"Attempting to kill the active sessions...")
+                    for active_record in active_records:
+                        if active_record.state.response_type == ComputeResponseType.SUCCESS:
+                            if active_record.slot.type.is_batch_compute():
+                                try:
+                                    self.get_platform().batch_compute.kill_session(active_record)
+                                except Exception:
+                                    # there is only one case that we need to evaluate here.
+                                    # it is when the compute is a FAILED one with a TRANSIENT error and waiting
+                                    # to be run again and kept as active. we will immediately move it to inactive to
+                                    # avoid picking it up in the next orchestration cycle.
+                                    # because for the batch compute this might already be an invalid compute and it can reject
+                                    # the kill request. this would keep the record in this state forever.
+                                    #  TODO remove response_type here (not removed after RoutingTable synchronization)
+                                    #   so a record cannot have FAILED ComputeResponse here.
+                                    if active_record.state.response_type == ComputeResponseType.FAILED:
+                                        state = cast(ComputeFailedResponse, active_record.state)
+                                        if state.failed_response_type == ComputeFailedResponseType.TRANSIENT:
+                                            state.failed_response_type = ComputeFailedResponseType.TRANSIENT_FORCE_STOPPED
+                                            modified = True
+                                    elif active_record.session_state and not active_record.session_state.state_type.is_active():
+                                        if (
+                                            active_record.session_state.state_type == ComputeSessionStateType.FAILED
+                                            and cast(ComputeFailedSessionState, active_record.session_state).failed_type
+                                            == ComputeFailedSessionStateType.TRANSIENT
+                                        ):
+                                            active_record.session_state.failed_type = ComputeFailedResponseType.TRANSIENT_FORCE_STOPPED
+                                            modified = True
+                            else:
+                                # cannot do anything else then movign the record to inactive as it is probably running
+                                # within the process domain of remote Processor and currently we don't have any transaction
+                                # management for inlined computes
+                                state = cast(ComputeFailedResponse, active_record.state)
+                                state.failed_response_type = ComputeFailedResponseType.FORCE_STOPPED
+                        elif active_record.state.response_type == ComputeResponseType.FAILED:
+                            # handle records without a session (that were rejected by the drivers directly)
+                            state = cast(ComputeFailedResponse, active_record.state)
+                            if state.failed_response_type == ComputeFailedResponseType.TRANSIENT:
+                                state.failed_response_type = ComputeFailedResponseType.TRANSIENT_FORCE_STOPPED
+                                modified = True
+
+        except Exception as err:
+            logger.critical(
+                f"Encountered error: '{str(err)}',  while attempting to kill the route: {route_id!r}"
+                f" stack trace: {traceback.format_exc()}"
+            )
+            raise err
+        finally:
+            if route_record and modified:
+                self._save(route_record, suppress_errors_and_emit=True)
+            if retained:
+                self._release(route_id)
+
+        return active_executions

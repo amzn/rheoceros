@@ -3,9 +3,10 @@
 
 import threading
 import time
+from datetime import datetime
+from unittest.mock import MagicMock
 
 import pytest
-from mock import MagicMock
 
 import intelliflow.api_ext as flow
 from intelliflow.api_ext import *
@@ -23,7 +24,7 @@ from intelliflow.core.platform.definitions.compute import (
 )
 from intelliflow.core.platform.drivers.compute.aws import AWSGlueBatchComputeBasic
 from intelliflow.core.platform.drivers.compute.aws_athena import AWSAthenaBatchCompute
-from intelliflow.core.platform.drivers.compute.aws_emr import AWSEMRBatchCompute
+from intelliflow.core.platform.drivers.compute.aws_emr import AWSEMRBatchCompute, InstanceConfig, RuntimeConfig
 from intelliflow.core.signal_processing import Slot
 from intelliflow.core.signal_processing.signal import *
 from intelliflow.core.signal_processing.signal_source import (
@@ -174,7 +175,13 @@ class TestAWSApplicationHybridCompute(AWSTestBase):
         app.create_data(
             id="should_NOT_fail",
             inputs={"offline_training_data": eureka_offline_training_data},
-            compute_targets=[Glue("""output=spark.sql('SELECT * FROM offline_training_data')""")],
+            compute_targets=[
+                Glue(
+                    """
+            output=spark.sql('SELECT * FROM offline_training_data')
+            """
+                )
+            ],
             # a dataset cannot have CSV output and header set with Athena (driver will raise)
             data_format=DatasetSignalSourceFormat.CSV,
             header=True,
@@ -262,6 +269,8 @@ class TestAWSApplicationHybridCompute(AWSTestBase):
         signal = default_selection_features_PRESTOSQL.signal()
         assert signal.resource_access_spec.data_compression == "ZLIB"
 
+        self.patch_aws_stop()
+
     def test_application_hybrid_compute_execution(self):
         self.patch_aws_start(glue_catalog_has_all_tables=True)
 
@@ -309,6 +318,7 @@ class TestAWSApplicationHybridCompute(AWSTestBase):
         app.activate()
 
         def glue_driver_compute_method_impl(
+            route: Route,
             materialized_inputs: List[Signal],
             slot: Slot,
             materialized_output: Signal,
@@ -341,6 +351,7 @@ class TestAWSApplicationHybridCompute(AWSTestBase):
         app.platform.batch_compute._drivers[1].get_session_state = MagicMock(side_effect=glue_driver_get_session_state_impl)
 
         def athena_driver_compute_method_impl(
+            route: Route,
             materialized_inputs: List[Signal],
             slot: Slot,
             materialized_output: Signal,
@@ -390,12 +401,18 @@ class TestAWSApplicationHybridCompute(AWSTestBase):
             # make sure that CompositeBatchDriver does not mess up with slot -> BatchCompute driver routing
             assert session_desc.session_id == "glue_JOB"
             return ComputeSessionState(
-                ComputeSessionDesc("job_id", ComputeResourceDesc("job_name", "job_arn", driver=AWSGlueBatchComputeBasic))
+                ComputeSessionDesc("job_run_id", ComputeResourceDesc("job_name", "job_arn", driver=AWSGlueBatchComputeBasic))
                 if not session_desc
                 else session_desc,
                 # COMPLETE!
                 ComputeSessionStateType.COMPLETED,
-                [ComputeExecutionDetails("<start_time>", "<end_time>", dict({"param1": 1, "param2": 2}))],
+                [
+                    ComputeExecutionDetails(
+                        "<start_time>",
+                        "<end_time>",
+                        dict({"Id": "job_run_id", "StartedOn": datetime.now(), "CompletedOn": datetime.now(), "param1": 1, "param2": 2}),
+                    )
+                ],
             )
 
         app.platform.batch_compute._drivers[1].get_session_state = MagicMock(side_effect=glue_driver_get_session_state_impl)
@@ -408,7 +425,11 @@ class TestAWSApplicationHybridCompute(AWSTestBase):
             return ComputeSessionState(
                 ComputeSessionDesc("job_id", ComputeResourceDesc("job_name", "job_arn", driver=None)) if not session_desc else session_desc,
                 ComputeSessionStateType.COMPLETED,
-                [ComputeExecutionDetails("<start_time>", "<end_time>", dict({"param1": 1, "param2": 2}))],
+                [
+                    ComputeExecutionDetails(
+                        "<start_time>", "<end_time>", dict({"QueryExecutionId": "test_exec_id", "param1": 1, "param2": 2})
+                    )
+                ],
             )
 
         app.platform.batch_compute._drivers[0].get_session_state = MagicMock(side_effect=athena_driver_get_session_state_impl)
@@ -419,10 +440,50 @@ class TestAWSApplicationHybridCompute(AWSTestBase):
         assert len(app.get_active_routes()) == 0
 
         # and successful!
-        path, _ = app.poll(default_selection_features_SPARK["NA"]["2021-03-18"])
+        path, glue_compute_records = app.poll(default_selection_features_SPARK["NA"]["2021-03-18"])
         assert path
-        path, _ = app.poll(default_selection_features_PRESTOSQL["NA"]["2021-03-18"])
+        path, athena_compute_records = app.poll(default_selection_features_PRESTOSQL["NA"]["2021-03-18"])
         assert path
+
+        # Debugging
+        # patch Glue driver's remote call
+        def glue_driver_filter_log_events(**query):
+            return {
+                "events": [
+                    {"logStreamName": "job_run_id", "timestamp": 123, "message": "string", "ingestionTime": 123, "eventId": "string"},
+                ],
+                "searchedLogStreams": [
+                    {"logStreamName": "job_run_id", "searchedCompletely": True},
+                ],
+                "nextToken": None,
+            }
+
+        app.platform.batch_compute._drivers[1]._filter_log_events = MagicMock(side_effect=glue_driver_filter_log_events)
+
+        glue_compute_log_query = app.get_compute_record_logs(glue_compute_records[0])[0]
+        assert glue_compute_log_query
+        assert len(glue_compute_log_query.records) == 2
+        assert glue_compute_log_query.records[0]["logStreamName"] == "job_run_id"
+        # do the same again with the materialized view this time (rather than using the compute record directly)
+        glue_compute_log_query = app.get_compute_record_logs(default_selection_features_SPARK["NA"]["2021-03-18"])[0]
+        assert glue_compute_log_query
+        assert len(glue_compute_log_query.records) == 2
+        assert glue_compute_log_query.records[0]["logStreamName"] == "job_run_id"
+
+        athena_compute_log_query = app.get_compute_record_logs(athena_compute_records[0])[0]
+        assert athena_compute_log_query
+        assert not athena_compute_log_query.records
+        # do the same again with the materialized view this time (rather than using the compute record directly)
+        athena_compute_log_query = app.get_compute_record_logs(default_selection_features_PRESTOSQL["NA"]["2021-03-18"])[0]
+        assert athena_compute_log_query
+        assert not athena_compute_log_query.records
+
+        # verify cannot retrieve information for non-existent executions
+        with pytest.raises(ValueError):
+            app.get_compute_record_logs(default_selection_features_SPARK["NA"]["2022-09-12"])
+
+        with pytest.raises(ValueError):
+            app.get_compute_record_logs(default_selection_features_PRESTOSQL["NA"]["2022-09-12"])
 
         self.patch_aws_stop()
 
@@ -460,7 +521,7 @@ class TestAWSApplicationHybridCompute(AWSTestBase):
                     "<SPARK CODE>",
                     # will pick EMR over the existence of InstanceConfig
                     GlueVersion="2.0",
-                    InstanceConfig={"master": {}, "compute": {}},
+                    InstanceConfig=InstanceConfig(20),
                 )
             ],
         )
@@ -471,7 +532,7 @@ class TestAWSApplicationHybridCompute(AWSTestBase):
                 BatchCompute(
                     "<SPARK CODE>",
                     # will pick EMR over the existence of RuntimeConfig
-                    RuntimeConfig="GlueVerion-2.0",
+                    RuntimeConfig=RuntimeConfig.GlueVersion_2_0,
                 )
             ],
         )
@@ -485,6 +546,7 @@ class TestAWSApplicationHybridCompute(AWSTestBase):
         app.activate()
 
         def glue_driver_compute_method_impl(
+            route: Route,
             materialized_inputs: List[Signal],
             slot: Slot,
             materialized_output: Signal,
@@ -516,6 +578,7 @@ class TestAWSApplicationHybridCompute(AWSTestBase):
         app.platform.batch_compute._drivers[0].get_session_state = MagicMock(side_effect=glue_driver_get_session_state_impl)
 
         def emr_driver_compute_method_impl(
+            route: Route,
             materialized_inputs: List[Signal],
             slot: Slot,
             materialized_output: Signal,
@@ -596,6 +659,7 @@ class TestAWSApplicationHybridCompute(AWSTestBase):
         #
         # BEGIN typical test time BatchCompute driver patching sequence:
         def athena_driver_compute_method_impl(
+            route: Route,
             materialized_inputs: List[Signal],
             slot: Slot,
             materialized_output: Signal,
@@ -654,6 +718,7 @@ class TestAWSApplicationHybridCompute(AWSTestBase):
                 AWSConfiguration.builder()
                 .with_region(self.region)
                 .with_param(CompositeBatchCompute.BATCH_COMPUTE_DRIVERS_PARAM, [AWSGlueBatchComputeBasic, AWSEMRBatchCompute])
+                .with_param(AWSCommonParams.DEFAULT_CREDENTIALS_AS_ADMIN, True)
                 .build()
             ),
         )

@@ -5,6 +5,7 @@ import codecs
 import copy
 import datetime
 import json
+import pickle
 import zlib
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, Generic, Optional, Type, TypeVar
@@ -12,6 +13,9 @@ from uuid import uuid4
 
 import dill as pickle
 from dill.source import getsource
+
+SerializationError = pickle.PicklingError
+DeserializationError = pickle.UnpicklingError
 
 # FUTURE remove if we ever rely on 'cloudpickle' since it auto-registers this
 # why do we need this? In platforms where cloudpickle is used (as in notebooks where pyspark uses it), then this

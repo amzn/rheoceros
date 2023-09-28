@@ -521,6 +521,8 @@ class DimensionVariant(Dimension):
     """
 
     CAST_PARAMS_FIELD_ID: ClassVar[str] = "_cast_params"
+    RANGE_SHIFT_FIELD_ID: ClassVar[str] = "_range_shift"
+    MAX_RANGE_SHIFT_VALUE: ClassVar[int] = sys.maxsize
 
     def __init__(
         self, value: Any, name: Optional[NameType] = None, typ: Optional[Type] = None, params: Optional[Dict[str, Any]] = None
@@ -545,6 +547,42 @@ class DimensionVariant(Dimension):
 
     def is_special_value(self) -> bool:
         return not self.is_material_value()
+
+    def transform(self) -> "DimensionVariant":
+        """Apply user provided range shift or custom transforms on the value of the variant to get the final value.
+
+        Transformation is required whenever a variant value is to be used in high-level compute code when resource
+        access is necessary. Untransformed value of the variant is its actual value that must be used to link high-level
+        entities such as Signals to others in the context of SignalLinkNodes for example. Actual unmaterialized value
+        represents either a direct user input or the value from an incoming event.
+
+        DimensionVariant materialization can be best resembled to Scene Graph rendering where 3D entities (their
+        location, dimensions, etc) go through chain of transformations based on the scene hierarchy. Here we have a
+        more trivial, one level hierarchy (Signal -> DimensionFilter -> DimensionVariant) but technically limitless
+        type of transformations (shift and custom transformations provided by the user).
+        """
+        return self._shift()._transform() if self.is_material_value() else self
+
+    def _shift(self) -> "DimensionVariant":
+        """apply range shift if defined by user as part of dimension variant metadata.
+        Shift can be applied as a special transform to materialize the final value of a dimension variant.
+        """
+        shifted_variant = self
+        if self.params:
+            shift = self.params.get(self.RANGE_SHIFT_FIELD_ID, None)
+            if shift:
+                if shift >= 0:
+                    shifted_variant = shifted_variant + abs(shift)
+                else:
+                    shifted_variant = shifted_variant - abs(shift)
+        return shifted_variant
+
+    def _transform(self) -> "DimensionVariant":
+        """Apply user provided transform <Callable>s (if any) in a chain.
+        Transforms are used to materialize the final value of a dimension variant.
+        """
+        # FUTURE/TODO
+        return self
 
     def apply(self, other: "DimensionVariant", finalize: bool) -> Optional[List["DimensionVariant"]]:
         """Apply another variant to this one in the context of chaining two filters.
@@ -665,10 +703,13 @@ class DimensionVariantReader:
 
 class DimensionVariantMapper(DimensionVariantReader):
     def __init__(
-        self, source: Union[Union[Dimension, str], Tuple[Union[Dimension, str]]], target: Dimension, func: DimensionVariantMapFunc
+        self,
+        source: Union[Union[Dimension, str], Tuple[Union[Dimension, str]]],
+        target: Union[Dimension, str],
+        func: DimensionVariantMapFunc,
     ) -> None:
         super().__init__(source)
-        self._target = target
+        self._target = target if isinstance(target, Dimension) else Dimension(target, None)
         self._func = func
         self._mapped_target_index = 0
         self._mapped_values: List[Any] = []
@@ -983,8 +1024,11 @@ class RelativeVariant(DimensionVariant, DimensionVariantResolver, DimensionVaria
         self._relative_index = relative_index
 
     @classmethod
-    def build_value(cls, relative_index: int) -> str:
-        return cls.DATUM_DIMENSION_VALUE_SPECIAL_CHAR + cls.INDEX_SEPARATOR + str(relative_index)
+    def build_value(cls, relative_index: int, shift: Optional[int] = None) -> str:
+        value = cls.DATUM_DIMENSION_VALUE_SPECIAL_CHAR + cls.INDEX_SEPARATOR + str(relative_index)
+        if shift:
+            value = value + cls.INDEX_SEPARATOR + str(shift)
+        return value
 
     # overrides
     def is_material_value(self) -> bool:
@@ -1100,12 +1144,19 @@ class RelativeVariant(DimensionVariant, DimensionVariantResolver, DimensionVaria
 
         # noinspection PyBroadException
         try:
-            datum, relative_index = raw_value.split(cls.INDEX_SEPARATOR)
-            if datum == cls.DATUM_DIMENSION_VALUE_SPECIAL_CHAR:
-                if abs(int(relative_index)) <= cls.MAX_RELATIVE_INDEX_VALUE:
-                    return DimensionVariantResolver.Result(score=DimensionVariantResolverScore.MATCH, creator=cls)
-                else:
-                    raise ValueError(f"RelativeVariant (value: {raw_value}) relative_index exceeds max limit!")
+            slice = raw_value.split(cls.INDEX_SEPARATOR)
+            if len(slice) in [2, 3]:
+                datum = slice[0]
+                if datum == cls.DATUM_DIMENSION_VALUE_SPECIAL_CHAR:
+                    relative_index = slice[1]
+                    if abs(int(relative_index)) <= cls.MAX_RELATIVE_INDEX_VALUE:
+                        if len(slice) == 3:
+                            shift = slice[2]
+                            if abs(int(shift)) > cls.MAX_RANGE_SHIFT_VALUE:
+                                raise ValueError(f"RelativeVariant (value: {raw_value}) shift ({shift}) exceeds max limit!")
+                        return DimensionVariantResolver.Result(score=DimensionVariantResolverScore.MATCH, creator=cls)
+                    else:
+                        raise ValueError(f"RelativeVariant (value: {raw_value}) relative_index exceeds max limit!")
         except Exception:
             pass
 
@@ -1113,7 +1164,26 @@ class RelativeVariant(DimensionVariant, DimensionVariantResolver, DimensionVaria
 
     @classmethod
     def create(cls, raw_value: Any, params_dict: ParamsDictType) -> DimensionVariant:
-        datum, relative_index = raw_value.split(cls.INDEX_SEPARATOR)
+        """Create variant from a string value previously resolved to be a RelativeVariant by
+        RelativeVariant::resolve function. In other terms, DimensionVariantFactory is expected
+        to call this for a raw_value that was previously resolved to be RelativeVariant.
+
+        So its format can be any of the following:
+
+        "_": NOW where _ is DATUM_DIMENSION_VALUE_SPECIAL_CHAR
+        "_:R": Range of [NOW ... NOW -/+ abs(R)] where R is an integer
+        "_:R:S": Range of [(NOW - S) ... (NOW - S) -/+ abs(R)] where R and S are integers
+        """
+        if raw_value == RelativeVariant.DATUM_DIMENSION_VALUE_SPECIAL_CHAR:
+            relative_index = -1
+            shift = None
+        else:
+            range_parts = raw_value.split(cls.INDEX_SEPARATOR)
+            relative_index = range_parts[1]
+            shift = range_parts[2] if len(range_parts) == 3 else None
+            if shift:
+                params_dict = dict() if params_dict is None else dict(params_dict)
+                params_dict.update({DimensionVariant.RANGE_SHIFT_FIELD_ID: int(shift)})
         return (
             RelativeVariant(int(relative_index))
             if not params_dict
@@ -1421,6 +1491,8 @@ class DateVariant(DimensionVariant, DimensionVariantResolver, DimensionVariantCr
     GRANULARITY_PARAM: ClassVar[str] = "granularity"
     TIMEZONE_PARAM: ClassVar[str] = "timezone"
     FORMAT_PARAM: ClassVar[str] = "format"
+    MIN_DATETIME: ClassVar[str] = "min"
+    RELATIVE_MIN_DATETIME: ClassVar[str] = "relative_min"
 
     _SUPPORTED_DATE_TIME_SEPARATORS: ClassVar[List[str]] = ["T", " ", "-", "_", "@", "/"]
 
@@ -1496,6 +1568,7 @@ class DateVariant(DimensionVariant, DimensionVariantResolver, DimensionVariantCr
     def params(self, val: Dict[str, Any]) -> None:
         self._params = val
         self._update_params(val)
+        self._validate_naive()
         if self._format:
             self._value = self._date.strftime(self._format)
             self._validate_format()
@@ -1522,10 +1595,61 @@ class DateVariant(DimensionVariant, DimensionVariantResolver, DimensionVariantCr
 
             # TODO check format and granularity dispcepancies!
             # e.g if self._format == "%H" and self._datetime_granularity != DatetimeGranularity.HOUR
+
+            self._update_min(params)
+            self._update_relative_min(params)
         else:
             self._datetime_granularity = DEFAULT_DATETIME_GRANULARITY
             self._timezone = None
             self._format = None
+            self._min = None
+            self._relative_min = None
+
+    def _update_min(self, params: Dict[str, Any]):
+        self._min = None
+        if self.MIN_DATETIME in params:
+            min_datetime = params[self.MIN_DATETIME]
+            if isinstance(min_datetime, date):
+                self._min = datetime(min_datetime.year, min_datetime.month, min_datetime.day)
+            elif isinstance(min_datetime, datetime):
+                self._min = min_datetime
+            else:
+                # use our own mechanism to infer from user provided value. create a DateVariant
+                # to get the datetime value
+                min_params = copy.deepcopy(params)
+                # eliminate any recursive min/relative_min action on min value
+                del min_params[self.MIN_DATETIME]
+                if self.RELATIVE_MIN_DATETIME in min_params:
+                    del min_params[self.RELATIVE_MIN_DATETIME]
+                if self.CAST_PARAMS_FIELD_ID in min_params:
+                    cast_params = min_params[self.CAST_PARAMS_FIELD_ID]
+                    if self.MIN_DATETIME in cast_params:
+                        del cast_params[self.MIN_DATETIME]
+                    if self.RELATIVE_MIN_DATETIME in min_params[self.CAST_PARAMS_FIELD_ID]:
+                        del cast_params[self.RELATIVE_MIN_DATETIME]
+                self._min = DimensionVariantFactory.create_variant(min_datetime, min_params).date
+        elif params.get(self.CAST_PARAMS_FIELD_ID, None):
+            cast_params = params[self.CAST_PARAMS_FIELD_ID]
+            min_datetime = cast_params.get(self.MIN_DATETIME, None)
+            if min_datetime:
+                min_params = dict(params)
+                del min_params[self.CAST_PARAMS_FIELD_ID]
+                min_params.update(cast_params)
+                del min_params[self.MIN_DATETIME]
+                if self.RELATIVE_MIN_DATETIME in min_params:
+                    del min_params[self.RELATIVE_MIN_DATETIME]
+                self._min = DimensionVariantFactory.create_variant(min_datetime, min_params).date
+
+    def _update_relative_min(self, params: Dict[str, Any]):
+        if self.RELATIVE_MIN_DATETIME in params:
+            self._relative_min = params[self.RELATIVE_MIN_DATETIME]
+        elif params.get(self.CAST_PARAMS_FIELD_ID, None):
+            self._relative_min = params[self.CAST_PARAMS_FIELD_ID].get(self.RELATIVE_MIN_DATETIME, None)
+        else:
+            self._relative_min = None
+
+        if self._relative_min is not None and not isinstance(self._relative_min, timedelta):
+            self._relative_min = self._delta(self._relative_min)
 
     @property
     def date(self) -> datetime:
@@ -1560,8 +1684,20 @@ class DateVariant(DimensionVariant, DimensionVariantResolver, DimensionVariantCr
         # tzlocal is OK! we just use the absolute datetime value as naive in that case.
         if self._date.tzinfo and isinstance(self._date.tzinfo, tzoffset):
             raise ValueError(
-                "DateVariant datetime object cannot contain timezone info!" " Please use the 'timezone' attribute of the dimension."
+                f"DateVariant datetime object {self.name!r} cannot contain timezone info!"
+                " Please use the 'timezone' attribute of the dimension."
             )
+
+        if self._min is not None and self._date < self._min:
+            raise ValueError(
+                f"DateVariant {self.name!r} cannot be created from {self._date!r} which is earlier than 'min' datetime {self._min!r}!"
+            )
+        if self._relative_min is not None:
+            shifted_now = datetime.utcnow() - self._relative_min
+            if self._date < shifted_now:
+                raise ValueError(
+                    f"DateVariant {self.name!r} cannot be created from {self._date!r} which is earlier than 'relative_min' datetime {shifted_now!r} (calculated as [UTC_NOW - {self._relative_min}])!"
+                )
 
     @property
     def timezone(self) -> datetime.tzinfo:
@@ -1608,6 +1744,24 @@ class DateVariant(DimensionVariant, DimensionVariantResolver, DimensionVariantCr
         except Exception:
             return False
 
+    def _delta(self, value: Any) -> Union[timedelta, relativedelta]:
+        delta: timedelta
+        if self._datetime_granularity == DatetimeGranularity.MINUTE:
+            delta = timedelta(minutes=value)
+        elif self._datetime_granularity == DatetimeGranularity.HOUR:
+            delta = timedelta(hours=value)
+        elif self._datetime_granularity == DatetimeGranularity.DAY:
+            delta = timedelta(days=value)
+        elif self._datetime_granularity == DatetimeGranularity.WEEK:
+            delta = timedelta(weeks=value)
+        elif self._datetime_granularity == DatetimeGranularity.MONTH:
+            delta = relativedelta(months=value)
+        elif self._datetime_granularity == DatetimeGranularity.YEAR:
+            delta = relativedelta(years=value)
+        else:
+            raise ValueError(f"Datetime granularity {self._datetime_granularity!r} defined on {self.name!r} is not supported!")
+        return delta
+
     def __add__(self, value: Any) -> "DimensionVariant":
         """Encapsulate the logic for incremental change / shifts on this variant.
 
@@ -1624,19 +1778,7 @@ class DateVariant(DimensionVariant, DimensionVariantResolver, DimensionVariantCr
         DimensionVariant (copy semantics)
 
         """
-        delta: timedelta
-        if self._datetime_granularity == DatetimeGranularity.MINUTE:
-            delta = timedelta(minutes=value)
-        elif self._datetime_granularity == DatetimeGranularity.HOUR:
-            delta = timedelta(hours=value)
-        elif self._datetime_granularity == DatetimeGranularity.DAY:
-            delta = timedelta(days=value)
-        elif self._datetime_granularity == DatetimeGranularity.WEEK:
-            delta = timedelta(weeks=value)
-        elif self._datetime_granularity == DatetimeGranularity.MONTH:
-            delta = relativedelta(months=value)
-        elif self._datetime_granularity == DatetimeGranularity.YEAR:
-            delta = relativedelta(years=value)
+        delta: timedelta = self._delta(value)
 
         new_variant: DimensionVariant = copy.deepcopy(self)
         new_variant.date = new_variant.date + delta
@@ -1693,11 +1835,10 @@ class DateVariant(DimensionVariant, DimensionVariantResolver, DimensionVariantCr
 
     @classmethod
     def create(cls, raw_value: Any, params_dict: ParamsDictType) -> DimensionVariant:
-        return (
-            DateVariant(raw_value)
-            if not params_dict
-            else DateVariant(raw_value, params_dict.get(Dimension.NAME_FIELD_ID, None), params_dict)
-        )
+        if not params_dict:
+            return DateVariant(raw_value)
+        else:
+            return DateVariant(raw_value, params_dict.get(Dimension.NAME_FIELD_ID, None), params_dict)
 
 
 # register this new variant to the factory
@@ -2283,7 +2424,7 @@ class DimensionFilter(DimensionSpec):
                 # beginning of a new dimension block (multiple variant seq)
                 sub_dim_specs: DimensionSpec = cls._get_spec_recursive(cast(DimensionFilter, value))
 
-                dim: Dimension = Dimension(item.name, item.type)
+                dim: Dimension = Dimension(item.name, item.type, item.params)
                 spec.add_dimension(dim, sub_dim_specs)
                 current_level_head_dim = dim
 
@@ -2475,7 +2616,10 @@ class DimensionFilter(DimensionSpec):
 
                     new_dim_var = DimensionVariantFactory.create_variant(value, params_dict)
                     if coalesce_relatives and isinstance(new_dim_var, RelativeVariant):
+                        if AnyVariant.ANY_DIMENSION_VALUE_SPECIAL_CHAR in dim_all_mapped_values:
+                            continue
                         new_dim_var = DimensionVariantFactory.create_variant(AnyVariant.ANY_DIMENSION_VALUE_SPECIAL_CHAR, params_dict)
+                        dim_all_mapped_values.add(AnyVariant.ANY_DIMENSION_VALUE_SPECIAL_CHAR)
 
                     if new_dim_var:
                         sub_filters = cls.materialize(sub_spec, dim_mappers, coalesce_relatives, allow_partial)
@@ -2508,6 +2652,16 @@ class DimensionFilter(DimensionSpec):
             return False
         return True
 
+    def transform(self) -> "DimensionFilter":
+        new_filter: DimensionFilter = DimensionFilter()
+
+        for dim, sub_spec in self.get_dimensions():
+            tip_dim = copy.deepcopy(dim.transform())
+            tip_sub_spec = cast(DimensionFilter, sub_spec).transform() if sub_spec else None
+            new_filter.add_dimension(tip_dim, tip_sub_spec)
+
+        return new_filter
+
     def tip(self) -> "DimensionFilter":
         new_filter: DimensionFilter = DimensionFilter()
 
@@ -2518,6 +2672,21 @@ class DimensionFilter(DimensionSpec):
             break
 
         return new_filter
+
+    def get_dimension_variants(self, dimension_name: str) -> List[DimensionVariant]:
+        if not self.find_dimension_by_name(dimension_name):
+            raise ValueError(f"Dimension {dimension_name!r} cannot be found!")
+        return self._get_dimension_variants(self, dimension_name)
+
+    @classmethod
+    def _get_dimension_variants(cls, filter: "DimensionFilter", dimension_name: str) -> List[DimensionVariant]:
+        variants: List[DimensionVariant] = []
+        if filter:
+            for dim, sub_filter in filter.get_dimensions():
+                if dim.name == dimension_name:
+                    variants.append(dim)
+                variants.extend(cls._get_dimension_variants(sub_filter, dimension_name))
+        return variants
 
 
 if __name__ == "__main__":

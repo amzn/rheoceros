@@ -4,9 +4,9 @@
 import threading
 import time
 from typing import Callable
+from unittest.mock import MagicMock
 
 import pytest
-from mock import MagicMock
 
 import intelliflow.api_ext as flow
 from intelliflow.api_ext import *
@@ -42,7 +42,11 @@ class TestAWSApplicationExecutionHooks(AWSTestBase):
             id = app.id
 
         ducsi_data = app.marshal_external_data(
-            GlueTable("booker", "d_unified_cust_shipment_items", partition_keys=["region_id", "ship_day"]),
+            GlueTable(
+                "booker",
+                "d_unified_cust_shipment_items",
+                partition_keys=["region_id", "ship_day"],
+            ),
             "DEXML_DUCSI",
             {"region_id": {"type": DimensionType.LONG, "ship_day": {"format": "%Y-%m-%d", "type": DimensionType.DATETIME}}},
             {"1": {"*": {"timezone": "PST"}}},
@@ -134,6 +138,7 @@ class TestAWSApplicationExecutionHooks(AWSTestBase):
         # 1- Inject DUCSI event to trigger execution on the first node/route and create a pending node on the second.
         # mock batch_compute response
         def compute(
+            route: Route,
             materialized_inputs: List[Signal],
             slot: Slot,
             materialized_output: Signal,
@@ -191,6 +196,7 @@ class TestAWSApplicationExecutionHooks(AWSTestBase):
         ship_options = app.get_data("ship_options", context=Application.QueryContext.DEV_CONTEXT)[0]
         # mock again
         def compute(
+            route: Route,
             materialized_inputs: List[Signal],
             slot: Slot,
             materialized_output: Signal,
@@ -224,6 +230,7 @@ class TestAWSApplicationExecutionHooks(AWSTestBase):
 
         # initiate another trigger on 'REPEAT_DUCSI' with a different partition (12-26)
         def compute(
+            route: Route,
             materialized_inputs: List[Signal],
             slot: Slot,
             materialized_output: Signal,
@@ -244,6 +251,7 @@ class TestAWSApplicationExecutionHooks(AWSTestBase):
         #   we will have to use related app API to force update RoutingTable status.
         # only active record remaining should be the most recent one (12-26):
         def compute(
+            route: Route,
             materialized_inputs: List[Signal],
             slot: Slot,
             materialized_output: Signal,
@@ -313,11 +321,24 @@ class TestAWSApplicationExecutionHooks(AWSTestBase):
     def test_all_application_hooks_with_EMAIL(self):
         email_obj = EMAIL(sender="if-test-list@amazon.com", recipient_list=["yunusko@amazon.com"])
 
-        self._test_all_application_hooks(lambda: GenericComputeDescriptorHookVerifier(email_obj.action()))
+        action = email_obj.action()
+        assert action.describe_slot()["sender"]
+        self._test_all_application_hooks(lambda: GenericComputeDescriptorHookVerifier(action))
 
     def test_all_application_hooks_with_slack(self):
-        slack_obj = Slack(recipient_list=["https://hooks.slack.com/workflows/1/"], message="test message")
-        self._test_all_application_hooks(lambda: GenericComputeDescriptorHookVerifier(slack_obj.action()))
+        secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:secret-name-abcd"
+        slack_obj = Slack(
+            recipient_list=["https://hooks.slack.com/workflows/1/", secret_arn],
+            message="test message",
+        )
+        slack_action = slack_obj.action()
+        assert slack_action.describe_slot()["message"]
+
+        def _create_url_from_aws_secret(recipient: str, **params):
+            return ("https://hooks.slack.com/workflows/2/",)
+
+        slack_action._create_url = _create_url_from_aws_secret
+        self._test_all_application_hooks(lambda: GenericComputeDescriptorHookVerifier(slack_action))
 
     def test_application_hooks_generate_right_permissions(self):
         """Test system provided compute targets' compatibility and runtime permission contribution as hooks"""
@@ -358,6 +379,31 @@ class TestAWSApplicationExecutionHooks(AWSTestBase):
 
         # Test permissions applied to runtime / exec role as well
 
+    def test_application_hooks_serialization_error(self):
+        """Map the underlying serialization error to a better exception (ValueError)"""
+        self.patch_aws_start(glue_catalog_has_all_tables=True)
+
+        self.app = AWSApplication(app_name="hook-ser-err", region=self.region)
+
+        class A:
+            def __call__(self, *args, **kwargs):
+                pass
+
+        class B:
+            pass
+
+        # will cause SerializatrionError
+        A.__name__ = "B"
+
+        with pytest.raises(ValueError):
+            self.app.create_data(
+                id="dummy_node_SIM_as_exec_hook",
+                compute_targets=[NOOPCompute],
+                execution_hook=RouteExecutionHook(on_exec_begin=A()),
+            )
+
+        self.patch_aws_stop()
+
     def test_application_retry_hook(self):
         from test.intelliflow.core.application.test_aws_application_execution_control import TestAWSApplicationExecutionControl
 
@@ -395,6 +441,7 @@ class TestAWSApplicationExecutionHooks(AWSTestBase):
         # 1- Inject DUCSI event to trigger execution on the nodes/routes
         # mock batch_compute response
         def compute(
+            route: Route,
             materialized_inputs: List[Signal],
             slot: Slot,
             materialized_output: Signal,

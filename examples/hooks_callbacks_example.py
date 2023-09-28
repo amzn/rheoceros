@@ -12,8 +12,6 @@ from intelliflow.utils.test.hook import GenericRoutingHookImpl, OnExecBeginHookI
 
 flow.init_basic_logging()
 
-from pyodinhttp import odin_material_retrieve
-
 def poll(app, materialized_node, expect_failure=False, duration=3600):
     node = None
     if isinstance(materialized_node, MarshalingView):
@@ -34,18 +32,11 @@ def poll(app, materialized_node, expect_failure=False, duration=3600):
         assert elapsed_time_in_secs < duration, f"Test failed due to timeout while polling on {node.bound!r}"
 
 
-odin_ms = "com.amazon.access.DEXMLAWSDevAccount-IntelliFlowAdmin-1"
-app = AWSApplication(app_name="hook-app-dev",
-                      region="us-east-1",
-                      access_id=odin_material_retrieve(odin_ms, 'Principal').decode('utf-8'),
-                      access_key=odin_material_retrieve(odin_ms, 'Credential').decode('utf-8'))
+app = AWSApplication("hook-app-dev", "us-east-1")
 
 if app.state != ApplicationState.INACTIVE:
     app.terminate()
-    app = AWSApplication(app_name="hook-app-dev",
-                         region="us-east-1",
-                         access_id=odin_material_retrieve(odin_ms, 'Principal').decode('utf-8'),
-                         access_key=odin_material_retrieve(odin_ms, 'Credential').decode('utf-8'))
+    app = AWSApplication("hook-app-dev", "us-east-1")
 
 ducsi_data = app.marshal_external_data(
     GlueTable("booker", "d_unified_cust_shipment_items", partition_keys=["region_id", "ship_day"])
@@ -76,8 +67,7 @@ on_exec_begin_hook = OnExecBeginHookImpl()
 on_exec_skipped_hook = GenericRoutingHookImpl()
 on_compute_success_hook = GenericRoutingHookImpl()
 on_success_hook = GenericRoutingHookImpl()
-exec_checkpoints = [RouteCheckpoint(checkpoint_in_secs=60, slot=GenericRoutingHookImpl()),
-                    RouteCheckpoint(checkpoint_in_secs=4 * 60, slot=GenericRoutingHookImpl())]
+exec_checkpoints = [RouteCheckpoint(checkpoint_in_secs=60, slot=GenericRoutingHookImpl())]
 
 repeat_ducsi = app.create_data(id="REPEAT_DUCSI",
                                inputs={
@@ -157,11 +147,6 @@ poll(app, failed_ducsi[1]['2020-12-25'], expect_failure=True)
 
 assert on_compute_success_hook.verify(app)
 assert on_success_hook.verify(app)
-elapsed = time.time() - start
-if elapsed < 4 * 60:
-   # not very likely but just make sure that executions did not take less than last checkpoint's mark.
-   time.sleep((4 * 60) - elapsed)
-   app.update_active_routes_status()
 assert all([c.slot.verify(app) for c in exec_checkpoints])
 assert on_compute_failure_hook.verify(app)
 assert on_failure_hook.verify(app)

@@ -2,12 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from datetime import datetime
+from unittest.mock import MagicMock
 
 import pytest
-from mock import MagicMock
 
 from intelliflow.api_ext import *
 from intelliflow.core.application.application import Application
+from intelliflow.core.platform.definitions.aws.cw.dashboard import CW_DASHBOARD_WIDTH_MAX, LegendPosition
 from intelliflow.core.platform.definitions.compute import (
     ComputeFailedSessionState,
     ComputeFailedSessionStateType,
@@ -148,6 +149,84 @@ class TestAWSApplicationAlarmingMetrics(AWSTestBase):
         dev_context = CoreData.from_json(json_str)
         app._dev_context = dev_context
         #
+
+        # CUSTOM DASHBOARDS
+        dashboard_id = "dashboard_with_defaults"
+
+        app.create_dashboard(dashboard_id)
+        with pytest.raises(ValueError):
+            # cannot create another dashboard with the same id
+            app.create_dashboard(dashboard_id)
+
+        with pytest.raises(ValueError):
+            app.create_text_widget("NON_EXISTENT_DASHBOARD_ID", markdown="test")
+
+        app.create_text_widget(
+            dashboard_id,
+            markdown="Custom dashboard (with default widget attributes) to present all of the alarming and metrics stuff from this example app. ",
+        )
+
+        with pytest.raises(ValueError):
+            app.create_metric_widget("NON_EXISTENT_DASHBOARD_ID", [external_lambda_metric])
+
+        app.create_metric_widget(
+            dashboard_id,
+            [
+                external_lambda_metric["Error"][MetricStatistic.SUM][MetricPeriod.MINUTES(5)],
+                external_lambda_error_metric_on_another_func,
+                routing_table_metric_signal["WriteThrottleEvents"][MetricStatistic.SUM][MetricPeriod.MINUTES(5)],
+            ],
+        )
+
+        with pytest.raises(ValueError):
+            # cannot use multiple alarms with this API (unlike metric signals)
+            app.create_metric_widget(dashboard_id, [system_failure_alarm, processor_alarm])
+
+        app.create_metric_widget(dashboard_id, [system_failure_alarm])
+        app.create_alarm_widget(dashboard_id, processor_alarm)
+
+        with pytest.raises(ValueError):
+            app.create_alarm_status_widget("NON_EXISTENT_DASHBOARD_ID", "test", [system_failure_alarm])
+
+        app.create_alarm_status_widget(
+            dashboard_id, "Status widget for all of the alarms together", [system_failure_alarm, processor_alarm]
+        )
+        # the dashboard will be auto-created during the activation
+
+        dashboard_id = "dashboard_with_params"
+        app.create_dashboard(
+            dashboard_id,
+            # pass CW params to underlying driver
+            start="-PT2W",
+            periodOverride="inherit",
+        )
+
+        app.create_text_widget(
+            dashboard_id,
+            markdown="Custom dashboard (with default widget attributes) to present all of the alarming and metrics stuff from this example app. ",
+            width=CW_DASHBOARD_WIDTH_MAX,
+            height=4,
+            # x=None,  # CW will fit automatically on the same row if possible (if left undefined or as None)
+            # y=None
+        )
+        app.create_metric_widget(
+            dashboard_id,
+            [routing_table_metric_signal["WriteThrottleEvents"][MetricStatistic.SUM][MetricPeriod.MINUTES(15)]],
+            legend_pos=LegendPosition.RIGHT,
+            width=8,
+            height=6,
+            x=None,
+            y=None,
+        )
+        app.create_alarm_status_widget(
+            dashboard_id,
+            "Status widget for all of the alarms together",
+            [processor_alarm, system_failure_alarm],
+            width=CW_DASHBOARD_WIDTH_MAX,
+            height=6,
+            x=20,
+            y=20,
+        )
 
         app.activate(allow_concurrent_executions=False)
 
@@ -292,6 +371,21 @@ class TestAWSApplicationAlarmingMetrics(AWSTestBase):
             "one_or_more_spark_executions_failed_2", alarm_type=AlarmType.COMPOSITE, context=Application.QueryContext.DEV_CONTEXT
         )
 
+        # CUSTOM DASHBOARD
+        dashboard_id = "my_dashboard"
+        app.create_dashboard(dashboard_id)
+        # show that no other signal than alarm or metrics can be used here
+        with pytest.raises(ValueError):
+            app.create_metric_widget(dashboard_id, [monitor_failure_reactor])
+
+        with pytest.raises(ValueError):
+            app.create_alarm_widget(dashboard_id, monitor_failure_reactor)
+
+        with pytest.raises(ValueError):
+            app.create_alarm_status_widget(dashboard_id, "title", [monitor_failure_reactor])
+
+        app.create_alarm_status_widget(dashboard_id, "all my alarms", [generic_internal_alarm, composite_alarm])
+
         app.activate(allow_concurrent_executions=False)
 
         assert app.get_alarm("one_or_more_spark_executions_failed_2")[0] == etl_error_alarm_with_all_metric_variants
@@ -312,10 +406,13 @@ class TestAWSApplicationAlarmingMetrics(AWSTestBase):
             internal_spark_error_metric3,
         }
 
-        assert internal_spark_error_metric2 is app.metric("my_custom_spark_error_metric", sub_dimensions={"marketplace_id": "1"})
+        assert (
+            internal_spark_error_metric2.signal()
+            == app.metric("my_custom_spark_error_metric", sub_dimensions={"marketplace_id": "1"}).signal()
+        )
         # use Application::__getitem__
-        assert internal_spark_error_metric2 is app["my_custom_spark_error_metric":{"marketplace_id": "1"}]
-        assert internal_spark_error_metric3 is app["my_custom_spark_error_metric":{"marketplace_id": "3"}]
+        assert internal_spark_error_metric2.signal() == app["my_custom_spark_error_metric":{"marketplace_id": "1"}].signal()
+        assert internal_spark_error_metric3.signal() == app["my_custom_spark_error_metric":{"marketplace_id": "3"}].signal()
 
         # none of the variants of "my_custom_spark_error_metric" have both of these sub-dimensions
         assert app.metric("my_custom_spark_error_metric", sub_dimensions={"marketplace_id": "1", "region": "EU"}) is None

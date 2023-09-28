@@ -6,7 +6,6 @@
 For finer granular control, more flexibility core API should be used.
 """
 import copy
-import importlib
 import json
 import logging
 import uuid
@@ -24,16 +23,24 @@ from intelliflow.core.platform.definitions.aws.s3.object_wrapper import list_obj
 from intelliflow.core.signal_processing.signal import Signal, SignalDimensionTuple
 from intelliflow.core.signal_processing.signal_source import (
     PRIMARY_KEYS_KEY,
+    DataType,
+    ModelSignalSourceFormat,
     DatasetSignalSourceAccessSpec,
     S3SignalSourceAccessSpec,
     SignalSourceType,
 )
-from intelliflow.core.signal_processing.slot import SlotCode, SlotCodeMetadata, SlotCodeType
+from intelliflow.core.signal_processing.slot import SlotCode, SlotCodeMetadata, SlotCodeType, SlotType
 
 from .api import *
 from .core.application.context.node.base import DataNode
 from .core.platform.constructs import RoutingTable
+from .core.platform.definitions.aws.sagemaker.client_wrapper import (
+    BUILTIN_ALGO_MODEL_ARTIFACT_RESOURCE_NAME,
+    SagemakerBuiltinAlgo,
+    convert_image_uri_to_arn,
+)
 from .core.platform.definitions.compute import ComputeExecutionDetails, ComputeSessionStateType
+from .core.platform.drivers.compute.aws_emr import InstanceConfig, RuntimeConfig
 from .core.signal_processing.definitions.dimension_defs import DEFAULT_DATETIME_GRANULARITY, DatetimeGranularity, Type
 from .core.signal_processing.definitions.metric_alarm_defs import AlarmType, MetricSubDimensionMap, MetricSubDimensionMapType
 from .core.signal_processing.dimension_constructs import (
@@ -45,7 +52,7 @@ from .core.signal_processing.dimension_constructs import (
     DimensionVariant,
     DimensionVariantMapFunc,
 )
-from .core.signal_processing.routing_runtime_constructs import Route, RouteID
+from .core.signal_processing.routing_runtime_constructs import Route, RouteID, RuntimeLinkNode
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +143,37 @@ class GlueBatchCompute(InternalDataNode.BatchComputeDescriptor):
 Glue = GlueBatchCompute
 
 
+class EmrBatchCompute(InternalDataNode.BatchComputeDescriptor):
+    def __init__(
+        self,
+        code: str,
+        extra_permissions: List[Permission] = None,
+        retry_count: int = 0,
+        **kwargs,
+    ) -> None:
+        """Does basic check on AWS EMR Parametrization
+
+        Defaults:
+        Workers -> 25 m5.xlarge
+        """
+
+        lang: Lang = Lang.PYTHON
+        abi: ABI = ABI.GLUE_EMBEDDED
+        if not kwargs:
+            kwargs = dict()
+
+        if "InstanceConfig" not in kwargs:
+            kwargs["InstanceConfig"] = InstanceConfig(25)
+
+        if "RuntimeConfig" not in kwargs:
+            kwargs["RuntimeConfig"] = RuntimeConfig.AUTO
+
+        super().__init__(code, lang, abi, extra_permissions, retry_count, **kwargs)
+
+
+EMR = EmrBatchCompute
+
+
 class Spark(InternalDataNode.BatchComputeDescriptor):
     def __init__(
         self,
@@ -164,7 +202,20 @@ class SparkSQL(InternalDataNode.BatchComputeDescriptor):
             kwargs["GlueVersion"] = GlueVersion.AUTO.value
 
         ## means "run in PySpark as inlined/embedded code"
-        super().__init__(f'output=spark.sql("""{code}""")', Lang.PYTHON, ABI.GLUE_EMBEDDED, extra_permissions, retry_count, **kwargs)
+        super().__init__(
+            f'''
+import re
+queries = [query.strip() for query in re.split(";\\s+|;$", """{code}""")]
+for query in queries:
+    if query:
+        output = spark.sql(query)
+                ''',
+            Lang.PYTHON,
+            ABI.GLUE_EMBEDDED,
+            extra_permissions,
+            retry_count,
+            **kwargs,
+        )
 
         ## TODO support this Lang + ABI pair in Spark based BatchCompute drivers (Glue, EMR).
         # we need this for two things:
@@ -179,10 +230,37 @@ class PrestoSQL(InternalDataNode.BatchComputeDescriptor):
         super().__init__(code, Lang.PRESTO_SQL, ABI.PARAMETRIZED_QUERY, extra_permissions, retry_count, **kwargs)
 
 
-class DataFrameFormat(str, Enum):
-    SPARK = "SPARK"
-    PANDAS = "PANDAS"
-    ORIGINAL = "ORIGINAL"
+class SagemakerTrainingJob(InternalDataNode.BatchComputeDescriptor):
+    def __init__(
+        self,
+        extra_permissions: List[Permission] = None,
+        retry_count: int = 0,
+        **kwargs,
+    ) -> None:
+        if not kwargs:
+            raise ValueError(
+                "AWS Sagemaker training job parameters cannot be empty! " "Please provide them as keyword args to this compute descriptor."
+            )
+
+        # TODO do validations on kwargs based on
+        #   https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/sagemaker.html#SageMaker.Client.create_training_job
+
+        super().__init__("", Lang.AWS_SAGEMAKER_TRAINING_JOB, ABI.NONE, extra_permissions, retry_count, **kwargs)
+
+
+class SagemakerTransformJob(InternalDataNode.BatchComputeDescriptor):
+    def __init__(
+        self,
+        extra_permissions: List[Permission] = None,
+        retry_count: int = 0,
+        **kwargs,
+    ) -> None:
+        if not kwargs:
+            raise ValueError(
+                "AWS Sagemaker transform job parameters cannot be empty! " "Please provide them as keyword args to this compute descriptor."
+            )
+
+        super().__init__("", Lang.AWS_SAGEMAKER_TRANSFORM_JOB, ABI.NONE, extra_permissions, retry_count, **kwargs)
 
 
 class ApplicationExt(Application):
@@ -367,348 +445,8 @@ class ApplicationExt(Application):
             f"QueryContext.ALL."
         )
 
-    def get_routing_table(self) -> Iterable[Route]:
-        return self.platform.routing_table.get_all_routes()
-
-    def get_inactive_compute_records(
-        self, route: Union[str, MarshalerNode, Route], ascending: bool = True
-    ) -> Iterator[RoutingTable.ComputeRecord]:
-        route_id: RouteID = self._get_route_id(route)
-
-        return self.platform.routing_table.load_inactive_compute_records(route_id, ascending)
-
-    def get_active_compute_records(self, route: Union[str, MarshalerNode, Route]) -> Iterator[RoutingTable.ComputeRecord]:
-        route_record: RoutingTable.RouteRecord = self.get_active_route(route)
-        return [compute_record for compute_record in route_record.active_compute_records]
-
-    def preview_data(self, output: Union[MarshalingView, MarshalerNode], limit: int = None, columns: int = None) -> (Any, DataFrameFormat):
-        """Dumps the records into the console and logs and returns the data for 'limit' number of records
-
-        Strategy for the load operation is: Pandas -> Spark -> Original (collection object created for CSV, Parquet, ..)
-        """
-        # iterate=False here means that we want to whole as one single object to avoid extra iteration here.
-        data = None
-        format = None
-        if importlib.util.find_spec("pandas") is not None:
-            data, format = next(self.load_data(output, limit, DataFrameFormat.PANDAS, iterate=False)), DataFrameFormat.PANDAS
-            import pandas as pd
-
-            with pd.option_context("max_rows", limit, "max_columns", columns):
-                try:
-                    # jupyter support
-                    display(data)
-                except:
-                    print(data)
-        elif importlib.util.find_spec("pyspark") is not None:
-            data, format = next(self.load_data(output, limit, DataFrameFormat.SPARK, iterate=False)), DataFrameFormat.SPARK
-            if limit is not None:
-                data.show(n=limit)
-            else:
-                data.show()
-        else:
-            data, format = next(self.load_data(output, limit, DataFrameFormat.ORIGINAL, iterate=False)), DataFrameFormat.ORIGINAL
-            logger.critical(f"In format: {format.value!r}")
-            logger.critical("--------------------------------------")
-            for line in data:
-                print(line)
-
-        return data, format
-
-    def load_data(
-        self,
-        output: Union[MarshalingView, MarshalerNode],
-        limit: int = None,
-        format: Union[DataFrameFormat, str] = None,
-        spark: "SparkSession" = None,
-        iterate: bool = False,
-    ) -> Iterator[Any]:
-        """Preview the output in the format (Pandas/Spark dataframe or as the original data format) for a certain number
-         of records and also return the previewed data back to the user.
-
-        :param output: Materialized view of an internal data node (it can also be upstream).
-        :param limit: limit the number of records to be loaded. API loads all data if not specified.
-        :param format: determine whether the returned frame should be in Pandas, Spark or in the native format
-        (CSV, Parquet, etc in bytes).
-        :param iterate: boolean parameter that controls how the different parts of the underlying data will be read,
-        hence the return type. if it is enabled, then the return type is an iterator of data type determined by 'format'
-         parameter.
-        :return: Depending on the 'format' and 'iterate' parameters, returns an iterator for the parts or for the merged
-         version of Spark dataframes or Pandas dataframes or the original data for the target output partition (e.g CSV)
-        """
-        node: MarshalerNode = None
-        if isinstance(output, MarshalingView):
-            node = output.marshaler_node
-        elif isinstance(output, MarshalerNode):
-            node = output
-        else:
-            logging.error(f"Please provide a data node (if it is dimensionless) or filtered material version of it.")
-            raise ValueError(f"Wrong input type {type(output)} for Application::load_data(Union[MarshalingView, MarshalerNode]).")
-
-        if limit is not None and (not isinstance(limit, int) or limit <= 0):
-            raise ValueError(f"Please provide a positive value of type 'int' as 'limit' parameter to Application::load_data API")
-
-        if format:
-            format = DataFrameFormat(format.upper())
-
-        materialized_output: Signal = self._get_input_signal(output)
-        # TODO support node declarations with RelativeVariants which would have multipled branches in their filter spec
-        #  in that case this param should be 'materialized_paths' and Application::poll will support
-        #  full range check and return multiple paths.
-        materialized_path: str = None
-        data_it: Iterator[Tuple[str, bytes]] = None
-        if isinstance(node.bound, InternalDataNode):
-            internal_data_node = cast(InternalDataNode, node.bound)
-            # at this point, we might have either an internal or upstream internal dataset here
-
-            dimension_values = json.dumps(materialized_output.domain_spec.dimension_filter_spec.pretty(), indent=10)
-            logger.critical(f"Checking the existence of output for {internal_data_node.data_id!r} on dimension values: {dimension_values}")
-            materialized_path, record = self.poll(output)
-            if not materialized_path:
-                error_str = f"Input {internal_data_node.data_id!r} does not have the output for the dimension values: {dimension_values}"
-                logger.critical(error_str)
-                yield None
-
-            platform = self._get_platform_for(internal_data_node.signal())
-
-            data_it = platform.storage.load_internal(materialized_output)
-
-        elif isinstance(node.bound, ExternalDataNode):
-            # we do this extra check here because materialize API normally allows rendering with special chars too.
-            # we currently don't allow batch load of partitions using '*', relative variants.
-            if not materialized_output.domain_spec.dimension_filter_spec.is_material():
-                logging.error(f"Input data node {node.bound.data_id!r} to Application::load_data does not have" f" a materialized view!")
-                logging.error(f"Required dimensions and current values: {node.dimensions()}")
-                logging.error("Please use concrete dimension values for the input.")
-                raise ValueError(f"Can load materialized data nodes or views only!")
-            materialized_path = self.materialize(output)[0]
-            data_it = self._load_external_data(cast(ExternalDataNode, node.bound), output, materialized_output, materialized_path, limit)
-        else:
-            error_str = f"Node type {type(node.bound)} is not supported for Application::load_data API!"
-            logger.error(error_str)
-            raise ValueError(error_str)
-
-        logging.critical(f"Loading {limit if limit is not None and limit > 0 else 'all'} records from {materialized_path!r} ...")
-        dataset_access_spec = cast(DatasetSignalSourceAccessSpec, materialized_output.resource_access_spec)
-        data_format: str = dataset_access_spec.data_format.value
-        data_delimiter: str = dataset_access_spec.data_delimiter
-        data_encoding: str = dataset_access_spec.data_encoding
-        data_header_exists: bool = dataset_access_spec.data_header_exists
-        data_compression: Optional[str] = dataset_access_spec.data_compression
-        if format == DataFrameFormat.PANDAS:
-            # Pandas
-            import pandas as pd
-            from io import BytesIO, StringIO
-
-            pandas_df_list = []
-            retrieved_so_far = 0
-            for physical_path, data in data_it:
-                if not data:
-                    continue
-                if data_format.lower() == DatasetSignalSourceFormat.CSV.value.lower():
-                    # see https://pandas.pydata.org/pandas-docs/stable/reference/api/pandas.read_csv.html
-                    # if cannot resolve delimiter, use "engine='python'" which will use csv.Sniffer
-                    df = pd.read_csv(
-                        StringIO(str(data, data_encoding)),
-                        nrows=limit - retrieved_so_far,
-                        sep=data_delimiter,
-                        engine="python" if not data_delimiter else None,
-                    )
-                    # df = pd.read_csv(BytesIO(data), sep=data_delimiter)
-                elif data_format.lower() == DatasetSignalSourceFormat.PARQUET.value.lower():
-                    try:
-                        df = pd.read_parquet(BytesIO(data))
-                    except ValueError:  # _SUCCESS file, Schema file, etc
-                        continue
-                elif data_format.lower() == DatasetSignalSourceFormat.JSON.value.lower():
-                    # TODO skip completition protocol and schema files
-                    df = pd.read_json(StringIO(str(data, data_encoding)))
-                else:
-                    raise NotImplementedError(f"Loading {data_format!r} with Pandas not supported yet!")
-                retrieved_so_far = retrieved_so_far + len(df.index)
-                stop = False
-                if limit is not None and retrieved_so_far >= limit:
-                    stop = True
-                    if retrieved_so_far > limit:
-                        # drop from end
-                        df = df[: limit - retrieved_so_far]
-                        retrieved_so_far = limit
-
-                if iterate:
-                    logger.critical(f"Returning part {physical_path!r} in Pandas Dataframe...")
-                    logger.critical(f"retrieved so far: {retrieved_so_far}/{limit if limit is not None else 'ALL'}")
-                    logger.critical("---------------------------------")
-                    yield df
-                else:
-                    pandas_df_list.append(df)
-
-                if stop:
-                    break
-
-            if not iterate:
-                # see https://pandas.pydata.org/pandas-docs/stable/reference/api/pandas.concat.html
-                merged_df = pd.concat(pandas_df_list, ignore_index=True) if len(pandas_df_list) > 1 else pandas_df_list[0]
-                logger.critical(f"Retrieved {len(merged_df.index)} records:")
-                logger.critical("--------------------------------------")
-                yield merged_df
-        elif format == DataFrameFormat.SPARK:
-            if not spark:
-                from pyspark.sql import SparkSession
-                from pyspark.conf import SparkConf
-
-                try:
-                    # try to use the current config (it might or might not be in local mode already)
-                    conf = SparkConf()
-                    conf.setAppName(self.uuid)
-                    spark = SparkSession.builder.appName(self.uuid).config(conf=SparkConf()).enableHiveSupport().getOrCreate()
-                except:
-                    # fall-back to local mode (with as many cores as possible)
-                    spark = SparkSession.builder.appName(self.uuid).master("local[*]").enableHiveSupport().getOrCreate()
-
-            merged_df = None
-            try:
-                # TODO might fail if root-level (driver owned credentials) does not have dev-role permissions.
-                #  it might still work if its admin (and also) from the same account (majority of the cases).
-                #  - pending on setting up Spark port on Sagemaker.
-                # TODO read the delimiter from the spec (see TODO in BasicBatchDataInputMap::dumps)
-                merged_df = spark.read.load(
-                    materialized_path,
-                    format=data_format,
-                    sep=data_delimiter,
-                    inferSchema="true",
-                    header="true" if data_header_exists else "false",
-                )
-                if limit is not None:
-                    merged_df = merged_df.limit(limit)
-            except:
-                pass
-
-            if merged_df is not None:
-                yield merged_df
-            else:
-                retrieved_so_far = 0
-                for physical_path, data in data_it:
-                    if not data:
-                        continue
-                    spark.sparkContextc.parallelize(data.decode(data_encoding).splitlines())
-                    if (
-                        data_format.lower() == DatasetSignalSourceFormat.CSV.value.lower()
-                        or data_format.lower() == DatasetSignalSourceFormat.PARQUET.value.lower()
-                    ):
-                        df = spark.read.load(
-                            data, format=data_format.lower(), inferSchema="true", header="true" if data_header_exists else "false"
-                        )
-                        """ 
-                        spark.read \
-                            .option("header", "true") \
-                            .option("mode", "FAILFAST") \
-                            #.option("mode", "DROPMALFORMED")
-                            .option("delimiter", "|") \
-                            .option("inferSchema", "true")\
-                            .schema(schema) \
-                            .csv(csvData)
-                       """
-                    else:
-                        raise NotImplementedError(f"Loading {data_format!r} with Spark not supported yet!")
-
-                    df_count = df.count()
-                    retrieved_so_far = retrieved_so_far + df_count
-                    stop = False
-                    if limit is not None and retrieved_so_far >= limit:
-                        stop = True
-                        if retrieved_so_far > limit:
-                            # drop from end
-                            df = df.limit(df_count - (retrieved_so_far - limit))
-                            retrieved_so_far = limit
-
-                    if iterate:
-                        logger.critical(f"Returning part {physical_path!r} in Spark Dataframe...")
-                        logger.critical(f"retrieved so far: {retrieved_so_far}/{limit if limit is not None else 'ALL'}")
-                        logger.critical("---------------------------------")
-                        yield df
-                    else:
-                        merged_df = merged_df.unionAll(df) if merged_df else df
-
-                    if stop:
-                        break
-
-                if not iterate:
-                    logger.critical(f"Retrieved and merged {retrieved_so_far} records from all of the partitions.")
-                    logger.critical("--------------------------------------")
-                    yield merged_df
-
-        elif data_format.lower() == DatasetSignalSourceFormat.CSV.value.lower():
-            # TODO make sure RheocerOS BatchCompute enforces utf-8
-            #  or 'encoding' should be added to data access spec declaration.
-            import csv
-
-            all_data = []
-            retrieved_so_far = 0
-            if limit is not None:
-                limit = limit if not data_header_exists else limit + 1
-            for physical_path, data in data_it:
-                if not data:
-                    continue
-                csv_data = list(csv.reader(data.decode(data_encoding).splitlines()))
-                retrieved_so_far = retrieved_so_far + len(csv_data)
-                stop = False
-                if limit is not None and retrieved_so_far >= limit:
-                    stop = True
-                    if retrieved_so_far > limit:
-                        csv_data = csv_data[: limit - retrieved_so_far]
-                        retrieved_so_far = limit
-
-                if iterate:
-                    logger.critical(f"Returning CSV part {physical_path!r} as a list of tuples of {len(csv_data[0])} elements ...")
-                    logger.critical(f"retrieved so far: {retrieved_so_far}/{limit if limit is not None else 'ALL'}")
-                    logger.critical("---------------------------------")
-                    for line in csv_data:
-                        logger.critical(line)
-                    yield csv_data
-                else:
-                    # check header
-                    if data_header_exists and len(all_data) > 0 and all_data[0] == csv_data[0]:
-                        # skip
-                        all_data.extend(csv_data[1:])
-                    else:
-                        all_data.extend(csv_data)
-
-                if stop:
-                    break
-
-            if not iterate:
-                logger.critical(f"Retrieved {len(all_data)} records:")
-                yield all_data
-        else:
-            logger.critical(f"Transformation for data format {data_format!r} is not supported.")
-            logger.critical(f"Defaulting to limitless iteration over raw partition data.")
-            yield from data_it
-
-    def _load_external_data(
-        self,
-        external_data_node: ExternalDataNode,
-        output: Union[MarshalingView, MarshalerNode],
-        materialized_output: Signal,
-        materialized_path: str,
-        limit: int = None,
-    ) -> Iterator[Tuple[str, bytes]]:
-        """Load external data in an Application and Platform impl specific way.
-
-        Return type is same as 'Storage::load_internal' which is used for the load operation of internal data.
-        """
-        raise NotImplementedError(f"Application::_load_external_data is not provided by this Application impl {type(self)}")
-
 
 class AWSApplication(ApplicationExt):
-    @overload
-    def __init__(self, app_name: str, platform: HostPlatform = None, **kwargs) -> None:
-        ...
-
-    @overload
-    def __init__(
-        self, app_name: str, region: str = None, dev_role_account_id: str = None, access_id: str = None, access_key: str = None, **kwargs
-    ) -> None:
-        ...
-
     def __init__(
         self,
         app_name: str,
@@ -716,22 +454,35 @@ class AWSApplication(ApplicationExt):
         dev_role_account_id: str = None,
         access_id: str = None,
         access_key: str = None,
+        enforce_runtime_compatibility: bool = True,
         **kwargs,
     ) -> None:
+        from intelliflow.core.deployment import is_on_remote_dev_env
+
+        # limiting application name length to fail quickly and to avoid creation of dev role and storage account.
+        # this is a temporary fix and should eventually be handled in the respective cloud services drivers
+        assert len(app_name) <= 16, "App name should be of length 16 or less"
+
         conf_builder = AWSConfiguration.builder()
 
         if isinstance(region_or_platform, str) or "region" in kwargs:
             region = region_or_platform if isinstance(region_or_platform, str) else kwargs["region"]
-            if dev_role_account_id:
+            if dev_role_account_id and not is_on_remote_dev_env():
                 conf_builder = conf_builder.with_dev_role_credentials(dev_role_account_id)
             elif access_id is not None and access_key is not None:
                 conf_builder = conf_builder.with_admin_access_pair(access_id, access_key)
             else:
                 conf_builder = conf_builder.with_default_credentials(as_admin=True)
-            super().__init__(app_name, HostPlatform(conf_builder.with_region(region).build()))
+
+            for k, v in kwargs.items():
+                conf_builder.with_param(k, v)
+
+            super().__init__(app_name, HostPlatform(conf_builder.with_region(region).build()), enforce_runtime_compatibility)
         elif isinstance(region_or_platform, HostPlatform):
             platform = region_or_platform
-            super().__init__(app_name, platform)
+            for k, v in kwargs.items():
+                platform.conf.add_param(k, v)
+            super().__init__(app_name, platform, enforce_runtime_compatibility)
         else:
             raise ValueError(f"Please provide HostPlatform object or 'region' parameter for AWSApplication!")
 
@@ -1018,6 +769,9 @@ class AWSApplication(ApplicationExt):
                             else:
                                 # if not material, then try to link the dimension from any of the independent signals
                                 link = None
+                                # TODO once the graph analyzer is added, use it retrieve to even from dependent signals
+                                #  just make sure that directly or transitively the link leads to a source dimension from
+                                #  a independent signal
                                 for other_indep_input in independent_signals:
                                     other_dim = other_indep_input.domain_spec.dimension_spec.find_dimension_by_name(dim_name)
                                     if other_dim:
@@ -1025,7 +779,7 @@ class AWSApplication(ApplicationExt):
                                         break
                                 if link is None:
                                     raise ValueError(
-                                        f"Cannot link unmaterialized dimension {dim_name} from dependent "
+                                        f"Cannot link unmaterialized dimension {dim_name!r} from dependent "
                                         f"input {first_signal.alias!r} to output {id!r}"
                                     )
                                 output_dim_links.append(link)
@@ -1138,7 +892,12 @@ class AWSApplication(ApplicationExt):
                 # within 'load_data')
                 data_it = self.platform.storage.load_internal(temp_data.signal())
                 for data in data_it:
-                    yield data
+                    path, _ = data
+                    schema_file = temp_data.signal().resource_access_spec.data_schema_file
+                    if not schema_file or not path.lower().endswith(schema_file.lower()):
+                        success_file = temp_data.signal().get_required_resource_name().lower()
+                        if not success_file or not path.lower().endswith(success_file):
+                            yield data
             finally:
                 # restore previous active state
                 # TODO support Application::delete_data (with dependency check)
@@ -1170,9 +929,138 @@ class AWSApplication(ApplicationExt):
                 # pop the dev-state now and restore the application state
                 self.load_dev_state()
 
+    def train_xgboost(
+        self,
+        id: str,
+        training_data: Union[FilteredView, MarshalerNode],
+        validation_data: Union[FilteredView, MarshalerNode],
+        extra_inputs: Union[List[Union[FilteredView, MarshalerNode]], Dict[str, Union[FilteredView, MarshalerNode]]] = None,
+        input_dim_links: Optional[Sequence[Tuple[SignalDimensionTuple, DimensionVariantMapFunc, SignalDimensionTuple]]] = None,
+        output_dimension_spec: Optional[Union[Dict[str, Any], DimensionSpec]] = None,
+        output_dim_links: Optional[
+            Sequence[
+                Tuple[
+                    Union[OutputDimensionNameType, SignalDimensionTuple],
+                    DimensionVariantMapFunc,
+                    Union[OutputDimensionNameType, Tuple[OutputDimensionNameType, ...], SignalDimensionTuple],
+                ]
+            ]
+        ] = None,
+        training_job_params: Dict[str, Any] = None,
+        extra_compute_targets: Optional[Union[Sequence[ComputeDescriptor], str]] = None,
+        execution_hook: RouteExecutionHook = None,
+        pending_node_hook: RoutePendingNodeHook = None,
+        pending_node_expiration_ttl_in_secs: int = None,
+        retry_count=0,
+        **kwargs,
+    ) -> MarshalerNode:
+        """Convenience method to facilitate training using AWS Sagemaker builtin 'xgboost' algorithm"""
+        if extra_compute_targets and any(
+            [compute_target.create_slot(None).type.is_batch_compute() for compute_target in extra_compute_targets]
+        ):
+            raise ValueError(f"training node {id!r} cannot have a BatchCompute target in 'extra_compute_targets' param!")
+        else:
+            extra_compute_targets = []
 
-def aws_app(app_name: str, region: str, use_dev_role: bool = False) -> Application:
-    return AWSApplication(app_name, region, use_dev_role)
+        compute_params = dict(training_job_params) if training_job_params else dict()
+        if "AlgorithmSpecification" not in compute_params:
+            compute_params["AlgorithmSpecification"] = {}
+        if "TrainingImage" not in compute_params["AlgorithmSpecification"]:
+            compute_params["AlgorithmSpecification"].update({"AlgorithmName": SagemakerBuiltinAlgo.XGBOOST.value})
+
+        inputs = {"train": training_data, "validation": validation_data}
+        if extra_inputs:
+            if isinstance(extra_inputs, Dict):
+                input_signals = [self._get_input_signal(filtered_view, alias) for alias, filtered_view in extra_inputs.items()]
+            else:
+                input_signals = [self._get_input_signal(filtered_view) for filtered_view in extra_inputs]
+
+            extra_signals = self._check_upstream(input_signals)
+
+            for extra_input in extra_signals:
+                inputs.update({extra_input.alias: extra_input})
+
+        return self.create_data(
+            id=id,
+            inputs=inputs,
+            input_dim_links=input_dim_links,
+            output_dimension_spec=output_dimension_spec,
+            output_dim_links=output_dim_links,
+            compute_targets=[SagemakerTrainingJob(retry_count=retry_count, **compute_params)] + extra_compute_targets,
+            execution_hook=execution_hook,
+            pending_node_hook=pending_node_hook,
+            pending_node_expiration_ttl_in_secs=pending_node_expiration_ttl_in_secs,
+            # Sagemaker adds a folder before the model output file using the training job name
+            # e.g s3://.../internal_data/data/{dim1}/.../{dimN}/IntelliFlow-TrainingJob-{UUID/output/model.tar.gz
+            #   IntelliFlow-TrainingJob-{UUID/output/ is added as a prefix by SM
+            protocol=SignalIntegrityProtocol(
+                "FILE_CHECK",
+                {
+                    "file": "*"
+                    + S3SignalSourceAccessSpec.path_delimiter()
+                    + "*"
+                    + S3SignalSourceAccessSpec.path_delimiter()
+                    + BUILTIN_ALGO_MODEL_ARTIFACT_RESOURCE_NAME
+                },
+            ),
+            **kwargs,
+        )
+
+    def marshal_external_sagemaker_model(
+        self,
+        id: str,
+        training_image_uri: str,
+        **kwargs,
+    ) -> MarshalerNode:
+        """
+        Import a custom model created by the user. We can say that model concept here maps to Sagemaker <Model> entity.
+
+        Please refer
+          https://docs.aws.amazon.com/sagemaker/latest/APIReference/API_CreateModel.html
+          https://docs.aws.amazon.com/sagemaker/latest/dg/realtime-endpoints-deployment.html#realtime-endpoints-deployment-create-model
+
+        Also the `training_image_uri` argument here maps to `Image` parameter in that API.
+        """
+        return self.marshal_external_model(
+            id,
+            model_metadata={
+                "AlgorithmSpecification": {"TrainingImage": training_image_uri},
+            },
+            model_format=ModelSignalSourceFormat.SAGEMAKER_TRAINING_JOB,
+            permissions=[
+                Permission(
+                    [convert_image_uri_to_arn(training_image_uri)],
+                    [
+                        "ecr:Describe*",
+                        "ecr:BatchCheckLayerAvailability",
+                        "ecr:GetDownloadUrlForLayer",
+                        "ecr:BatchGetImage",
+                        "ecr:GetAuthorizationToken",
+                    ],
+                )
+            ],
+            **kwargs,
+        )
+
+    def marshal_external_model(
+        self,
+        id: str,
+        model_metadata: Dict[str, Any],
+        model_format: ModelSignalSourceFormat,
+        permissions: Optional[List[Permission]] = None,
+        **kwargs,
+    ) -> MarshalerNode:
+        noop_compute_with_perms = InlinedCompute(lambda input_map, output, params: ..., permissions=permissions)
+        return self.create_data(
+            id,
+            compute_targets=[noop_compute_with_perms],
+            model_metadata=model_metadata,
+            data_type=DataType.MODEL_ARTIFACT,
+            model_format=model_format,
+            schema=None,
+            header=False,
+            **kwargs,
+        )
 
 
 # Other Convenience Methods
@@ -1195,7 +1083,7 @@ class EscapeExistingJobParams(dict):
         return "{" + key + "}"
 
 
-def python_module(module_path: str, **kwargs) -> str:
+def python_module(module_path: str, external_library_paths: Optional[List[str]] = None, **kwargs) -> str:
     import inspect
     import importlib
 
@@ -1208,7 +1096,12 @@ def python_module(module_path: str, **kwargs) -> str:
     module_src = inspect.getsource(mod)
 
     params = {key: repr(value) for key, value in kwargs.items()}
-    return module_src if not params else module_src.format_map(EscapeExistingJobParams(params))
+    code = module_src if not params else module_src.format_map(EscapeExistingJobParams(params))
+
+    if external_library_paths:
+        code = SlotCode(code, SlotCodeMetadata(SlotCodeType.EMBEDDED_SCRIPT, external_library_paths=external_library_paths))
+
+    return code
 
 
 # provide convenience methods for users to capture two possible cases for Scala code.
@@ -1227,3 +1120,28 @@ def scala_script(
     convention and which boilerplate to be used at runtime.
     """
     return SlotCode(code, SlotCodeMetadata(SlotCodeType.EMBEDDED_SCRIPT, entity, method, external_library_paths))
+
+
+def sql_module(module_root: str, file_name: str) -> str:
+    import inspect
+    import importlib
+    from importlib.resources import contents
+    from importlib.resources import path
+
+    code_spec = importlib.util.find_spec(module_root)
+
+    if not code_spec:
+        raise ValueError(f"{module_root!r} cannot be resolved to be a valid Python module path.")
+
+    root_mod = importlib.util.module_from_spec(code_spec)
+
+    if not inspect.ismodule(root_mod):
+        raise ValueError(f"{module_root} is not a valid Python module!")
+
+    for resource in contents(root_mod):
+        with path(root_mod, resource) as resource_path:
+            if resource == file_name:
+                data = resource_path.read_text()
+                return data
+
+    raise ValueError(f"File({file_name}) not found in {module_root}!")

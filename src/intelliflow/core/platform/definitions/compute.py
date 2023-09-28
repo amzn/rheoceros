@@ -34,8 +34,10 @@ class ComputeSuccessfulResponseType(str, Enum):
 class ComputeFailedResponseType(str, Enum):
     BAD_SLOT = "BAD_SLOT"  # permanent, don't try with the same workload
     TRANSIENT = "TRANSIENT"
+    TRANSIENT_FORCE_STOPPED = "TRANSIENT_FORCE_STOPPED"
     TIMEOUT = "TIMEOUT"  # cannot decide BAD or TRANSIENT, but workload took too much time
     STOPPED = "STOPPED"  # RheocerOS assumes that a stopped execution is a failed one
+    FORCE_STOPPED = "FORCE_STOPPED"
     APP_INTERNAL = "APP_INTERNAL"  # app session/workload logic failed internally
     COMPUTE_INTERNAL = "COMPUTE_INTERNAL"  # compute impl failed internally (no comm/transient issues but smthg else)
     NOT_FOUND = "NOT_FOUND"  # orchestration and compute backend state inconsistency
@@ -138,6 +140,12 @@ class ComputeFailedResponse(ComputeResponse):
     def failed_response_type(self, val: ComputeFailedResponseType) -> None:
         self._failed_response_type = val
 
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}(failed_response_type={self.failed_response_type}, resource_desc={self._resource_desc}, "
+            f"error_code={self._error_code}, error_msg={self._error_msg})"
+        )
+
 
 # generic compute session/job status types
 @unique
@@ -227,6 +235,10 @@ class ComputeFailedSessionState(ComputeSessionState):
     def failed_type(self) -> ComputeFailedSessionStateType:
         return self._failed_type
 
+    @failed_type.setter
+    def failed_type(self, failed_type: ComputeFailedSessionStateType) -> None:
+        self._failed_type = failed_type
+
     def __repr__(self) -> str:
         return (
             f"{self.__class__.__name__}(session_desc={self.session_desc!r},"
@@ -267,25 +279,30 @@ class BasicBatchDataInputMap(CoreData):
                         "resource_type": signal.resource_access_spec.source.value,
                         "path_format": signal.resource_access_spec.path_format,
                         "data_format": signal.resource_access_spec.data_format.value,
-                        "data_type": signal.resource_access_spec.dataset_type.value,
+                        "data_type": (signal.resource_access_spec.data_type.value if signal.resource_access_spec.data_type else None),
+                        "dataset_type": (
+                            signal.resource_access_spec.dataset_type.value if signal.resource_access_spec.dataset_type else None
+                        ),
                         "data_compression": signal.resource_access_spec.data_compression,
                         "encryption_key": signal.resource_access_spec.encryption_key,
                         "data_header_exists": signal.resource_access_spec.data_header_exists,
                         "data_schema_file": signal.resource_access_spec.data_schema_file,
-                        "data_schema_type": signal.resource_access_spec.data_schema_type.value
-                        if signal.resource_access_spec.data_schema_type
-                        else None,
+                        "data_schema_type": (
+                            signal.resource_access_spec.data_schema_type.value if signal.resource_access_spec.data_schema_type else None
+                        ),
                         "partition_keys": signal.resource_access_spec.partition_keys,
                         "partitions": signal.resource_access_spec.get_partitions(signal.domain_spec.dimension_filter_spec),
                         "primary_keys": signal.resource_access_spec.primary_keys,
                         "delimiter": signal.resource_access_spec.data_delimiter,
                         "attrs": signal.resource_access_spec.__dict__,
-                        "proxy": {
-                            "resource_type": signal.resource_access_spec.proxy.source.value,
-                            "attrs": signal.resource_access_spec.proxy.__dict__,
-                        }
-                        if signal.resource_access_spec.proxy
-                        else None,
+                        "proxy": (
+                            {
+                                "resource_type": signal.resource_access_spec.proxy.source.value,
+                                "attrs": signal.resource_access_spec.proxy.__dict__,
+                            }
+                            if signal.resource_access_spec.proxy
+                            else None
+                        ),
                         "if_signal_type": signal.type.value,
                         "serialized_signal": signal.serialize(),
                         "range_check_required": signal.range_check_required,
@@ -307,6 +324,15 @@ class BasicBatchDataInputMap(CoreData):
                     for signal in self.input_signals
                     if signal.type == SignalType.TIMER_EVENT
                 ],
+                "other_signals": [
+                    {
+                        "alias": signal.alias,
+                        "resource_type": signal.resource_access_spec.source.value,
+                        "serialized_signal": signal.serialize(),
+                    }
+                    for signal in self.input_signals
+                    if not signal.type.is_data() and signal.type != SignalType.TIMER_EVENT
+                ],
             },
             default=repr,
         )
@@ -314,7 +340,7 @@ class BasicBatchDataInputMap(CoreData):
 
 def create_output_dimension_map(materialized_output: Signal) -> Dict[str, Any]:
     return {
-        dimension.name: dimension.value
+        dimension.name: dimension.transform().value
         for dimension in materialized_output.domain_spec.dimension_filter_spec.get_flattened_dimension_map().values()
     }
 
@@ -355,3 +381,13 @@ class BasicBatchDataOutput(CoreData):
                 "dimension_map": create_output_dimension_map(self.output),
             }
         )
+
+
+ComputeLogRow = Dict[str, Any]
+
+
+class ComputeLogQuery(CoreData):
+    def __init__(self, records: List[ComputeLogRow], resource_urls: List[str], next_token: Optional[str] = None) -> None:
+        self.records = records
+        self.resource_urls = resource_urls
+        self.next_token = next_token

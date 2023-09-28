@@ -42,7 +42,7 @@ eureka_offline_training_data = app.add_external_data(
 
 # second S3 signal
 eureka_offline_all_data = app.marshal_external_data(
-    S3Dataset("111111111111","dex-ml-eureka-model-training-data", "eureka_p3/v8_00/all-data-prod","partition_day={}", dataset_format=DataFormat.CSV)
+    S3Dataset("111111111111","eureka-model-training-data", "eureka_p3/v8_00/all-data-prod","partition_day={}", dataset_format=DataFormat.CSV)
     , "eureka_training_all_data"
     , {
         'day': {

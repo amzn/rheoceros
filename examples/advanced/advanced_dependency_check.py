@@ -10,6 +10,7 @@
 
 import intelliflow.api_ext as flow
 from intelliflow.api_ext import *
+from intelliflow.core.application.core_application import ApplicationState
 
 from intelliflow.core.signal_processing.dimension_constructs import StringVariant
 from intelliflow.utils.test.inlined_compute import NOOPCompute
@@ -21,7 +22,11 @@ flow.init_basic_logging()
 #  - do everything (admin, use it for quick prototyping!)
 #  - can create/delete roles (dev role of this app) that would have this app-name and IntelliFlow in it
 #  - can get/assume its dev-role (won't help if this is the first run)
-app = AWSApplication("advanced-inputs", "us-east-1")
+app = AWSApplication("advanced-inputs", "us-east-1", enforce_runtime_compatibility=False)
+
+if app.state != ApplicationState.INACTIVE:
+    # reset routing state, previous execution data
+    app.platform.routing_table._clear_active_routes()
 
 eureka_offline_training_data = app.add_external_data(
     data_id="eureka_training_data",
@@ -36,6 +41,8 @@ default_selection_features = app.create_data(id='eureka_default',
                                              inputs={
                                                  # Range !!!
                                                  "offline_training_data": eureka_offline_training_data['NA'][:-3].range_check(True),
+                                                 "offline_training_data_shifted_range": eureka_offline_training_data['NA'][-1:-3].range_check(True),
+                                                 "offline_training_data_yesterday": eureka_offline_training_data['NA'][-1:].range_check(True),
                                                  "datum": eureka_offline_training_data['NA']['2020-03-18']
                                              },
                                              compute_targets=[  # when inputs are ready, trigger the following

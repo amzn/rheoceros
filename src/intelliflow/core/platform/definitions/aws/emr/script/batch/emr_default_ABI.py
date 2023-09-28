@@ -17,6 +17,7 @@ from intelliflow.core.platform.definitions.aws.emr.script.batch.common import (
     BOOTSTRAPPER_PLATFORM_KEY_PARAM,
     CLIENT_CODE_BUCKET,
     CLIENT_CODE_PARAM,
+    EXECUTION_ID,
     INPUT_MAP_PARAM,
     JOB_NAME_PARAM,
     OUTPUT_PARAM,
@@ -83,7 +84,7 @@ def install_if_bundle(working_set_object: str):
     subprocess.run(f"rm -rf /tmp/tmp-intelliflow/".split())
     subprocess.run(f"aws s3 cp {working_set_object} /tmp/".split())
     subprocess.run(f"unzip -qq -o /tmp/{working_set_object.split('/')[-1]} -d /tmp/tmp-intelliflow/".split())
-    sys.path.extend(['/tmp/tmp-intelliflow/'])
+    sys.path.insert(0, '/tmp/tmp-intelliflow/')
 
 def run_emr_bootstrap(job_name,
                       code_bucket,
@@ -93,7 +94,9 @@ def run_emr_bootstrap(job_name,
                       bootstrapper_path,
                       aws_region,
                       prologue_code,
-                      epilogue_code):
+                      epilogue_code,
+                      working_set_object,
+                      args):
 
     '''
     [Insert bootstrap description here.]
@@ -127,6 +130,7 @@ def run_emr_bootstrap(job_name,
     conf = SparkConf().setAppName(job_name)
     conf.setIfMissing("hive.metastore.client.factory.class", "com.amazonaws.glue.catalog.metastore.AWSGlueDataCatalogHiveClientFactory")
     sc = SparkContext.getOrCreate(conf=conf)
+    sc.addPyFile(working_set_object)
     spark = SparkSession(sc)\\
             .builder.config(conf=conf)\\
             .enableHiveSupport().getOrCreate()
@@ -140,7 +144,6 @@ def run_emr_bootstrap(job_name,
     serialized_bootstrapper_str = bootstrapper_obj.get()['Body'].read().decode('utf-8')
     runtime_platform: RuntimePlatform = RuntimePlatform.deserialize(serialized_bootstrapper_str)
     runtime_platform.runtime_init(runtime_platform.batch_compute)
-
 
     logger = logging.getLogger(__name__)
 
@@ -163,10 +166,12 @@ def run_emr_bootstrap(job_name,
                       {" WHERE " + where_clause if where_clause else ""}
                 '''
 
-
     input_map = json.loads(input_map_str)
 
     def load_input_df(input, sc, aws_region):
+        if input.get("data_type", "dataset") not in ["dataset", None]:
+            return None
+    
         if input['encryption_key']:
             # first set encryption (if defined)
             if input['resource_type'] == 'S3':
@@ -229,7 +234,7 @@ def run_emr_bootstrap(job_name,
                     if input['data_format'] == 'parquet':
                         new_df = spark.read.parquet(resource_path)
                     else:
-                        new_df = spark.read.load(resource_path, format=input['data_format'], sep=input['delimiter'], inferSchema='true', header='true')
+                        new_df = spark.read.load(resource_path, format=input['data_format'], sep=input['delimiter'], inferSchema='true', header=input['data_header_exists'])
                 # Path not found exception is considered Analysis Exception within Spark code. Please check the
                 # link below for reference.
                 # https://github.com/apache/spark/blob/1b609c7dcfc3a30aefff12a71aac5c1d6273b2c0/sql/catalyst/src/main/scala/org/apache/spark/sql/errors/QueryCompilationErrors.scala#L977
@@ -239,7 +244,11 @@ def run_emr_bootstrap(job_name,
                             logger.error("{0} path does not exist. Since range check is not required. Continuing with next available path".format(resource_path))
                             continue
                     raise e
-            input_df = input_df.unionAll(new_df) if input_df else new_df
+            if input_df and len(input_df.columns) > 0: 
+                if len(new_df.columns) > 0: # skip empty "partition" 
+                    input_df = input_df.unionAll(new_df)
+            else:
+                input_df = new_df
             if input['nearest_the_tip_in_range']:
                 break
         if input_df is None:
@@ -260,10 +269,12 @@ def run_emr_bootstrap(job_name,
         if input['alias']:
             exec('{0} = input_df'.format(input['alias']))
             exec('{0}_signal = input_signal'.format(input['alias']))
-            input_df.registerTempTable(input['alias'])
+            if input_df is not None:
+                input_df.registerTempTable(input['alias'])
         exec('input{0} = input_df'.format(i))
         exec('input{0}_signal = input_signal'.format(i))
-        input_df.registerTempTable('input{0}'.format(i))
+        if input_df is not None:
+            input_df.registerTempTable('input{0}'.format(i))
 
     # assign timers to user provided alias'
     for i, input in enumerate(input_map['timers']):
@@ -273,6 +284,13 @@ def run_emr_bootstrap(job_name,
             exec('{0}_signal = input_signal'.format(input['alias']))
         exec('timer{0} = "{1}"'.format(i, input['time']))
         exec('timer{0}_signal = input_signal'.format(i))
+        
+    # assign other signals to user provided alias'
+    for i, input in enumerate(input_map['other_signals']):
+        input_signal = Signal.deserialize(input['serialized_signal'])
+        if input['alias']:
+            exec('{0} = "{1}"'.format(input['alias'], input['time']))
+            exec('{0}_signal = input_signal'.format(input['alias']))
 
     output_param = json.loads(output_str)
     output_signal = Signal.deserialize(output_param['serialized_signal'])
@@ -306,7 +324,7 @@ def run_emr_bootstrap(job_name,
 
     output.write\\
         .format(output_param['data_format'])\\
-        .option("header", True)\\
+        .option("header", output_param['data_header_exists'])\\
         .option("delimiter", output_param['delimiter'])\\
         .mode("overwrite")\\
         .save(output_param['resource_materialized_path'])
@@ -314,11 +332,12 @@ def run_emr_bootstrap(job_name,
     # save schema
     try:
         output_signal_internal = runtime_platform.storage.map_materialized_signal(output_signal)
-        # this implicitly calls _jdf.schema().json() and then json.loads, so avoiding it now directly using _jdf.
-        # schema_data = json.dumps(output.schema.jsonValue())
-        schema_data = output._jdf.schema().json()
         schema_file = output_signal_internal.resource_access_spec.data_schema_file
-        runtime_platform.storage.save(schema_data, [], output_signal_internal.get_materialized_resource_paths()[0].strip("/") + "/" + schema_file)
+        if schema_file:
+            # this implicitly calls _jdf.schema().json() and then json.loads, so avoiding it now directly using _jdf.
+            # schema_data = json.dumps(output.schema.jsonValue())
+            schema_data = output._jdf.schema().json()
+            runtime_platform.storage.save(schema_data, [], output_signal_internal.get_materialized_resource_paths()[0].strip("/") + "/" + schema_file)
     except Exception as error:
         # note: critical is not supported via logger
         logger.error("IntelliFlow: An error occurred while trying to create schema! Error: " + str(error))
@@ -346,10 +365,16 @@ def run_emr_bootstrap(job_name,
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     args_list = ['--{JOB_NAME_PARAM}', '--{CLIENT_CODE_BUCKET}', '--{CLIENT_CODE_PARAM}', '--{INPUT_MAP_PARAM}', '--{OUTPUT_PARAM}',
-                 '--{BOOTSTRAPPER_PLATFORM_KEY_PARAM}', '--{AWS_REGION}', '--{WORKING_SET_OBJECT_PARAM}']
+                 '--{BOOTSTRAPPER_PLATFORM_KEY_PARAM}', '--{AWS_REGION}', '--{WORKING_SET_OBJECT_PARAM}', 
+                 '--{USER_EXTRA_PARAMS_PARAM}', '--{EXECUTION_ID}']
     for arg in args_list:
         parser.add_argument(arg)
-    args = parser.parse_args()
+    args, _ = parser.parse_known_args()
+    
+    user_arg_keys = json.loads(args.{USER_EXTRA_PARAMS_PARAM})
+    for arg in user_arg_keys:
+        parser.add_argument(arg)
+    args, _ = parser.parse_known_args()
 
     prologue_code_base64_str = '{base64.b64encode(self._prologue_code.encode('utf-8')).decode('ascii')}'
     epilogue_code_base64_str = '{base64.b64encode(self._epilogue_code.encode('utf-8')).decode('ascii')}'
@@ -367,6 +392,8 @@ if __name__ == "__main__":
                       args.{BOOTSTRAPPER_PLATFORM_KEY_PARAM},
                       args.{AWS_REGION},
                       prologue_code,
-                      epilogue_code)
+                      epilogue_code,
+                      args.{WORKING_SET_OBJECT_PARAM},
+                      vars(args))
 """
         )
