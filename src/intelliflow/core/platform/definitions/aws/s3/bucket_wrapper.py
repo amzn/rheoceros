@@ -148,24 +148,30 @@ def remove_notification(s3, bucket_name, topic_arns: Set[str], queue_arns: Set[s
     if current_topic_confs:
         data.setdefault(
             "TopicConfigurations",
-            [current_topic for current_topic in current_topic_confs if current_topic["TopicArn"] not in topic_arns]
-            if topic_arns
-            else current_topic_confs,
+            (
+                [current_topic for current_topic in current_topic_confs if current_topic["TopicArn"] not in topic_arns]
+                if topic_arns
+                else current_topic_confs
+            ),
         )
     if current_queue_confs:
         data.setdefault(
             "QueueConfigurations",
-            [current_queue for current_queue in current_queue_confs if current_queue["QueueArn"] not in queue_arns]
-            if queue_arns
-            else current_queue_confs,
+            (
+                [current_queue for current_queue in current_queue_confs if current_queue["QueueArn"] not in queue_arns]
+                if queue_arns
+                else current_queue_confs
+            ),
         )
 
     if current_lambda_confs:
         data.setdefault(
             "LambdaFunctionConfigurations",
-            [current_lambda for current_lambda in current_lambda_confs if current_lambda["LambdaFunctionArn"] not in lambda_arns]
-            if lambda_arns
-            else current_lambda_confs,
+            (
+                [current_lambda for current_lambda in current_lambda_confs if current_lambda["LambdaFunctionArn"] not in lambda_arns]
+                if lambda_arns
+                else current_lambda_confs
+            ),
         )
 
     if data:

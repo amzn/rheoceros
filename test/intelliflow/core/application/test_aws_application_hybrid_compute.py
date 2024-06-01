@@ -30,6 +30,7 @@ from intelliflow.core.signal_processing.signal import *
 from intelliflow.core.signal_processing.signal_source import (
     DATASET_COMPRESSION_DEFAULT_VALUE,
     DATASET_DELIMITER_DEFAULT_VALUE,
+    DATASET_FOLDER_DEFAULT_VALUE,
     DatasetSchemaType,
     DatasetType,
 )
@@ -55,6 +56,7 @@ class TestAWSApplicationHybridCompute(AWSTestBase):
                 "cradle_eureka_p3/v8_00/training-data",
                 StringVariant("NA", "region"),
                 AnyDate("day", {"format": "%Y-%m-%d"}),
+                data_folder="sub_folder",
             ),
         )
 
@@ -82,6 +84,9 @@ class TestAWSApplicationHybridCompute(AWSTestBase):
 
         eureka_offline_training_data = app.get_data("eureka_training_data", context=Application.QueryContext.DEV_CONTEXT)[0]
         eureka_offline_all_data = app.get_data("eureka_training_all_data", context=Application.QueryContext.DEV_CONTEXT)[0]
+
+        assert eureka_offline_training_data.signal().resource_access_spec.data_folder == "sub_folder"
+        assert eureka_offline_all_data.signal().resource_access_spec.data_folder == DATASET_FOLDER_DEFAULT_VALUE
 
         # test when slot / compute cannot be mapped to any of the underlying BatchCompute drivers
         # here the problem is we are using generic BatchCompute slot type but not providing GlueVersion for example
@@ -120,6 +125,7 @@ class TestAWSApplicationHybridCompute(AWSTestBase):
         assert signal.resource_access_spec.data_delimiter == DATASET_DELIMITER_DEFAULT_VALUE
         assert signal.resource_access_spec.dataset_type.value == DatasetType.REPLACE
         assert signal.resource_access_spec.data_compression is DATASET_COMPRESSION_DEFAULT_VALUE
+        assert signal.resource_access_spec.data_folder is DATASET_FOLDER_DEFAULT_VALUE
         assert signal.resource_access_spec.data_header_exists  # determined by the driver!
         assert signal.resource_access_spec.data_schema_type == DatasetSchemaType.SPARK_SCHEMA_JSON  # determined by the driver!
 
@@ -146,6 +152,7 @@ class TestAWSApplicationHybridCompute(AWSTestBase):
             signal.resource_access_spec.dataset_type.value == DatasetType.REPLACE
         )  # not effective but still there since driver does not change it
         assert signal.resource_access_spec.data_compression is DATASET_COMPRESSION_DEFAULT_VALUE
+        assert signal.resource_access_spec.data_folder is DATASET_FOLDER_DEFAULT_VALUE
         # TODO Athena CTAS uses GZIP by default (and uses .gz as the suffix on partitions) and it is seamless for downstream consumption (Spark or Athena again)
         #  but the driver should still this keep the signal properties 'metadata' consistent (particularly for another app in collaboration mode)
         # refer
@@ -231,7 +238,7 @@ class TestAWSApplicationHybridCompute(AWSTestBase):
                 )
             ],
             enforce_referential_integrity=False,
-            data_format=DatasetSignalSourceFormat.ORC
+            data_format=DatasetSignalSourceFormat.ORC,
             # TODO raise error from Athena driver when PARQUET or ORC and header is set False by user
             # header=False
         )
@@ -242,6 +249,7 @@ class TestAWSApplicationHybridCompute(AWSTestBase):
         # TODO Athena uses GZIP by default and it is seamless for downstream consumption (Spark or Athena again)
         #  but the driver should still this keep the signal properties 'metadata' consistent (particularly for another app in collaboration mode)
         assert signal.resource_access_spec.data_compression is DATASET_COMPRESSION_DEFAULT_VALUE
+        assert signal.resource_access_spec.data_folder is DATASET_FOLDER_DEFAULT_VALUE
         #  refer
         # https://docs.aws.amazon.com/athena/latest/ug/create-table-as.html for ORC default compression
         # assert signal.resource_access_spec.data_compression == "GZIP"  # Athena default compression for ORC
@@ -338,9 +346,11 @@ class TestAWSApplicationHybridCompute(AWSTestBase):
             # make sure that CompositeBatchDriver does not mess up with slot -> BatchCompute driver routing
             assert session_desc.session_id == "glue_JOB"
             return ComputeSessionState(
-                ComputeSessionDesc("job_id", ComputeResourceDesc("job_name", "job_arn", driver=AWSGlueBatchComputeBasic))
-                if not session_desc
-                else session_desc,
+                (
+                    ComputeSessionDesc("job_id", ComputeResourceDesc("job_name", "job_arn", driver=AWSGlueBatchComputeBasic))
+                    if not session_desc
+                    else session_desc
+                ),
                 ComputeSessionStateType.PROCESSING,
                 [ComputeExecutionDetails("<start_time>", "<end_time>", dict({"param1": 1, "param2": 2}))],
             )
@@ -401,9 +411,11 @@ class TestAWSApplicationHybridCompute(AWSTestBase):
             # make sure that CompositeBatchDriver does not mess up with slot -> BatchCompute driver routing
             assert session_desc.session_id == "glue_JOB"
             return ComputeSessionState(
-                ComputeSessionDesc("job_run_id", ComputeResourceDesc("job_name", "job_arn", driver=AWSGlueBatchComputeBasic))
-                if not session_desc
-                else session_desc,
+                (
+                    ComputeSessionDesc("job_run_id", ComputeResourceDesc("job_name", "job_arn", driver=AWSGlueBatchComputeBasic))
+                    if not session_desc
+                    else session_desc
+                ),
                 # COMPLETE!
                 ComputeSessionStateType.COMPLETED,
                 [
@@ -566,9 +578,11 @@ class TestAWSApplicationHybridCompute(AWSTestBase):
             # make sure that CompositeBatchDriver does not mess up with slot -> BatchCompute driver routing
             assert session_desc.session_id == "glue_JOB"
             return ComputeSessionState(
-                ComputeSessionDesc("job_id", ComputeResourceDesc("job_name", "job_arn", driver=AWSGlueBatchComputeBasic))
-                if not session_desc
-                else session_desc,
+                (
+                    ComputeSessionDesc("job_id", ComputeResourceDesc("job_name", "job_arn", driver=AWSGlueBatchComputeBasic))
+                    if not session_desc
+                    else session_desc
+                ),
                 ComputeSessionStateType.PROCESSING,
                 [ComputeExecutionDetails("<start_time>", "<end_time>", dict({"param1": 1, "param2": 2}))],
             )

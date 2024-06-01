@@ -269,74 +269,73 @@ class BasicBatchDataInputMap(CoreData):
     def __init__(self, input_signals: Sequence[Signal]) -> None:
         self.input_signals = input_signals
 
+    def create(self) -> Dict[str, Any]:
+        return {
+            "data_inputs": [
+                {
+                    "alias": signal.alias,
+                    "resource_materialized_paths": [path for path in signal.get_materialized_resource_paths()],
+                    "resource_type": signal.resource_access_spec.source.value,
+                    "path_format": signal.resource_access_spec.path_format,
+                    "data_format": signal.resource_access_spec.data_format.value,
+                    "data_type": (signal.resource_access_spec.data_type.value if signal.resource_access_spec.data_type else None),
+                    "dataset_type": (signal.resource_access_spec.dataset_type.value if signal.resource_access_spec.dataset_type else None),
+                    "data_compression": signal.resource_access_spec.data_compression,
+                    "data_folder": signal.resource_access_spec.data_folder,
+                    "encryption_key": signal.resource_access_spec.encryption_key,
+                    "data_header_exists": signal.resource_access_spec.data_header_exists,
+                    "data_schema_file": signal.resource_access_spec.data_schema_file,
+                    "data_schema_type": (
+                        signal.resource_access_spec.data_schema_type.value if signal.resource_access_spec.data_schema_type else None
+                    ),
+                    "data_schema_def": signal.resource_access_spec.data_schema_definition,
+                    "partition_keys": signal.resource_access_spec.partition_keys,
+                    "partitions": signal.resource_access_spec.get_partitions(signal.domain_spec.dimension_filter_spec),
+                    "primary_keys": signal.resource_access_spec.primary_keys,
+                    "delimiter": signal.resource_access_spec.data_delimiter,
+                    "attrs": signal.resource_access_spec.__dict__,
+                    "proxy": (
+                        {
+                            "resource_type": signal.resource_access_spec.proxy.source.value,
+                            "attrs": signal.resource_access_spec.proxy.__dict__,
+                        }
+                        if signal.resource_access_spec.proxy
+                        else None
+                    ),
+                    "if_signal_type": signal.type.value,
+                    "serialized_signal": signal.serialize(),
+                    "range_check_required": signal.range_check_required,
+                    "nearest_the_tip_in_range": signal.nearest_the_tip_in_range,
+                }
+                for signal in self.input_signals
+                if signal.type.is_data()
+            ],
+            "timers": [
+                {
+                    "alias": signal.alias,
+                    #'formatted_time': next(iter(signal.domain_spec.dimension_filter_spec.get_root_dimensions())).value,
+                    #'raw_time': next(iter(signal.domain_spec.dimension_filter_spec.get_root_dimensions())).date,
+                    # note: formatted_time and time should be identical
+                    "time": TimerSignalSourceAccessSpec.extract_time(signal.get_materialized_resource_paths()[0]),
+                    "resource_type": signal.resource_access_spec.source.value,
+                    "serialized_signal": signal.serialize(),
+                }
+                for signal in self.input_signals
+                if signal.type == SignalType.TIMER_EVENT
+            ],
+            "other_signals": [
+                {
+                    "alias": signal.alias,
+                    "resource_type": signal.resource_access_spec.source.value,
+                    "serialized_signal": signal.serialize(),
+                }
+                for signal in self.input_signals
+                if not signal.type.is_data() and signal.type != SignalType.TIMER_EVENT
+            ],
+        }
+
     def dumps(self) -> str:
-        return json.dumps(
-            {
-                "data_inputs": [
-                    {
-                        "alias": signal.alias,
-                        "resource_materialized_paths": [path for path in signal.get_materialized_resource_paths()],
-                        "resource_type": signal.resource_access_spec.source.value,
-                        "path_format": signal.resource_access_spec.path_format,
-                        "data_format": signal.resource_access_spec.data_format.value,
-                        "data_type": (signal.resource_access_spec.data_type.value if signal.resource_access_spec.data_type else None),
-                        "dataset_type": (
-                            signal.resource_access_spec.dataset_type.value if signal.resource_access_spec.dataset_type else None
-                        ),
-                        "data_compression": signal.resource_access_spec.data_compression,
-                        "encryption_key": signal.resource_access_spec.encryption_key,
-                        "data_header_exists": signal.resource_access_spec.data_header_exists,
-                        "data_schema_file": signal.resource_access_spec.data_schema_file,
-                        "data_schema_type": (
-                            signal.resource_access_spec.data_schema_type.value if signal.resource_access_spec.data_schema_type else None
-                        ),
-                        "data_schema_def": signal.resource_access_spec.data_schema_definition,
-                        "partition_keys": signal.resource_access_spec.partition_keys,
-                        "partitions": signal.resource_access_spec.get_partitions(signal.domain_spec.dimension_filter_spec),
-                        "primary_keys": signal.resource_access_spec.primary_keys,
-                        "delimiter": signal.resource_access_spec.data_delimiter,
-                        "attrs": signal.resource_access_spec.__dict__,
-                        "proxy": (
-                            {
-                                "resource_type": signal.resource_access_spec.proxy.source.value,
-                                "attrs": signal.resource_access_spec.proxy.__dict__,
-                            }
-                            if signal.resource_access_spec.proxy
-                            else None
-                        ),
-                        "if_signal_type": signal.type.value,
-                        "serialized_signal": signal.serialize(),
-                        "range_check_required": signal.range_check_required,
-                        "nearest_the_tip_in_range": signal.nearest_the_tip_in_range,
-                    }
-                    for signal in self.input_signals
-                    if signal.type.is_data()
-                ],
-                "timers": [
-                    {
-                        "alias": signal.alias,
-                        #'formatted_time': next(iter(signal.domain_spec.dimension_filter_spec.get_root_dimensions())).value,
-                        #'raw_time': next(iter(signal.domain_spec.dimension_filter_spec.get_root_dimensions())).date,
-                        # note: formatted_time and time should be identical
-                        "time": TimerSignalSourceAccessSpec.extract_time(signal.get_materialized_resource_paths()[0]),
-                        "resource_type": signal.resource_access_spec.source.value,
-                        "serialized_signal": signal.serialize(),
-                    }
-                    for signal in self.input_signals
-                    if signal.type == SignalType.TIMER_EVENT
-                ],
-                "other_signals": [
-                    {
-                        "alias": signal.alias,
-                        "resource_type": signal.resource_access_spec.source.value,
-                        "serialized_signal": signal.serialize(),
-                    }
-                    for signal in self.input_signals
-                    if not signal.type.is_data() and signal.type != SignalType.TIMER_EVENT
-                ],
-            },
-            default=repr,
-        )
+        return json.dumps(self.create(), default=repr)
 
 
 def create_output_dimension_map(materialized_output: Signal) -> Dict[str, Any]:
@@ -362,27 +361,28 @@ class BasicBatchDataOutput(CoreData):
     def __init__(self, output: Signal) -> None:
         self.output = output
 
-    def dumps(self) -> str:
+    def create(self) -> Dict[str, Any]:
         completion_indicator_paths = self.output.get_materialized_resources()
-        return json.dumps(
-            {
-                "alias": self.output.alias,
-                "resource_materialized_path": self.output.get_materialized_resource_paths()[0],
-                "resource_type": self.output.resource_access_spec.source.value,
-                "completion_indicator_materialized_path": completion_indicator_paths[0] if completion_indicator_paths else None,
-                "data_format": self.output.resource_access_spec.data_format.value,
-                "data_header_exists": self.output.resource_access_spec.data_header_exists,
-                "data_schema_file": self.output.resource_access_spec.data_schema_file,
-                "data_schema_type": self.output.resource_access_spec.data_schema_type.value
-                if self.output.resource_access_spec.data_schema_type
-                else None,
-                "data_schema_def": self.output.resource_access_spec.data_schema_definition,
-                "delimiter": self.output.resource_access_spec.data_delimiter,
-                "if_signal_type": self.output.type.value,
-                "serialized_signal": self.output.serialize(),
-                "dimension_map": create_output_dimension_map(self.output),
-            }
-        )
+        return {
+            "alias": self.output.alias,
+            "resource_materialized_path": self.output.get_materialized_resource_paths()[0],
+            "resource_type": self.output.resource_access_spec.source.value,
+            "completion_indicator_materialized_path": completion_indicator_paths[0] if completion_indicator_paths else None,
+            "data_format": self.output.resource_access_spec.data_format.value,
+            "data_header_exists": self.output.resource_access_spec.data_header_exists,
+            "data_schema_file": self.output.resource_access_spec.data_schema_file,
+            "data_schema_type": (
+                self.output.resource_access_spec.data_schema_type.value if self.output.resource_access_spec.data_schema_type else None
+            ),
+            "data_schema_def": self.output.resource_access_spec.data_schema_definition,
+            "delimiter": self.output.resource_access_spec.data_delimiter,
+            "if_signal_type": self.output.type.value,
+            "serialized_signal": self.output.serialize(),
+            "dimension_map": create_output_dimension_map(self.output),
+        }
+
+    def dumps(self) -> str:
+        return json.dumps(self.create())
 
 
 ComputeLogRow = Dict[str, Any]

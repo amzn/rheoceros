@@ -11,13 +11,11 @@ logger = logging.getLogger(__name__)
 class SignalIntegrityChecker(ABC):
     @classmethod
     @abstractmethod
-    def check(cls, signal_source: "SignalSource", protocol: "SignalIntegrityProtocol") -> bool:
-        ...
+    def check(cls, signal_source: "SignalSource", protocol: "SignalIntegrityProtocol") -> bool: ...
 
     @classmethod
     @abstractmethod
-    def get_required_resource_name(cls, materialized_access_spec: "SignalAccessSpec", protocol: "SignalIntegrityProtocol") -> str:
-        ...
+    def get_required_resource_name(cls, materialized_access_spec: "SignalAccessSpec", protocol: "SignalIntegrityProtocol") -> str: ...
 
 
 class StatelessResourceChecker(SignalIntegrityChecker):

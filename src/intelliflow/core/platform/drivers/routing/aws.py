@@ -7,6 +7,7 @@ from enum import Enum
 from typing import ClassVar, Dict, Iterator, List, Optional, Sequence, Set, Tuple, Type, Union, cast
 
 import boto3
+import botocore
 from boto3.dynamodb.conditions import Attr, Key, Or
 from botocore.exceptions import ClientError
 
@@ -85,7 +86,7 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
         operations occur in the very beginning of a construct's life-cycle within an app.
         """
         super().__init__(params)
-        self._ddb = self._session.resource("dynamodb", region_name=self._region)
+        self._ddb = self._session.resource("dynamodb", region_name=self._region, config=self._ddb_client_dev_config())
         self._ddb_scaling = self._session.client("application-autoscaling", region_name=self._region)
         self._routing_table_name = None
         self._routing_table = None
@@ -101,7 +102,7 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
 
     def _deserialized_init(self, params: ConstructParamsDict) -> None:
         super()._deserialized_init(params)
-        self._ddb = self._session.resource("dynamodb", region_name=self._region)
+        self._ddb = self._session.resource("dynamodb", region_name=self._region, config=self._ddb_client_dev_config())
         self._ddb_scaling = self._session.client("application-autoscaling", region_name=self._region)
         self._routing_lock_retainer_id = self._create_retainer_id_for_session()
 
@@ -115,6 +116,11 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
         self._routing_lock_table = None
         self._ddb_scaling = None
         self._routing_lock_retainer_id = None
+
+    @classmethod
+    def _ddb_client_dev_config(cls):
+        # TODO tune, use only in dev-mode for parallel executions (not required at runtime)
+        return botocore.client.Config(max_pool_connections=20)
 
     @property
     def routing_table_name(self):
@@ -523,19 +529,28 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
                             "compute_record_sort_key": f"{inactive_record.trigger_timestamp_utc}{uuid.uuid4()}",
                             "compute_trigger_timestamp_utc": inactive_record.trigger_timestamp_utc,
                             "compute_finished_timestamp_utc": inactive_record.deactivated_timestamp_utc,
-                            "compute_elapsed_time": inactive_record.deactivated_timestamp_utc - inactive_record.trigger_timestamp_utc
-                            if inactive_record.deactivated_timestamp_utc
-                            else None,
+                            "compute_elapsed_time": (
+                                inactive_record.deactivated_timestamp_utc - inactive_record.trigger_timestamp_utc
+                                if inactive_record.deactivated_timestamp_utc
+                                else None
+                            ),
                             "compute_response_state": inactive_record.state.response_type.value,
-                            "compute_response_sub_state": inactive_record.state.successful_response_type.value
-                            if inactive_record.state.response_type == ComputeResponseType.SUCCESS
-                            else inactive_record.state.failed_response_type.value,
-                            "compute_session_state": inactive_record.session_state.state_type.value
-                            if inactive_record.session_state
-                            else ComputeSessionStateType.FAILED.value,
-                            "compute_session_sub_state": inactive_record.session_state.failed_type.value
-                            if inactive_record.session_state and inactive_record.session_state.state_type == ComputeSessionStateType.FAILED
-                            else "",  # cannot leave empty if will be used as a secondary index, in that case set as ComputeFailedResponseType.UNKNOWN
+                            "compute_response_sub_state": (
+                                inactive_record.state.successful_response_type.value
+                                if inactive_record.state.response_type == ComputeResponseType.SUCCESS
+                                else inactive_record.state.failed_response_type.value
+                            ),
+                            "compute_session_state": (
+                                inactive_record.session_state.state_type.value
+                                if inactive_record.session_state
+                                else ComputeSessionStateType.FAILED.value
+                            ),
+                            "compute_session_sub_state": (
+                                inactive_record.session_state.failed_type.value
+                                if inactive_record.session_state
+                                and inactive_record.session_state.state_type == ComputeSessionStateType.FAILED
+                                else ""
+                            ),  # cannot leave empty if will be used as a secondary index, in that case set as ComputeFailedResponseType.UNKNOWN
                             "slot_type": inactive_record.slot.type.value,
                             # TODO create a GSI to get compute records that belong to the same context together
                             "execution_context_id": inactive_record.execution_context_id,
@@ -1017,7 +1032,7 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
                     "dynamodb:Scan",
                     "dynamodb:PutItem",
                     "dynamodb:DeleteItem",
-                    "dynamodb:BatchWriteItem"
+                    "dynamodb:BatchWriteItem",
                     # "dynamodb:BatchGetItem",
                     # "dax:*",
                     # "application-autoscaling:*"
@@ -1100,7 +1115,7 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
             "ProvisionedReadCapacityUnits": ["*"],
             "TransactionConflict": ["*"],
             "ReadThrottleEvents": ["*"],
-            "WriteThrottleEvents": ["*"]
+            "WriteThrottleEvents": ["*"],
             # TODO enable when default CW dashboard max widget limit issue is handled
             # "ConditionalCheckFailedRequests": []
         }
@@ -1253,9 +1268,9 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
                 # When billing mode is provisioned we need to provide the
                 # RCUs and WCUs but the following values are just dummy.
                 # Refer Auto Scaling Capacities above.
-                provisioned_throughput={"ReadCapacityUnits": 20, "WriteCapacityUnits": 20}
-                if self.billing_mode == BillingMode.PROVISIONED
-                else None,
+                provisioned_throughput=(
+                    {"ReadCapacityUnits": 20, "WriteCapacityUnits": 20} if self.billing_mode == BillingMode.PROVISIONED else None
+                ),
                 billing_mode=self.billing_mode,
             )
 
@@ -1326,9 +1341,9 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
                 # When billing mode is provisioned we need to provide the
                 # RCUs and WCUs but the following values are just dummy.
                 # Refer Auto Scaling Capacities above.
-                provisioned_throughput={"ReadCapacityUnits": 20, "WriteCapacityUnits": 10}
-                if self.billing_mode == BillingMode.PROVISIONED
-                else None,
+                provisioned_throughput=(
+                    {"ReadCapacityUnits": 20, "WriteCapacityUnits": 10} if self.billing_mode == BillingMode.PROVISIONED else None
+                ),
                 billing_mode=self.billing_mode,
             )
         except ClientError as error:
@@ -1360,9 +1375,9 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
                 # When billing mode is provisioned we need to provide the
                 # RCUs and WCUs but the following values are just dummy.
                 # Refer Auto Scaling Capacities above.
-                provisioned_throughput={"ReadCapacityUnits": 20, "WriteCapacityUnits": 10}
-                if self.billing_mode == BillingMode.PROVISIONED
-                else None,
+                provisioned_throughput=(
+                    {"ReadCapacityUnits": 20, "WriteCapacityUnits": 10} if self.billing_mode == BillingMode.PROVISIONED else None
+                ),
                 billing_mode=self.billing_mode,
             )
         except ClientError as error:
@@ -1396,9 +1411,9 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
                 # When billing mode is provisioned we need to provide the
                 # RCUs and WCUs but the following values are just dummy.
                 # Refer Auto Scaling Capacities above.
-                provisioned_throughput={"ReadCapacityUnits": 20, "WriteCapacityUnits": 10}
-                if self.billing_mode == BillingMode.PROVISIONED
-                else None,
+                provisioned_throughput=(
+                    {"ReadCapacityUnits": 20, "WriteCapacityUnits": 10} if self.billing_mode == BillingMode.PROVISIONED else None
+                ),
                 billing_mode=self.billing_mode,
             )
         except ClientError as error:

@@ -472,6 +472,7 @@ class TestAWSEMRBatchCompute(AWSTestBase, DriverTestUtils):
         execution_id = "aaaa-aaaa-aaa"
 
         extra_params = {"key1": "value1", "key2": 2}
+        ignored_bundle_modules = ["boto3", "botocore"]
         actual_args = mock_compute._build_emr_cli_arg(
             app_name,
             boilerplate,
@@ -483,6 +484,7 @@ class TestAWSEMRBatchCompute(AWSTestBase, DriverTestUtils):
             working_set_object,
             extra_params,
             execution_id,
+            ignored_bundle_modules,
         )
         assert expected_args == actual_args[: len(expected_args)]
         assert ["--key1", "value1", "--key2", "2"] == actual_args[len(expected_args) : len(expected_args) + 4]

@@ -6,6 +6,7 @@
   TODO
 
 """
+
 import json
 from abc import ABC, abstractmethod
 from typing import Any, List, Optional
@@ -204,8 +205,7 @@ class FilteredView(ABC, SignalProvider, metaclass=_FilterViewMeta):
         return self._chain(self._signal, new_filter_raw_input)
 
     @abstractmethod
-    def _chain(self, signal: Signal, filtering_levels: RawDimensionFilterInput) -> "FilterView":
-        ...
+    def _chain(self, signal: Signal, filtering_levels: RawDimensionFilterInput) -> "FilterView": ...
 
     @classmethod
     def get_raw_filtering_input(cls, slice_filter: Any, dimension_name: str) -> RawDimensionFilterInput:

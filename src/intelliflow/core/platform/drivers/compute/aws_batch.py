@@ -279,14 +279,15 @@ class AWSBatchCompute(AWSConstructMixin, BatchCompute):
             api_params.pop(AWS_BATCH_ORCHESTRATOR_ROLE_ARN_PARAM)
 
         if not retry_session_desc:
-            # overwrite logic:
-            # now clean the output partition (delete previous batch job runs)
-            # entire_domain=False just uses the material dimension values to target the current output partition only
-            # IMPORTANT: do it the first time! not during retries as we'd like to keep the partial container outputs
-            # Example: and array size 100 job fails due to some childs having transient issues. we want to let them
-            # (batch logic) be idempotent.
-            output_internal_view = self.get_platform().storage.map_materialized_signal(materialized_output)
-            self.get_platform().storage.delete_internal(output_internal_view, entire_domain=False)
+            if route.output.resource_access_spec.overwrites:
+                # overwrite logic:
+                # now clean the output partition (delete previous batch job runs)
+                # entire_domain=False just uses the material dimension values to target the current output partition only
+                # IMPORTANT: do it the first time! not during retries as we'd like to keep the partial container outputs
+                # Example: and array size 100 job fails due to some childs having transient issues. we want to let them
+                # (batch logic) be idempotent.
+                output_internal_view = self.get_platform().storage.map_materialized_signal(materialized_output)
+                self.get_platform().storage.delete_internal(output_internal_view, entire_domain=False)
 
         # call submit_job
         job_id = None
@@ -608,7 +609,7 @@ class AWSBatchCompute(AWSConstructMixin, BatchCompute):
                 ],
                 [
                     "batch:SubmitJob",
-                    "batch:TerminateJob"
+                    "batch:TerminateJob",
                     # Describe and List APIs don't allow resource-level persmissions (see the one with "*" below)
                     #    , "batch:DescribeJobs"
                 ],

@@ -175,13 +175,11 @@ def get_session_with_account(account_id: str, region: str) -> boto3.Session:
 
 
 @overload
-def get_session(role_ARN: str = None, region: str = None, duration: int = IF_DEFAULT_SESSION_DURATION) -> boto3.Session:
-    ...
+def get_session(role_ARN: str = None, region: str = None, duration: int = IF_DEFAULT_SESSION_DURATION) -> boto3.Session: ...
 
 
 @overload
-def get_session(aws_access_pair: AWSAccessPair = None, region: str = None, duration: int = IF_DEFAULT_SESSION_DURATION) -> boto3.Session:
-    ...
+def get_session(aws_access_pair: AWSAccessPair = None, region: str = None, duration: int = IF_DEFAULT_SESSION_DURATION) -> boto3.Session: ...
 
 
 def get_session(
@@ -213,13 +211,11 @@ def get_session(
 
 
 @overload
-def get_caller_identity(session: boto3.Session, region: str) -> str:
-    ...
+def get_caller_identity(session: boto3.Session, region: str) -> str: ...
 
 
 @overload
-def get_caller_identity(access_pair: AWSAccessPair, region: str) -> str:
-    ...
+def get_caller_identity(access_pair: AWSAccessPair, region: str) -> str: ...
 
 
 def get_caller_identity(access_pair_or_session: Union[AWSAccessPair, boto3.Session], region: str) -> str:
@@ -236,13 +232,11 @@ def get_caller_identity(access_pair_or_session: Union[AWSAccessPair, boto3.Sessi
 
 
 @overload
-def get_aws_account_id(session: boto3.Session, region: str) -> str:
-    ...
+def get_aws_account_id(session: boto3.Session, region: str) -> str: ...
 
 
 @overload
-def get_aws_account_id(access_pair: AWSAccessPair, region: str) -> str:
-    ...
+def get_aws_account_id(access_pair: AWSAccessPair, region: str) -> str: ...
 
 
 def get_aws_account_id(access_pair_or_session: Union[AWSAccessPair, boto3.Session], region: str) -> str:
@@ -661,16 +655,25 @@ def update_role_trust_policy(
         module_logger.info("Skipping role trusted policy update since no change detected against the existing trusted policy...")
 
 
+def _get_size_optimized_statements(permissions: Set["ConstructPermission"]) -> Dict[Set[str], Set[str]]:
+    actions_bucketed_statements = {}
+    for resources, actions in permissions:
+        actions_bucketed_statements.setdefault(frozenset(actions), set(resources)).update(resources)
+
+    return actions_bucketed_statements
+
+
 def put_inlined_policy(
     role_name: str, policy_name: str, action_resource_pairs: Set["ConstructPermission"], base_session: boto3.Session
 ) -> None:
     iam = base_session.client("iam")
 
+    size_optimized_statements = _get_size_optimized_statements(action_resource_pairs)
     inlined_policy = {
         "Version": "2012-10-17",
         "Statement": [
             {"Effect": "Allow", "Action": [action for action in actions], "Resource": [resource for resource in resources]}
-            for resources, actions in action_resource_pairs
+            for actions, resources in size_optimized_statements.items()
         ],
     }
 

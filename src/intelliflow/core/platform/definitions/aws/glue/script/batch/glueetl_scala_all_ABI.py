@@ -15,6 +15,7 @@ Scala ETL since runtimes are different. Therefore;
 DONOT EDIT / Introduce dependencies to this module. Host applications working set won't be available
 when this script is being executed by Glue.
 """
+
 from typing import ClassVar, Optional, Set
 
 from intelliflow.core.platform.definitions.aws.glue.script.batch.common import (

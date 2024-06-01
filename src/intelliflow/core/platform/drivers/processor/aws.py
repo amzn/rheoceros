@@ -662,7 +662,7 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
                 self._sqs,
                 self._dlq_name,
                 1209600,  # 14 days for msg retention period (MAX for SQS)
-                15 * 60  # 15 mins for visibility timeout for future support of consumption from DLQ.
+                15 * 60,  # 15 mins for visibility timeout for future support of consumption from DLQ.
                 # in that case the consumer will depend on max IF event processing time
                 # before it can actually delete the message from the Queue.
             )

@@ -315,7 +315,9 @@ class TestAWSApplicationComputeTargets(AWSTestBase):
                     SlotCode(
                         "<SOME Pyspark CODE>",
                         SlotCodeMetadata(
-                            SlotCodeType.EMBEDDED_SCRIPT, external_library_paths=["python-foo-lib", "python-bar-lib", "python-lib"]
+                            SlotCodeType.EMBEDDED_SCRIPT,
+                            external_library_paths=["python-foo-lib", "python-bar-lib", "python-lib"],
+                            ignored_bundle_modules=["boto3", "botocore"],
                         ),
                     )
                 ),
@@ -343,6 +345,7 @@ class TestAWSApplicationComputeTargets(AWSTestBase):
         assert len(cast(SlotCode, kickoff_route.slots[0].code).metadata.external_library_paths) == 2
         # now it should give 3! on number of external libs for the PySpark compute
         assert len(cast(SlotCode, kickoff_route.slots[1].code).metadata.external_library_paths) == 3
+        assert len(cast(SlotCode, kickoff_route.slots[1].code).metadata.ignored_bundle_modules) == 2
 
         self.patch_aws_stop()
 

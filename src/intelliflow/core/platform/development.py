@@ -75,6 +75,7 @@ from .drivers.compute.aws_batch import AWSBatchCompute
 from .drivers.compute.aws_emr import AWSEMRBatchCompute
 from .drivers.compute.aws_sagemaker.training_job import AWSSagemakerTrainingJobBatchCompute
 from .drivers.compute.aws_sagemaker.transform_job import AWSSagemakerTransformJobBatchCompute
+from .drivers.compute.aws_sfn import AWSSFNCompute
 from .drivers.compute.local import LocalSparkBatchComputeImpl, LocalSparkIPCBatchComputeImpl
 from .drivers.diagnostics.aws import AWSCloudWatchDiagnostics
 from .drivers.diagnostics.local import LocalDiagnosticsImpl
@@ -380,8 +381,7 @@ class Configuration(Serializable):
 
     @classmethod
     @abstractmethod
-    def get_supported_constructs_map(cls) -> Dict[Type[BaseConstruct], Set[Type[BaseConstruct]]]:
-        ...
+    def get_supported_constructs_map(cls) -> Dict[Type[BaseConstruct], Set[Type[BaseConstruct]]]: ...
 
     def get_active_construct_type(self, construct_type: Type[BaseConstruct]) -> Type[BaseConstruct]:
         return self._active_construct_map[construct_type]
@@ -645,6 +645,7 @@ class AWSConfiguration(Configuration):
                 AWSSagemakerTrainingJobBatchCompute,
                 AWSSagemakerTransformJobBatchCompute,
                 # AWSBatchCompute,
+                # AWSSFNCompute,
             ],
         )
 
@@ -1170,6 +1171,7 @@ class AWSConfiguration(Configuration):
                 AWSSagemakerTrainingJobBatchCompute,
                 AWSSagemakerTransformJobBatchCompute,
                 AWSBatchCompute,
+                AWSSFNCompute,
             },
             RoutingTable: {AWSDDBRoutingTable},
             Diagnostics: {AWSCloudWatchDiagnostics},
@@ -1304,8 +1306,7 @@ class DevelopmentPlatform(Platform):
         self._extensions = persisted_platform.extensions
 
     @abstractmethod
-    def should_load_constructs(self) -> bool:
-        ...
+    def should_load_constructs(self) -> bool: ...
 
     def process_downstream_connection(self, downstream_platform: "DevelopmentPlatform") -> UpstreamGrants:
         conf_grants: UpstreamGrants = self._conf.process_downstream_connection(downstream_platform)
@@ -1851,3 +1852,11 @@ class RemotePlatform(DevelopmentPlatform):
             f"Bad operation on RemotePlatform for {self.context_id}!"
             f" RemotePlatform is meant to bind to another one, not supposed to create a new context."
         )
+
+    @property
+    def upstream_connections(self) -> Dict[str, DevelopmentPlatform]:
+        module_logger.critical(
+            f"Transitive upstream applications are not exposed via {self.__class__.__name__!r}::upstream_connections!"
+            f" Returning empty dictionary..."
+        )
+        return {}

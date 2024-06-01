@@ -4,6 +4,7 @@
 """
 Module to provide Athena CTAS input materialization Glue ETL script
 """
+
 from typing import ClassVar, Optional, Set
 
 from intelliflow.core.platform.definitions.aws.athena.common import ATHENA_RESERVED_DDL_KEYWORDS, ATHENA_RESERVED_SELECT_STATEMENT_KEYWORDS
@@ -91,6 +92,7 @@ from intelliflow.core.platform.definitions.aws.glue import catalog as glue_catal
 from intelliflow.core.platform.definitions.aws.athena.client_wrapper import query, ATHENA_CLIENT_RETRYABLE_EXCEPTION_LIST
 from intelliflow.core.platform.definitions.aws.athena.common import check_name_for_DDL, check_name_for_DML
 from intelliflow.core.platform.definitions.aws.athena.execution.common import create_input_table_name, create_input_filtered_view_name, convert_spark_datatype_to_presto
+from intelliflow.utils.spark import create_spark_schema
 
 args = getResolvedOptions(sys.argv, {list(self._args)!r})
 
@@ -210,16 +212,19 @@ def load_input_df(input, sc, aws_region):
                                    "after the execution has started.".format(resource_path))
         if not new_df:
             # native access via input materialized paths
+            # TODO read IF 'data_schema_file' for internal datasets when 'data_header_exists' is False
+            #      - mandatory for Athena CSV based CTAS outputs (which lack header)
+            #  if header is false and schema does not exist, fail!
+            schema_def = input.get("data_schema_def", None)
+            spark_schema_def = create_spark_schema(schema_def) if schema_def else None
             try:
                 if input['data_format'] == 'parquet':
-                    new_df = spark.read.parquet(resource_path)
-                else:
-                    # TODO read IF 'data_schema_file' for internal datasets when 'data_header_exists' is False
-                    #      - mandatory for Athena CSV based CTAS outputs (which lack header)
-                    #  if header is false and schema does not exist, fail!
-                    schema_def = input.get("data_schema_def", None)
                     if schema_def:
-                        spark_schema_def = create_spark_schema(schema_def)
+                        new_df = spark.read.schema(spark_schema_def).parquet(resource_path)
+                    else:
+                        new_df = spark.read.parquet(resource_path)
+                else:
+                    if schema_def:
                         new_df = spark.read.load(resource_path, format=input['data_format'], sep=input['delimiter'], schema=spark_schema_def, header=input['data_header_exists'])
                     else:
                         new_df = spark.read.load(resource_path, format=input['data_format'], sep=input['delimiter'], inferSchema='true', header=input['data_header_exists'])

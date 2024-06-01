@@ -11,6 +11,7 @@ import pytest
 import intelliflow.api_ext as flow
 from intelliflow.api_ext import *
 from intelliflow.core.application.application import Application
+from intelliflow.core.application.remote_application import DownstreamApplicationPermission
 from intelliflow.core.platform.definitions.compute import (
     ComputeFailedSessionState,
     ComputeFailedSessionStateType,
@@ -24,6 +25,7 @@ from intelliflow.core.platform.definitions.compute import (
 from intelliflow.core.signal_processing import Slot
 from intelliflow.core.signal_processing.signal import *
 from intelliflow.mixins.aws.test import AWSTestBase
+from intelliflow.utils.test.data_emulation import add_test_data
 from intelliflow.utils.test.inlined_compute import NOOPCompute
 
 
@@ -1273,6 +1275,85 @@ class TestAWSApplicationExecutionControl(AWSTestBase):
             app.execute(node_1_3)  # designed to fail (execute maps execution failure to runtime on user side)
         # verify that activation should NOT occur
         assert app.activate.call_count == 8
+
+        self.patch_aws_stop()
+
+    def test_application_execute_on_upstream_data(self):
+        self.patch_aws_start(glue_catalog_has_all_andes_tables=True)
+
+        app1 = AWSApplication("child1", self.region)
+        app1.activate()
+
+        app2 = AWSApplication("child2", self.region)
+        app2.activate()
+
+        from test.intelliflow.core.application.test_aws_application_create_and_query import TestAWSApplicationBuild
+
+        upstream_app = TestAWSApplicationBuild._create_test_application(self, "parent_app")
+        # simplify the test and make upstream internal node copmutes no-operation, we are interested in execution
+        # recursing into the upstream app
+        upstream_app.patch_data("eureka_default_selection_data_over_two_days", compute_targets=[NOOPCompute])
+        upstream_app.patch_data("eureka_default_completed_features", compute_targets=[NOOPCompute])
+        # connect them
+        upstream_app.authorize_downstream("child1", self.account_id, self.region)
+        # grant execution permission to the second app
+        upstream_app.authorize_downstream("child2", self.account_id, self.region, **{DownstreamApplicationPermission.EXECUTE: True})
+        upstream_app.activate()
+        # mark actual external data as completed
+        add_test_data(upstream_app, upstream_app["eureka_training_data"]["NA"]["2024-07-20"], "_SUCCESS", "")
+        add_test_data(upstream_app, upstream_app["eureka_training_data"]["NA"]["2024-07-21"], "_SUCCESS", "")
+        add_test_data(upstream_app, upstream_app["eureka_training_all_data"]["2024-07-20"], "_SUCCESS", "")
+        add_test_data(upstream_app, upstream_app["eureka_training_all_data"]["2024-07-21"], "_SUCCESS", "")
+        self.activate_event_propagation(upstream_app, cycle_time_in_secs=30)
+
+        app1.import_upstream("parent_app", self.account_id, self.region)
+        app2.import_upstream("parent_app", self.account_id, self.region)
+
+        # consume external data
+        app1_ext_data_etl = app1.create_data(
+            "app1_ext_data", inputs=[upstream_app["eureka_training_data"].range_check(True)], compute_targets=[NOOPCompute]
+        )
+
+        app2_ext_data_etl = app2.create_data(
+            "app2_ext_data", inputs=[upstream_app["eureka_training_data"].range_check(True)], compute_targets=[NOOPCompute]
+        )
+
+        # consume upstream internal data that has transitive data dependency in the upstream app
+        app1_data_etl = app1.create_data(
+            "app1_data1", inputs=[upstream_app["eureka_default_completed_features"].range_check(True)], compute_targets=[NOOPCompute]
+        )
+
+        app2_data_etl = app2.create_data(
+            "app2_data1", inputs=[upstream_app["eureka_default_completed_features"].range_check(True)], compute_targets=[NOOPCompute]
+        )
+        app1.activate()
+        app2.activate()
+
+        # external data exists, so this will work
+        app1.execute(app1_ext_data_etl["NA"]["2024-07-20"], recursive=True)
+
+        # show that no matter what the permission is an external data (e.g S3) even in upsteam app cannot be executed.
+        # external partitoin does not exist
+        with pytest.raises(ValueError):
+            app2.execute(app2_ext_data_etl["NA"]["2024-07-19"], recursive=True)
+
+        # without a permission app1 cannot recurse into the parent app
+        with pytest.raises(ValueError):
+            app1.execute(app1_data_etl["NA"]["2024-07-20"], recursive=True)
+
+        # now show that execution permission matters and will let execution recurse into upsteram nodes
+        # use a different date just to make sure so that we can verify.
+        # Note: Due to the lack of cross-app event propagation (from upstream app to app2 here), we cannot use wait=True
+        #  otherwise execute will complain about undetected execution.
+        app2.execute(app2_data_etl["NA"]["2024-07-21"], recursive=True, wait=False)
+
+        # check parent nodes are both backfilled
+        assert app2.poll(app2["eureka_default_completed_features"]["NA"]["2024-07-21"])[0]
+        assert app2.poll(app2["eureka_default_selection_data_over_two_days"]["NA"]["2024-07-21"])[0]
+
+        # other partitions triggered by app1 must be empty
+        assert not app2.poll(app2["eureka_default_completed_features"]["NA"]["2024-07-20"])[0]
+        assert not app2.poll(app2["eureka_default_selection_data_over_two_days"]["NA"]["2024-07-20"])[0]
 
         self.patch_aws_stop()
 

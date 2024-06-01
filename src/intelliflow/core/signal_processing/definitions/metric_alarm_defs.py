@@ -145,12 +145,16 @@ class MetricDimensionValues(CoreData):
     def from_raw_values(cls, dim_values: List[Any]) -> "MetricDimensionValues":
         return MetricDimensionValues(
             dim_values[0],
-            MetricStatistic.from_raw(dim_values[1])
-            if dim_values[1] != AnyVariant.ANY_DIMENSION_VALUE_SPECIAL_CHAR
-            else AnyVariant.ANY_DIMENSION_VALUE_SPECIAL_CHAR,
-            MetricPeriod.from_raw(dim_values[2])
-            if dim_values[2] != AnyVariant.ANY_DIMENSION_VALUE_SPECIAL_CHAR
-            else AnyVariant.ANY_DIMENSION_VALUE_SPECIAL_CHAR,
+            (
+                MetricStatistic.from_raw(dim_values[1])
+                if dim_values[1] != AnyVariant.ANY_DIMENSION_VALUE_SPECIAL_CHAR
+                else AnyVariant.ANY_DIMENSION_VALUE_SPECIAL_CHAR
+            ),
+            (
+                MetricPeriod.from_raw(dim_values[2])
+                if dim_values[2] != AnyVariant.ANY_DIMENSION_VALUE_SPECIAL_CHAR
+                else AnyVariant.ANY_DIMENSION_VALUE_SPECIAL_CHAR
+            ),
             dim_values[3],
         )
 
@@ -240,20 +244,16 @@ class AlarmTreatMissingData(str, Enum):
 
 class AlarmDefaultAction(ABC):
     @abstractmethod
-    def uri(self, alarm_params: Union["AlarmParams", "CompositeAlarmParams"]) -> str:
-        ...
+    def uri(self, alarm_params: Union["AlarmParams", "CompositeAlarmParams"]) -> str: ...
 
     @abstractmethod
-    def __eq__(self, other) -> bool:
-        ...
+    def __eq__(self, other) -> bool: ...
 
     @abstractmethod
-    def __ne__(self, other) -> bool:
-        ...
+    def __ne__(self, other) -> bool: ...
 
     @abstractmethod
-    def __hash__(self) -> int:
-        ...
+    def __hash__(self) -> int: ...
 
 
 class AlarmDefaultActionsMap(CoreData):

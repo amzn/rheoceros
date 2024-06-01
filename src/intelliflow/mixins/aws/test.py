@@ -15,7 +15,7 @@ from unittest.mock import MagicMock
 import boto3
 import pytest
 from dateutil.tz import tzlocal
-from moto import mock_batch_simple  # so as to avoid docket in the background (oterhwise use mock_batch)
+from moto import mock_batch_simple  # so as to avoid docker in the background (otherhwise use mock_batch)
 from moto import (
     mock_applicationautoscaling,
     mock_athena,
@@ -34,6 +34,7 @@ from moto import (
     mock_ses,
     mock_sns,
     mock_sqs,
+    mock_stepfunctions,
     mock_sts,
 )
 
@@ -87,6 +88,7 @@ class AWSTestBase:
         mock_cloudwatch(),
         mock_batch_simple(),
         mock_ec2(),
+        mock_stepfunctions(),
     ]
 
     # COMPENSATE MOTO

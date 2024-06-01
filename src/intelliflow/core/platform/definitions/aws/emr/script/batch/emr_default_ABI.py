@@ -9,6 +9,7 @@ User code gets set as "client" code.
 Then EMR based constructs are supposed to get the final state of this script and send it
 to EMR during job creation.
 """
+
 import base64
 from typing import ClassVar, Optional, Set
 
@@ -18,6 +19,7 @@ from intelliflow.core.platform.definitions.aws.emr.script.batch.common import (
     CLIENT_CODE_BUCKET,
     CLIENT_CODE_PARAM,
     EXECUTION_ID,
+    IGNORED_BUNDLE_MODULES_PARAM,
     INPUT_MAP_PARAM,
     JOB_NAME_PARAM,
     OUTPUT_PARAM,
@@ -35,6 +37,7 @@ class EmrDefaultABIPython:
         OUTPUT_PARAM,
         BOOTSTRAPPER_PLATFORM_KEY_PARAM,
         USER_EXTRA_PARAMS_PARAM,
+        IGNORED_BUNDLE_MODULES_PARAM,
         AWS_REGION,
         WORKING_SET_OBJECT_PARAM,
     }
@@ -80,11 +83,17 @@ from pyspark.sql.functions import *
 from pyspark.sql.types import StructType
 from pyspark.sql.utils import *
 
-def install_if_bundle(working_set_object: str):
+def install_if_bundle(working_set_object: str, ignored_bundle_modules):
     subprocess.run(f"rm -rf /tmp/tmp-intelliflow/".split())
     subprocess.run(f"aws s3 cp {working_set_object} /tmp/".split())
     subprocess.run(f"unzip -qq -o /tmp/{working_set_object.split('/')[-1]} -d /tmp/tmp-intelliflow/".split())
     sys.path.insert(0, '/tmp/tmp-intelliflow/')
+    
+    import importlib
+    for ignored_module in ignored_bundle_modules:
+        subprocess.run(f"rm -rf /tmp/tmp-intelliflow/{ignored_module}".split())
+        if ignored_module in sys.modules:
+            importlib.reload(sys.modules[ignored_module])
 
 def run_emr_bootstrap(job_name,
                       code_bucket,
@@ -231,6 +240,10 @@ def run_emr_bootstrap(job_name,
                                        "Either there is a problem with range_check mechanism or the partition has been deleted "
                                        "after the execution has started.".format(resource_path))
             if not new_df:
+                # append data sub folder if it is defined by the user
+                data_folder = input.get("data_folder", None)
+                if data_folder:
+                    resource_path = resource_path.rstrip("/") + "/" + data_folder
                 # native access via input materialized paths
                 schema_def = input.get("data_schema_def", None)
                 spark_schema_def = create_spark_schema(schema_def) if schema_def else None
@@ -381,7 +394,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     args_list = ['--{JOB_NAME_PARAM}', '--{CLIENT_CODE_BUCKET}', '--{CLIENT_CODE_PARAM}', '--{INPUT_MAP_PARAM}', '--{OUTPUT_PARAM}',
                  '--{BOOTSTRAPPER_PLATFORM_KEY_PARAM}', '--{AWS_REGION}', '--{WORKING_SET_OBJECT_PARAM}', 
-                 '--{USER_EXTRA_PARAMS_PARAM}', '--{EXECUTION_ID}']
+                 '--{USER_EXTRA_PARAMS_PARAM}', '--{IGNORED_BUNDLE_MODULES_PARAM}', '--{EXECUTION_ID}']
     for arg in args_list:
         parser.add_argument(arg)
     args, _ = parser.parse_known_args()
@@ -398,7 +411,8 @@ if __name__ == "__main__":
     epilogue_code = b64.b64decode(epilogue_code_base64_str).decode('utf-8')
     # use base64 for json support in cli
 
-    install_if_bundle(args.{WORKING_SET_OBJECT_PARAM})
+    ignored_bundle_modules = json.loads(args.{IGNORED_BUNDLE_MODULES_PARAM})
+    install_if_bundle(args.{WORKING_SET_OBJECT_PARAM}, ignored_bundle_modules)
     run_emr_bootstrap(args.{JOB_NAME_PARAM},
                       args.{CLIENT_CODE_BUCKET},
                       args.{CLIENT_CODE_PARAM},

@@ -5,8 +5,7 @@ from intelliflow.core.signal_processing.signal import Signal
 
 
 @overload
-def create_incoming_signal(from_signal: Signal, dimension_values: List[Any]) -> Signal:
-    ...
+def create_incoming_signal(from_signal: Signal, dimension_values: List[Any]) -> Signal: ...
 
 
 def create_incoming_signal(from_signal: Signal, materialized_path_or_dimension_values: Union[str, List[Any]]) -> Signal:

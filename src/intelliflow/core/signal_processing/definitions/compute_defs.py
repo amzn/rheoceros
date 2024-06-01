@@ -18,6 +18,8 @@ class Lang(int, Enum):
 
     AWS_BATCH_JOB = 11
 
+    AWS_SFN_STATE_MACHINE = 15
+
 
 @unique
 class ABI(int, Enum):

@@ -6,6 +6,7 @@
    - Context:
 
 """
+
 import copy
 import logging
 from typing import Any, Dict, List, NewType, Optional, Set, Type
@@ -168,15 +169,22 @@ class Context(Serializable["Context"]):
     def add_upstream_app(self, remote_app: RemoteApplication) -> None:
         self._imported_data.add(remote_app)
 
-    def add_downstream_app(self, id: str, conf: Configuration):
-        self._downstream_apps.add(DownstreamApplication(id, conf))
+    def add_downstream_app(self, id: str, conf: Configuration, **params: Dict[str, Any]):
+        self._downstream_apps.add(DownstreamApplication(id, conf, **params))
+
+    def get_downstream_app(self, id: str, conf: Configuration) -> DownstreamApplication:
+        down_app = DownstreamApplication(id, conf)
+        for app in self._downstream_apps:
+            if app == down_app:
+                return app
+        return None
 
     def has_upstream_app(self) -> bool:
         return bool(self._imported_data)
 
     def get_upstream_app(self, context_uuid: str) -> RemoteApplication:
         for remote_app in self._imported_data:
-            if remote_app.uuid == context_uuid:
+            if not remote_app.is_transitive and remote_app.uuid == context_uuid:
                 return remote_app
         return None
 

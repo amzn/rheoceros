@@ -896,7 +896,7 @@ class AWSCloudWatchDiagnostics(AWSConstructMixin, Diagnostics):
             OKActions=[self._topic_arn] + [action.uri(alarm_params) for action in alarm_params.default_actions.OK_ACTIONS],
             AlarmActions=[self._topic_arn] + [action.uri(alarm_params) for action in alarm_params.default_actions.ALARM_ACTIONS],
             InsufficientDataActions=[self._topic_arn]
-            + [action.uri(alarm_params) for action in alarm_params.default_actions.INSUFFICIENT_DATA_ACTIONS]
+            + [action.uri(alarm_params) for action in alarm_params.default_actions.INSUFFICIENT_DATA_ACTIONS],
             # TODO Pass this if alarm is new
             # , Tags=[
             #    {

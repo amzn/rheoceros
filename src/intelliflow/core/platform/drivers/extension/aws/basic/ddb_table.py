@@ -274,7 +274,7 @@ class AWSDDBTableExtension(AWSConstructMixin, Extension):
             "ProvisionedReadCapacityUnits": ["*"],
             "TransactionConflict": ["*"],
             "ReadThrottleEvents": ["*"],
-            "WriteThrottleEvents": ["*"]
+            "WriteThrottleEvents": ["*"],
             # TODO enable when default CW dashboard max widget limit issue is handled
             # "ConditionalCheckFailedRequests": []
         }

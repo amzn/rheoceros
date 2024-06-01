@@ -27,7 +27,7 @@ class MarshalerNode(Node, SignalProvider):
     def __init__(
         self,
         bound: Node,
-        desc: str
+        desc: str,
         # TODO extended marshaling support
     ) -> None:
         if bound is None:

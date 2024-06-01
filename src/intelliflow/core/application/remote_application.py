@@ -3,7 +3,8 @@
 
 import copy
 import logging
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Type, Union, cast
+from enum import Enum
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Type, Union, cast
 
 from intelliflow.core.application.context.node.base import DataNode, Node
 from intelliflow.core.application.context.node.marshaling.nodes import MarshalerNode
@@ -49,6 +50,12 @@ class RemoteApplication(Serializable["RemoteApplication"]):
         Only the direct ancestors, one level only as can be observed in Context::_deserialized_init
         where we load remote apps of an application if it is the host/client application."""
         return not self._remote_app
+
+    def is_executable_in(self, host_platform: HostPlatform) -> bool:
+        if not self.is_transitive:
+            host_as_downstream = self._remote_app.active_context.get_downstream_app(host_platform.context_id, host_platform.conf)
+            return host_as_downstream and host_as_downstream.can_execute()
+        return False
 
     def _create_app(self, host_platform: HostPlatform) -> "Application":
         new_conf = copy.deepcopy(self._conf)
@@ -170,6 +177,10 @@ class RemoteApplication(Serializable["RemoteApplication"]):
         raise ValueError(f"Cannot find any existing node with ID '{entity_id}' within the remote application '{self._id}'")
 
 
+class DownstreamApplicationPermission(str, Enum):
+    EXECUTE = "execute"
+
+
 class DownstreamApplication(CoreData):
     """Class that has the minimum state [only ID and platform info] of a remote application.
 
@@ -177,9 +188,10 @@ class DownstreamApplication(CoreData):
     instantiation/loading of the target application might not be possible.
     """
 
-    def __init__(self, id: str, conf: Configuration) -> None:
+    def __init__(self, id: str, conf: Configuration, **params: Dict[str, Any]) -> None:
         self.id = id
         self.conf = conf
+        self.params = dict(params)
 
     def __eq__(self, other: "DownstreamApplication") -> bool:
         return (
@@ -190,3 +202,9 @@ class DownstreamApplication(CoreData):
 
     def __hash__(self) -> int:
         return hash(self.id)
+
+    def get_params(self) -> Dict[str, Any]:
+        return getattr(self, "params", dict())
+
+    def can_execute(self) -> bool:
+        return self.get_params().get(DownstreamApplicationPermission.EXECUTE, False)

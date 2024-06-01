@@ -6,6 +6,7 @@
 This *can* be provided to EMR for further client code convenience. But this should not be
 mandatory.
 """
+
 from typing import Set
 
 JOB_NAME_PARAM: str = "JOB_NAME"
@@ -17,6 +18,7 @@ CLIENT_CODE_ABI: str = "CLIENT_CODE_ABI"
 OUTPUT_PARAM: str = "OUTPUT"
 BOOTSTRAPPER_PLATFORM_KEY_PARAM: str = "BOOTSTRAPPER_PATH"
 USER_EXTRA_PARAMS_PARAM: str = "USER_EXTRA_PARAM"
+IGNORED_BUNDLE_MODULES_PARAM: str = "IGNORED_BUNDLE_MODULES"
 AWS_REGION: str = "AWS_REGION"
 WORKING_SET_OBJECT_PARAM: str = "WORKING_SET_OBJECT"
 EXECUTION_ID: str = "EXECUTION_ID"

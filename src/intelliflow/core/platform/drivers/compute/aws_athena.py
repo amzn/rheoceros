@@ -3,6 +3,7 @@
 
 """AWS Athena driver that provide big-data workload execution abstraction to a Processor.
 """
+
 import json
 import logging
 import uuid
@@ -1475,6 +1476,36 @@ class AWSAthenaBatchCompute(AWSConstructMixin, BatchCompute):
                 execution_details["details"][
                     "QueryEditorURL"
                 ] = f"https://{self.region}.console.aws.amazon.com/athena/home?region={self.region}#/query-editor/history/{query_execution_id}"
+            elif "GlueVersion" in final_execution_details:
+                # prologue job (in Glue)
+                details = dict()
+                details["JobId"] = final_execution_details.get("Id", None)
+                details["JobName"] = final_execution_details.get("JobName", None)
+                details["JobURL"] = (
+                    f"https://{self.region}.console.aws.amazon.com/gluestudio/home?region={self.region}#/editor/job/{details['JobName']}/details"
+                )
+                details["JobRunURL"] = (
+                    f"https://{self.region}.console.aws.amazon.com/gluestudio/home?region={self.region}#/job/{details['JobName']}/run/{details['JobId']}"
+                )
+                details["JobLogURL"] = (
+                    f"https://{self.region}.console.aws.amazon.com/cloudwatch/home?region={self.region}#logsV2:log-groups/log-group/$252Faws-glue$252Fjobs$252Foutput/log-events/{details['JobId']}"
+                )
+                details["StartedOn"] = final_execution_details.get("StartedOn", None)
+                details["CompletedOn"] = final_execution_details.get("CompletedOn", None)
+                details["JobRunState"] = final_execution_details.get("JobRunState", None)
+                details["Attempt"] = final_execution_details.get("Attempt", None)
+                details["ExecutionTime"] = final_execution_details.get("ExecutionTime", None)
+                details["WorkerType"] = final_execution_details.get("WorkerType", None)
+                details["NumberOfWorkers"] = final_execution_details.get("NumberOfWorkers", None)
+                details["GlueVersion"] = final_execution_details.get("GlueVersion", None)
+
+                job_run_state = final_execution_details.get("JobRunState", None)
+                # Adding error message if the JobRun FAILED OR TIMEDOUT
+                if job_run_state == "FAILED" or job_run_state == "TIMEOUT":
+                    details["ErrorMessage"] = final_execution_details.get("ErrorMessage", None)
+                    details["Timeout"] = final_execution_details.get("Timeout", None)
+
+                execution_details.update({"details": details})
 
         # Extract SLOT info
         if active_compute_record.slot:

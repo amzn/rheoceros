@@ -173,9 +173,11 @@ class InternalDataNode(DataNode):
                 on_compute_retry=self._check_hook_type(execution_hook.on_compute_retry),
                 on_success=self._check_hook_type(execution_hook.on_success),
                 on_failure=self._check_hook_type(execution_hook.on_failure),
-                checkpoints=[RouteCheckpoint(c.checkpoint_in_secs, self._check_hook_type(c.slot)) for c in execution_hook.checkpoints]
-                if execution_hook.checkpoints
-                else execution_hook.checkpoints,
+                checkpoints=(
+                    [RouteCheckpoint(c.checkpoint_in_secs, self._check_hook_type(c.slot)) for c in execution_hook.checkpoints]
+                    if execution_hook.checkpoints
+                    else execution_hook.checkpoints
+                ),
             )
 
     def _check_pending_node_callables(self, pending_node_hook: Optional[RoutePendingNodeHook]) -> Optional[RoutePendingNodeHook]:
@@ -190,9 +192,11 @@ class InternalDataNode(DataNode):
             return RoutePendingNodeHook(
                 on_pending_node_created=self._check_hook_type(pending_node_hook.on_pending_node_created),
                 on_expiration=self._check_hook_type(pending_node_hook.on_expiration),
-                checkpoints=[RouteCheckpoint(c.checkpoint_in_secs, self._check_hook_type(c.slot)) for c in pending_node_hook.checkpoints]
-                if pending_node_hook.checkpoints
-                else pending_node_hook.checkpoints,
+                checkpoints=(
+                    [RouteCheckpoint(c.checkpoint_in_secs, self._check_hook_type(c.slot)) for c in pending_node_hook.checkpoints]
+                    if pending_node_hook.checkpoints
+                    else pending_node_hook.checkpoints
+                ),
             )
 
     @property

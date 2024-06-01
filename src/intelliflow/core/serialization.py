@@ -102,8 +102,7 @@ _SERIALIZED_DICT_KEY = "_intelliflow_dict_key"
 
 class JSONSerializable(ABC, Generic[_Serialized]):
     @abstractmethod
-    def serializable_copy(self) -> _Serialized:
-        ...
+    def serializable_copy(self) -> _Serialized: ...
 
     def _serializable_full_class_name(self) -> str:
         klass = self.__class__

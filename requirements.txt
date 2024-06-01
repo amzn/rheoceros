@@ -24,7 +24,7 @@
 
 boto3~=1.26.57
 botocore~=1.29.58
-setuptools~=65.5.1
+setuptools>=70.0.0
 python-dateutil~=2.8.2
 dill~=0.3.4
 packaging~=21.3

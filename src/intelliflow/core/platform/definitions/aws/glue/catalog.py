@@ -50,6 +50,7 @@ def _map_column_type(col_type: str) -> Type:
         or type.startswith("bigint")
         or type.startswith("int")
         or type.startswith("tinyint")
+        or type.startswith("smallint")
         or type.startswith("long")
     ):
         return Type.LONG
@@ -97,6 +98,7 @@ def get_data_format(output_format: str, serde: str) -> Optional[DatasetSignalSou
 
 
 def create_signal(glue_client, database_name: str, table_name: str) -> Optional[GlueTableDesc]:
+    is_andes: bool = False
     try:
         table = exponential_retry(
             glue_client.get_table,
@@ -163,9 +165,28 @@ def create_signal(glue_client, database_name: str, table_name: str) -> Optional[
             **params,
         )
 
-    partitions = exponential_retry(
-        glue_client.get_partitions, CATALOG_COMMON_RETRYABLE_ERRORS, DatabaseName=database_name, TableName=table_name, MaxResults=1
-    )
+    try:
+        partitions = exponential_retry(
+            glue_client.get_partitions, CATALOG_COMMON_RETRYABLE_ERRORS, DatabaseName=database_name, TableName=table_name, MaxResults=1
+        )
+    except ClientError as ex:
+        if ex.response["Error"]["Code"] == "EntityNotFoundException":
+            try:
+                partitions = exponential_retry(
+                    glue_client.get_partitions,
+                    CATALOG_COMMON_RETRYABLE_ERRORS,
+                    DatabaseName="andes",
+                    TableName=f"{database_name}.{table_name}",
+                    MaxResults=1,
+                )
+            except ClientError as ex2:
+                if ex2.response["Error"]["Code"] != "FederationSourceException":
+                    raise
+                access_spec.data_partitions_accessible = False
+                partitions = None
+        else:
+            raise
+
     if not partitions or "Partitions" not in partitions or not partitions["Partitions"]:
         logger.critical(f"There no partitions in Glue catalog for table: {table_name} in DB: {database_name}!")
     else:

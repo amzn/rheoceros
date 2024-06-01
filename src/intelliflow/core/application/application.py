@@ -1397,16 +1397,23 @@ class Application(CoreApplication):
                 lambda link: SignalDimensionLink(
                     SignalDimensionTuple(None, Dimension(link[0], None)) if not isinstance(link[0], SignalDimensionTuple) else link[0],
                     link[1] if link[1] else DIMENSION_VARIANT_IDENTICAL_MAP_FUNC,
-                    self._check_upstream(link[2]) if isinstance(link[2], SignalDimensionTuple)
-                    # literal value assignment, use the same dimension:name to create a variant/value
-                    else SignalDimensionTuple(None, DimensionVariantFactory.create_variant(link[2], {Dimension.NAME_FIELD_ID: link[0]}))
-                    # when link[0] is not str (<OutputDimensionNameType>), then it is output -> input link assignment,
-                    # so on the right hand side either one output dimension or a tuple of output dimensions:
-                    #   Union[OutputDimensionNameType, Tuple[OutputDimensionNameType]]
-                    if isinstance(link[0], OutputDimensionNameType)
-                    else SignalDimensionTuple(None, *link[2])
-                    if isinstance(link[2], (tuple, list))
-                    else SignalDimensionTuple(None, link[2]),
+                    (
+                        self._check_upstream(link[2])
+                        if isinstance(link[2], SignalDimensionTuple)
+                        # literal value assignment, use the same dimension:name to create a variant/value
+                        else (
+                            SignalDimensionTuple(None, DimensionVariantFactory.create_variant(link[2], {Dimension.NAME_FIELD_ID: link[0]}))
+                            # when link[0] is not str (<OutputDimensionNameType>), then it is output -> input link assignment,
+                            # so on the right hand side either one output dimension or a tuple of output dimensions:
+                            #   Union[OutputDimensionNameType, Tuple[OutputDimensionNameType]]
+                            if isinstance(link[0], OutputDimensionNameType)
+                            else (
+                                SignalDimensionTuple(None, *link[2])
+                                if isinstance(link[2], (tuple, list))
+                                else SignalDimensionTuple(None, link[2])
+                            )
+                        )
+                    ),
                 ),
                 output_dim_links,
             )
@@ -1649,7 +1656,7 @@ class Application(CoreApplication):
         auto_input_dim_linking_enabled: bool = True,
         auto_output_dim_linking_enabled: bool = True,
         auto_backfilling_enabled: bool = False,
-        protocol: SignalIntegrityProtocol = InternalDataNode.DEFAULT_DATA_COMPLETION_PROTOCOL,
+        protocol: SignalIntegrityProtocol = None,
         enforce_referential_integrity=False,
         **kwargs,
     ) -> MarshalerNode:
@@ -1922,9 +1929,9 @@ class Application(CoreApplication):
                             )[0]
                             if not sub_response.deferred_signals:
                                 # transfer the new execution context to the original response to be returned to the caller
-                                execution_contexts: Optional[
-                                    Dict["Route.ExecutionContext", List["RoutingTable.ComputeRecord"]]
-                                ] = sub_response.get_execution_contexts(route.route_id)
+                                execution_contexts: Optional[Dict["Route.ExecutionContext", List["RoutingTable.ComputeRecord"]]] = (
+                                    sub_response.get_execution_contexts(route.route_id)
+                                )
                                 if execution_contexts is not None:
                                     if response.get_execution_contexts(route) is None:
                                         response.add_route(route)
@@ -2441,19 +2448,36 @@ class Application(CoreApplication):
                     # probabyly a preceding ready_signal was the reason for the False result from is_ready in the previous
                     # iteration.
                     continue
-                if ready_signal.nearest_the_tip_in_range:
+                # support upstream executions if allowed
+                upstream_executable_input = False
+                mapped_signal = ready_signal
+                execution_app = self
+                executable_parent_app: "Application" = self._get_executable_upstream_app_for(ready_signal)
+                if executable_parent_app:
+                    # we have to map the input back to its application's domain
+                    # (INTERNAL -> (child app consumes as) EXTERNAL -> INTERNAL)
+                    mapped_upstream_signal = executable_parent_app.platform.storage.map_materialized_signal(ready_signal)
+                    if mapped_upstream_signal and mapped_upstream_signal.resource_access_spec.source == SignalSourceType.INTERNAL:
+                        mapped_signal = mapped_upstream_signal
+                        execution_app = executable_parent_app
+                        # for execute to work as it picks up _dev_context normally
+                        execution_app._dev_context = execution_app._active_context
+                        input_node = execution_app.get_data(mapped_signal.resource_access_spec.data_id)[0]
+                        upstream_executable_input = True
+                #
+                if mapped_signal.nearest_the_tip_in_range:
                     # check completion condition for nearest check is not True. if any of the completed paths are done, then
                     # range-check for this signal is ready.
                     if not (analysis_result and analysis_result.completed_paths):
                         # this is enough for us to confidently say it is not ready for 'nearest_the_tip_in_range = True' case.
-                        if not self._is_executable(ready_signal):
+                        if not execution_app._is_executable(mapped_signal):
                             raise ValueError(
                                 f"Recursive execution on {internal_data_node.data_id!r} cannot proceed due to missing data on external "
                                 f"input {ready_signal.alias!r}! At least one path from the following list "
                                 f"should be available: {analysis_result.remaining_paths}"
                             )
                         input_view = input_node
-                        partitions = ready_signal.resource_access_spec.get_dimensions(ready_signal.domain_spec.dimension_filter_spec)
+                        partitions = mapped_signal.resource_access_spec.get_dimensions(mapped_signal.domain_spec.dimension_filter_spec)
                         # e.g [['NA', '2021-06-21'], ['NA', '2021-06-22']]
                         if partitions:
                             # special use-case for 'nearest_the_tip_in_range' just attempt to execute the TIP
@@ -2461,11 +2485,11 @@ class Application(CoreApplication):
                             # input_node -> input_node['NA']['2021-06-21']
                             for dim_value in partition:
                                 input_view = input_view[dim_value]
-                        self.execute(
+                        execution_app.execute(
                             target=input_view,
                             wait=wait,
                             recursive=True,
-                            integrity_check=integrity_check,
+                            integrity_check=integrity_check if not upstream_executable_input else False,
                             _active_dependency_tree=parents_to_be_ignored,
                         )
                         # only add TIPs (represented by input signals), so in this case it is the TIP by default
@@ -2473,18 +2497,19 @@ class Application(CoreApplication):
                 else:
                     if analysis_result.remaining_paths:
                         # not ready
-                        if not self._is_executable(ready_signal):
+                        if not execution_app._is_executable(mapped_signal):
                             # since we force range_check = True above to reuse dependency check from within RuntimeLinkNode,
                             # now we need to get the original ref to see if it is actually required before erroring out
                             org_non_executable_signal = [
-                                s for s in internal_data_node.signal_link_node._signals if s.alias == ready_signal.alias
+                                s for s in internal_data_node.signal_link_node._signals if s.alias == mapped_signal.alias
                             ][0]
                             # raise only when:
                             # - user explicitly wants the range check
                             # - or the input signal/event is required (which is basically / implicitly a range check on the TIP)
                             if org_non_executable_signal.range_check_required or (
                                 not org_non_executable_signal.is_reference
-                                and not self._is_projection(org_non_executable_signal)
+                                and not execution_app._is_projection(mapped_signal)
+                                # use ready_signal. mapped_signal might be mapped from the parent app
                                 and ready_signal.get_materialized_resource_paths()[0] in analysis_result.remaining_paths
                             ):
                                 raise ValueError(
@@ -2495,6 +2520,7 @@ class Application(CoreApplication):
                             continue
 
                         need_to_enforce_wait = False
+                        # use ready_signal. mapped_signal might be mapped from the parent app
                         if ready_signal.get_materialized_resource_paths()[0] in analysis_result.remaining_paths:
                             # TIP is missing, add it to executed_input_indexes if so. we do it to avoid caller execution
                             # context (dependent/child node) calling 'process' on this input.
@@ -2511,15 +2537,18 @@ class Application(CoreApplication):
 
                         for path in analysis_result.remaining_paths:
                             # e.g ['NA', 1, '2021-06-21']
-                            dimension_values = ready_signal.extract_dimensions(path)
+                            dimension_values = ready_signal.extract_dimensions(
+                                path
+                            )  # cannot use mapped_signal (might be mapped from parent)
 
                             input_view = input_node
                             # input_node -> input_node['NA'][1]['2021-06-21']
                             for dim_value in dimension_values:
                                 input_view = input_view[dim_value]
-                            self.execute(
+                            execution_app.execute(
                                 target=input_view,
                                 wait=need_to_enforce_wait or wait,
+                                integrity_check=integrity_check if not upstream_executable_input else False,
                                 recursive=True,
                                 _active_dependency_tree=parents_to_be_ignored,
                             )
@@ -2770,7 +2799,7 @@ class Application(CoreApplication):
         """
         batch_executor_pool = None
         if len(targets) > 1:
-            batch_executor_pool = concurrent.futures.ThreadPoolExecutor(max_workers=len(targets))
+            batch_executor_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2 * len(targets))
 
         executors = []
         for target in targets:
@@ -3277,9 +3306,9 @@ class Application(CoreApplication):
                     retry_if_deferred=True,
                     is_blocked=is_blocked,
                 )[0]
-                execution_contexts: Optional[
-                    Dict["Route.ExecutionContext", List["RoutingTable.ComputeRecord"]]
-                ] = response.get_execution_contexts(internal_data_node.route_id)
+                execution_contexts: Optional[Dict["Route.ExecutionContext", List["RoutingTable.ComputeRecord"]]] = (
+                    response.get_execution_contexts(internal_data_node.route_id)
+                )
                 if not input_signals[i].is_reference and execution_contexts is None:
                     # this should not happen after all those RuntimeLinkNode based checks (internal error),
                     # unless the input is a reference which might not yield a response from routing.
@@ -3785,9 +3814,9 @@ class Application(CoreApplication):
         self._dev_context.add_upstream_app(remote_app)
         return remote_app
 
-    def export_to_downstream_application(self, id: ApplicationID, conf: Configuration):
+    def export_to_downstream_application(self, id: ApplicationID, conf: Configuration, **params: Dict[str, Any]):
         conf.set_downstream(self._platform.conf, id)
-        self._dev_context.add_downstream_app(id, conf)
+        self._dev_context.add_downstream_app(id, conf, **params)
 
     def get_upstream_applications(
         self, id: ApplicationID, conf: Configuration, search_context: QueryContext = QueryContext.ACTIVE_RUNTIME_CONTEXT
@@ -3823,6 +3852,17 @@ class Application(CoreApplication):
                 remote_app = self._active_context.get_upstream_app(owner_context_uuid)
                 platform = remote_app.platform if remote_app else None
         return platform
+
+    def _get_executable_upstream_app_for(self, signal: Signal) -> Optional["Application"]:
+        input_owner_context_uuid = signal.resource_access_spec.get_owner_context_uuid()
+        if input_owner_context_uuid != self.uuid:
+            # signal is from an upstream app
+            parent_app = self._dev_context.get_upstream_app(input_owner_context_uuid)
+            if not parent_app:
+                parent_app = self._active_context.get_upstream_app(input_owner_context_uuid)
+            if parent_app and parent_app.is_executable_in(self.platform):
+                return parent_app.remote_app
+        return None
 
     def admin_console(self):
         from intelliflow_visualization import EnvironmentInjectionMiddleware, app
