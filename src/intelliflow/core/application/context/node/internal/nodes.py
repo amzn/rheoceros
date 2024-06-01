@@ -33,7 +33,6 @@ MonitoringConfig = Dict[str, Any]
 
 
 class InternalDataNode(DataNode):
-
     DEFAULT_DATA_COMPLETION_PROTOCOL: ClassVar[SignalIntegrityProtocol] = SignalIntegrityProtocol("MANIFEST_CHECK", {"file": "_SUCCESS"})
 
     MAX_RETRY_COUNT: ClassVar[int] = 100

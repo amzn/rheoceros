@@ -74,7 +74,15 @@ class TestAWSApplicationExecutionControl(AWSTestBase):
             inputs={
                 "DEXML_DUCSI": ducsi_data,
             },
-            compute_targets="output=DEXML_DUCSI.limit(100)",
+            compute_targets=[
+                Glue(
+                    code="output=DEXML_DUCSI.limit(100)",
+                    GlueVersion="4.0",
+                )
+            ],
+            output_dimension_spec={
+                "region_id": {"type": DimensionType.LONG, "ship_day": {"type": DimensionType.DATETIME, "format": "%Y-%m-%d"}}
+            },
         )
 
         app.create_data(
@@ -85,9 +93,12 @@ class TestAWSApplicationExecutionControl(AWSTestBase):
                     "output=DEXML_DUCSI.sample(True, 0.0000001).join(SHIP_OPTIONS.select('ship_option'), DEXML_DUCSI.customer_ship_option == SHIP_OPTIONS.ship_option).limit(10)",
                     WorkerType=GlueWorkerType.G_1X.value,
                     NumberOfWorkers=70,
-                    GlueVersion="1.0",
+                    GlueVersion="4.0",
                 )
             ],
+            output_dimension_spec={
+                "region_id": {"type": DimensionType.LONG, "ship_day": {"type": DimensionType.DATETIME, "format": "%Y-%m-%d"}}
+            },
         )
 
         # SERIALIZATION: inject serialize/deserialize sequence for enhanced serialization coverage
@@ -180,14 +191,14 @@ class TestAWSApplicationExecutionControl(AWSTestBase):
         repeat_ducsi = app.get_data("REPEAT_DUCSI", context=Application.QueryContext.DEV_CONTEXT)[0]
         materialized_paths = app.materialize(repeat_ducsi[2]["2020-01-08"])
         assert len(materialized_paths) == 1
-        assert materialized_paths[0].endswith("internal_data/REPEAT_DUCSI/2/2020-01-08 00:00:00")
+        assert materialized_paths[0].endswith("internal_data/REPEAT_DUCSI/2/2020-01-08")
 
         ducsi_with_so = app.get_data("DUCSI_WITH_SO", context=Application.QueryContext.DEV_CONTEXT)[0]
         # ducsi_with_so has an outfilter with relative range, let's see the behaviour when the input is material already,
         # it should return the TIP
         materialized_paths = app.materialize(ducsi_with_so[2]["2020-01-08"])
         assert len(materialized_paths) == 1
-        assert materialized_paths[0].endswith("internal_data/DUCSI_WITH_SO/2/2020-01-08 00:00:00")
+        assert materialized_paths[0].endswith("internal_data/DUCSI_WITH_SO/2/2020-01-08")
 
         self.patch_aws_stop()
 
@@ -203,6 +214,7 @@ class TestAWSApplicationExecutionControl(AWSTestBase):
 
         # activate and process (in SYNC mode) using 'repeat_ducsi'
         app.activate()
+
         # mock batch_compute response
         def compute(
             route: Route,
@@ -236,6 +248,7 @@ class TestAWSApplicationExecutionControl(AWSTestBase):
         # 'ship_options'. Previous process call with ducsi has created a pending node in it as well. a signal for
         # 'ship_options' will complete that pending node and cause a trigger.
         ship_options = app.get_data("ship_options", context=Application.QueryContext.DEV_CONTEXT)[0]
+
         # mock again
         def compute(
             route: Route,
@@ -386,6 +399,7 @@ class TestAWSApplicationExecutionControl(AWSTestBase):
 
         ducsi = app["DEXML_DUCSI"]
         repeat_ducsi = app["REPEAT_DUCSI"]
+
         # mock batch_compute APIs to make the route active.
         def compute(
             route: Route,
@@ -426,14 +440,14 @@ class TestAWSApplicationExecutionControl(AWSTestBase):
         processor_thread.start()
 
         materialized_path, _ = app.poll(repeat_ducsi[1]["2020-12-25"])
-        assert materialized_path.endswith("internal_data/REPEAT_DUCSI/1/2020-12-25 00:00:00")
+        assert materialized_path.endswith("internal_data/REPEAT_DUCSI/1/2020-12-25")
         # now the system should be back in idle mode
         assert len(app.get_active_routes()) == 0
 
         # poll again, this time will check the inactive records since there is no active execution
         # and return the same result (from the most recent execution above).
         materialized_path, _ = app.poll(repeat_ducsi[1]["2020-12-25"])
-        assert materialized_path.endswith("internal_data/REPEAT_DUCSI/1/2020-12-25 00:00:00")
+        assert materialized_path.endswith("internal_data/REPEAT_DUCSI/1/2020-12-25")
 
         # now let's check the scenario where poll catches up with the most recent execution and returns None
         # despite the result of the previous successful execution from above.
@@ -732,8 +746,8 @@ class TestAWSApplicationExecutionControl(AWSTestBase):
         app.platform.batch_compute.get_session_state = MagicMock(side_effect=get_session_state)
 
         output_path = app.execute(target[1]["2020-12-28"])
-        # s3://if-andes_downstream-123456789012-us-east-1/internal_data/REPEAT_DUCSI/1/2020-12-28 00:00:00
-        assert output_path.endswith("internal_data/REPEAT_DUCSI/1/2020-12-28 00:00:00")
+        # s3://if-andes_downstream-123456789012-us-east-1/internal_data/REPEAT_DUCSI/1/2020-12-28
+        assert output_path.endswith("internal_data/REPEAT_DUCSI/1/2020-12-28")
 
         self.patch_aws_stop()
 
@@ -808,8 +822,8 @@ class TestAWSApplicationExecutionControl(AWSTestBase):
         # and now a successful run 'DUCSI_WITH_SO'
         ducsi_with_so = app["DUCSI_WITH_SO"]
         output_path = app.execute(ducsi_with_so, [ducsi_data[1]["2020-06-21"], ship_options])
-        # s3://if-andes_downstream-123456789012-us-east-1/internal_data/DUCSI_WITH_SO/1/2020-06-21 00:00:00
-        assert output_path.endswith("internal_data/DUCSI_WITH_SO/1/2020-06-21 00:00:00")
+        # s3://if-andes_downstream-123456789012-us-east-1/internal_data/DUCSI_WITH_SO/1/2020-06-21
+        assert output_path.endswith("internal_data/DUCSI_WITH_SO/1/2020-06-21")
 
         self.patch_aws_stop()
 

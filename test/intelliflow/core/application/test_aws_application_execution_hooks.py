@@ -194,6 +194,7 @@ class TestAWSApplicationExecutionHooks(AWSTestBase):
         # 'ship_options'. Previous process call with ducsi has created a pending node in it as well. a signal for
         # 'ship_options' will complete that pending node and cause a trigger.
         ship_options = app.get_data("ship_options", context=Application.QueryContext.DEV_CONTEXT)[0]
+
         # mock again
         def compute(
             route: Route,
@@ -319,7 +320,12 @@ class TestAWSApplicationExecutionHooks(AWSTestBase):
         self._test_all_application_hooks(lambda: GenericRoutingHookImpl())
 
     def test_all_application_hooks_with_EMAIL(self):
-        email_obj = EMAIL(sender="if-test-list@amazon.com", recipient_list=["yunusko@amazon.com"])
+        email_obj = EMAIL(
+            sender="if-test-list@amazon.com",
+            recipient_list=["yunusko@amazon.com"],
+            body="first input path URI: ${input0}, output path: ${output}, region: ${region_id}, date: ${ship_day}",
+            subject="first input path URI: ${input0}, output path: ${output}, region: ${region_id}, date: ${ship_day}",
+        )
 
         action = email_obj.action()
         assert action.describe_slot()["sender"]
@@ -329,7 +335,7 @@ class TestAWSApplicationExecutionHooks(AWSTestBase):
         secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:secret-name-abcd"
         slack_obj = Slack(
             recipient_list=["https://hooks.slack.com/workflows/1/", secret_arn],
-            message="test message",
+            message="test message. first input path URI: ${input0}, output path: ${output}, region: ${region_id}, date: ${ship_day}",
         )
         slack_action = slack_obj.action()
         assert slack_action.describe_slot()["message"]
@@ -339,6 +345,11 @@ class TestAWSApplicationExecutionHooks(AWSTestBase):
 
         slack_action._create_url = _create_url_from_aws_secret
         self._test_all_application_hooks(lambda: GenericComputeDescriptorHookVerifier(slack_action))
+
+        assert len(slack_action.permissions) == 2
+        assert slack_action.permissions[0].action[0] == slack_action.AWS_GET_SECRET_VALUE_ACTION
+        assert slack_action.permissions[1].action[0] == "kms:Encrypt"
+        assert slack_action.permissions[1].resource[0].startswith("arn:aws:kms")
 
     def test_application_hooks_generate_right_permissions(self):
         """Test system provided compute targets' compatibility and runtime permission contribution as hooks"""
@@ -386,16 +397,19 @@ class TestAWSApplicationExecutionHooks(AWSTestBase):
         self.app = AWSApplication(app_name="hook-ser-err", region=self.region)
 
         class A:
+            def __init__(self):
+                import boto3
+
+                # will cause SerializationError
+                self._session = boto3.client("s3")
+
             def __call__(self, *args, **kwargs):
                 pass
 
-        class B:
-            pass
+        # will cause SerializationError
+        A.__name__ = "C"
 
-        # will cause SerializatrionError
-        A.__name__ = "B"
-
-        with pytest.raises(ValueError):
+        with pytest.raises((ValueError, TypeError)):
             self.app.create_data(
                 id="dummy_node_SIM_as_exec_hook",
                 compute_targets=[NOOPCompute],

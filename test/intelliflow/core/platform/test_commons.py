@@ -10,7 +10,7 @@ import pytest
 from moto import (
     mock_applicationautoscaling,
     mock_autoscaling,
-    mock_dynamodb2,
+    mock_dynamodb,
     mock_events,
     mock_glue,
     mock_iam,

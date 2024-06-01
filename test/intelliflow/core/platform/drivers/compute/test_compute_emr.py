@@ -260,6 +260,30 @@ class TestAWSEMRBatchCompute(AWSTestBase, DriverTestUtils):
         assert error.typename == "ValueError"
         self.patch_aws_stop()
 
+    def test_compute_provide_output_attributes_emr(self):
+        self.patch_aws_start()
+        self.setup_platform_and_params()
+        mock_compute, mock_host_platform = self.get_driver_and_platform()
+        input_signal, test_slot, materialized_output = self.get_signals_slots()
+        mock_compute.provide_output_attributes([input_signal], test_slot, dict())
+
+        test_slot.extra_params.update({"partition_by": "boot me"})
+        with pytest.raises(ValueError):
+            mock_compute.provide_output_attributes([input_signal], test_slot, dict())
+
+        test_slot.extra_params.update({"partition_by": [1, 2]})
+        with pytest.raises(ValueError):
+            mock_compute.provide_output_attributes([input_signal], test_slot, dict())
+
+        test_slot.extra_params.update({"partition_by": '["col1", "col2"]'})
+        with pytest.raises(ValueError):
+            mock_compute.provide_output_attributes([input_signal], test_slot, dict())
+
+        test_slot.extra_params.update({"partition_by": ["col1", "col2"]})
+        mock_compute.provide_output_attributes([input_signal], test_slot, dict())
+
+        self.patch_aws_stop()
+
     def test_compute_activate_successful_emr(self):
         self.patch_aws_start()
         self.setup_platform_and_params()
@@ -269,6 +293,32 @@ class TestAWSEMRBatchCompute(AWSTestBase, DriverTestUtils):
         mock_compute.activate()
         s3 = boto3.resource("s3")
         assert bucket_exists(s3, mock_compute._bucket_name)
+        self.patch_aws_stop()
+
+    def test_compute_provide_runtime_default_policies(self):
+        self.patch_aws_start()
+        self.setup_platform_and_params()
+        mock_compute, mock_host_platform = self.get_driver_and_platform()
+        mock_host_platform._context_id = "test123_e_2_1"
+        mock_compute.dev_init(mock_host_platform)
+
+        managed_policies_before = mock_compute.provide_runtime_default_policies()
+
+        # mock IAM managed policy check to return True (exists) for any policy
+        import intelliflow.core.platform.drivers.compute.aws_emr as emr_compute_driver
+
+        _real_iam_func = emr_compute_driver.has_aws_managed_policy
+
+        def has_aws_managed_policy(*args, **kwargs):
+            return True
+
+        emr_compute_driver.has_aws_managed_policy = MagicMock(side_effect=has_aws_managed_policy)
+
+        managed_policies_after = mock_compute.provide_runtime_default_policies()
+
+        assert len(managed_policies_after) - len(managed_policies_before) > 0
+
+        emr_compute_driver.has_aws_managed_policy = _real_iam_func
         self.patch_aws_stop()
 
     def test_compute_get_session_state_successful_emr(self):
@@ -333,6 +383,8 @@ class TestAWSEMRBatchCompute(AWSTestBase, DriverTestUtils):
         )
 
         assert mock_compute._translate_runtime_config({"GlueVersion": "2.0"}, []) == compute_driver.RuntimeConfig.GlueVersion_2_0
+
+        assert mock_compute._translate_runtime_config({"GlueVersion": "4.0"}, []) == compute_driver.RuntimeConfig.GlueVersion_4_0
 
         self.patch_aws_stop()
 

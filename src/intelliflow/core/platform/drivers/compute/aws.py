@@ -10,7 +10,6 @@ the internal details
 """
 import json
 import logging
-import time
 import uuid
 from typing import Any, ClassVar, Dict, List, Optional, Set, Tuple, Type, cast
 
@@ -122,14 +121,14 @@ class AWSGlueBatchComputeBasic(AWSConstructMixin, BatchCompute):
     GLUE_JOB_NAME_FORMAT: ClassVar[str] = "IntelliFlow-{0}-{1}-{2}-{3}"
     SCRIPTS_ROOT_FORMAT: ClassVar[str] = "if-{0}-{1}-{2}-{3}"
     CLIENT_RETRYABLE_EXCEPTION_LIST: Set[str] = {"ConcurrentRunsExceededException", "OperationTimeoutException", "InternalServiceException"}
-    GLUE_DEFAULT_VERSION: ClassVar[GlueVersion] = GlueVersion.VERSION_2_0
+    GLUE_DEFAULT_VERSION: ClassVar[GlueVersion] = GlueVersion.VERSION_4_0
 
     @classmethod
     def driver_spec(cls) -> DimensionFilter:
         return DimensionFilter.load_raw(
             {
-                Lang.PYTHON: {ABI.GLUE_EMBEDDED: {"GlueVersion": {GlueVersion.AUTO.value: {}, "1.0": {}, "2.0": {}, "3.0": {}}}},
-                Lang.SCALA: {ABI.GLUE_EMBEDDED: {"GlueVersion": {GlueVersion.AUTO.value: {}, "1.0": {}, "2.0": {}, "3.0": {}}}},
+                Lang.PYTHON: {ABI.GLUE_EMBEDDED: {"GlueVersion": {GlueVersion.AUTO.value: {}, "1.0": {}, "2.0": {}, "3.0": {}, "4.0": {}}}},
+                Lang.SCALA: {ABI.GLUE_EMBEDDED: {"GlueVersion": {GlueVersion.AUTO.value: {}, "1.0": {}, "2.0": {}, "3.0": {}, "4.0": {}}}},
             }
         )
 
@@ -166,6 +165,16 @@ class AWSGlueBatchComputeBasic(AWSConstructMixin, BatchCompute):
             raise ValueError(
                 f"{DATA_TYPE_KEY!r} must be defined as {DataType.DATASET} or left undefined for {self.__class__.__name__} output!"
             )
+
+        # early validation for compute params that will be used at runtime
+        if slot.extra_params and "partition_by" in slot.extra_params:
+            if slot.code_lang == Lang.SCALA:
+                raise ValueError(f"'partition_by' is not supported in {slot.code_lang!r} by driver {self.__class__.__name__!r}!")
+
+            partition_cols = slot.extra_params["partition_by"]
+            is_valid_input = partition_cols and isinstance(partition_cols, list) and all(isinstance(item, str) for item in partition_cols)
+            if not is_valid_input:
+                raise ValueError("`partition_by` param must be a nonempty List[str]!")
 
         # default to CSV
         data_format_value = user_attrs.get(DATASET_FORMAT_KEY, user_attrs.get(DATA_FORMAT_KEY, None))
@@ -236,7 +245,6 @@ class AWSGlueBatchComputeBasic(AWSConstructMixin, BatchCompute):
             put_object, {"ServiceException", "TooManyRequestsException"}, self._bucket, output_param_key, output.dumps().encode("utf-8")
         )
 
-
         extra_params.update(
             {
                 # --enable-glue-datacatalog
@@ -256,15 +264,6 @@ class AWSGlueBatchComputeBasic(AWSConstructMixin, BatchCompute):
                     "extra-jars": ",".join(extra_jars),
                 }
             )
-
-        # TODO investigate why enabling this causes 'JOB_ID invalid argument failure' during glue init.
-        # if glue_version == "3.0":
-        #    extra_params.update({
-        #        # refer
-        #        #   https://docs.aws.amazon.com/glue/latest/dg/migrating-version-30.html#migrating-version-30-from-20
-        #        # --user-jars-first
-        #        "user-jars-first": ""
-        #    })
 
         if slot.code_lang == Lang.PYTHON and code_metadata.external_library_paths:
             if glue_version == "1.0":
@@ -422,11 +421,13 @@ class AWSGlueBatchComputeBasic(AWSConstructMixin, BatchCompute):
                 "1.0": {"job_name": "", "job_arn": "", "boilerplate": GlueDefaultABIPython, "suffix": "", "ext": "py"},
                 "2.0": {"job_name": "", "job_arn": "", "boilerplate": GlueDefaultABIPython, "suffix": "v2_0", "ext": "py"},
                 "3.0": {"job_name": "", "job_arn": "", "boilerplate": GlueDefaultABIPython, "suffix": "v3_0", "ext": "py"},
+                "4.0": {"job_name": "", "job_arn": "", "boilerplate": GlueDefaultABIPython, "suffix": "v4_0", "ext": "py"},
             },
             GlueJobLanguage.SCALA: {
                 "1.0": {"job_name": "", "job_arn": "", "boilerplate": GlueAllABIScala, "suffix": "", "ext": "scala"},
                 "2.0": {"job_name": "", "job_arn": "", "boilerplate": GlueAllABIScala, "suffix": "v2_0", "ext": "scala"},
                 "3.0": {"job_name": "", "job_arn": "", "boilerplate": GlueAllABIScala, "suffix": "v3_0", "ext": "scala"},
+                "4.0": {"job_name": "", "job_arn": "", "boilerplate": GlueAllABIScala, "suffix": "v4_0", "ext": "scala"},
             },
         }
 
@@ -544,6 +545,17 @@ class AWSGlueBatchComputeBasic(AWSConstructMixin, BatchCompute):
                                 f" a PyPI library name, BatchCompute driver {self.__class__.__name__!r} won't add it to"
                                 f" runtime permissions for exec role."
                             )
+
+                extra_jars = slot.extra_params.get("extra-jars", [])
+                for path in extra_jars:
+                    try:
+                        s3_spec = S3SignalSourceAccessSpec.from_url(account_id=None, url=path)
+                        external_library_resource_arns.add(f"arn:aws:s3:::{s3_spec.bucket}/{path[len(f's3://{s3_spec.bucket}/'):]}")
+                    except Exception:
+                        raise ValueError(
+                            f"External JAR path {path!r} attached to route {route.route_id!r} "
+                            f" via slot: {(slot.type, slot.code_lang)!r} is not an S3 path!"
+                        )
 
                 # TODO Move into <BatchCompute>
                 # TODO evalute moving is_batch_compute check even before the external library paths extraction.
@@ -871,7 +883,7 @@ class AWSGlueBatchComputeBasic(AWSConstructMixin, BatchCompute):
                 # check driver specific pre-compiled dependencies
                 #
                 # call with actual job version if bundles are version specific
-                bundles: List[Tuple[str, "Path"]] = get_bundles(glue_version="2.0")
+                bundles: List[Tuple[str, "Path"]] = get_bundles(glue_version="4.0")
                 self._bundle_s3_keys = []
                 self._bundle_s3_paths = []
                 for bundle_name, bundle_path in bundles:

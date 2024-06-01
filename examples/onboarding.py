@@ -25,7 +25,7 @@ app = AWSApplication(app_name, region)
 # The partition can be specified within the node.
 pdex_combine = app.marshal_external_data(
     S3Dataset("222333444555",  # from the same account
-              "cindex-in-search-metric-collection-demo",  # the S3 bucket
+              "<S3_BUCKET>",  # the S3 bucket
               "edx_dump/pdex/v2", "{}", "{}",  # the datapath with partition
               dataset_format=DataFormat.PARQUET)
     , "pdex_combine"
@@ -56,7 +56,7 @@ tommy_enc_key = "arn:aws:kms:us-east-1:111222333444:key/aaaaaaaa-bbbb-cccc-dddd-
 
 xdf_external = app.marshal_external_data(
     S3Dataset(SEARCH_OPEN_DATA_AWS_ACCOUNT_ID,
-              "searchdata-core-xdf-demo",
+              "<S3_BUCKET>",
               "",
               "{}", "{}*",  # partition dimension
               dataset_format=DataFormat.PARQUET, encryption_key=tommy_enc_key)

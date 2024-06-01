@@ -8,6 +8,7 @@ import pytest
 
 from intelliflow.core.serialization import dumps, loads
 from intelliflow.core.signal_processing.signal_source import *
+from intelliflow.utils.spark import SparkType
 
 
 class TestDataAccessSpec:
@@ -31,6 +32,22 @@ class TestDataAccessSpec:
         },
     )
 
+    data_access_spec_internal_with_attrs_with_diff_schema = DatasetSignalSourceAccessSpec(
+        data_access_spec_internal_with_attrs.source,
+        data_access_spec_internal_with_attrs.path_format,
+        {k: v for k, v in list(data_access_spec_internal_with_attrs.attrs.items()) + [(DATASET_SCHEMA_FILE_KEY, "SCHEMA.spark.json")]},
+    )
+
+    data_access_spec_internal_with_attrs_with_diff_schema_type = DatasetSignalSourceAccessSpec(
+        data_access_spec_internal_with_attrs.source,
+        data_access_spec_internal_with_attrs.path_format,
+        {
+            k: v
+            for k, v in list(data_access_spec_internal_with_attrs.attrs.items())
+            + [(DATASET_SCHEMA_TYPE_KEY, DatasetSchemaType.SPARK_SCHEMA_JSON)]
+        },
+    )
+
     data_access_spec_internal_with_attrs_with_extra = DatasetSignalSourceAccessSpec(
         SignalSourceType.S3,
         f"s://bucket/my_test_data/{DIMENSION_PLACEHOLDER_FORMAT}/{DIMENSION_PLACEHOLDER_FORMAT}",
@@ -40,6 +57,16 @@ class TestDataAccessSpec:
             PARTITION_KEYS_KEY: ["dim1"],
             PRIMARY_KEYS_KEY: ["prim1"],
             "dummy_key": "dummy_value",
+        },
+    )
+
+    data_access_spec_internal_with_attrs_with_diff_schema_definition = DatasetSignalSourceAccessSpec(
+        data_access_spec_internal_with_attrs.source,
+        data_access_spec_internal_with_attrs.path_format,
+        {
+            k: v
+            for k, v in list(data_access_spec_internal_with_attrs.attrs.items())
+            + [(DATASET_SCHEMA_DEFINITION_KEY, [("column1", "type", True)])]
         },
     )
 
@@ -73,6 +100,14 @@ class TestDataAccessSpec:
         assert self.data_access_spec_internal_with_attrs.check_integrity(self.data_access_spec_internal_with_attrs_with_extra)
         # should fail due to different parametrization
         assert not self.data_access_spec_internal.check_integrity(self.data_access_spec_internal_with_attrs)
+        assert not self.data_access_spec_internal_with_attrs.check_integrity(self.data_access_spec_internal_with_attrs_with_diff_schema)
+        assert not self.data_access_spec_internal_with_attrs.check_integrity(
+            self.data_access_spec_internal_with_attrs_with_diff_schema_type
+        )
+        assert not self.data_access_spec_internal_with_attrs.check_integrity(
+            self.data_access_spec_internal_with_attrs_with_diff_schema_definition
+        )
+
         # verify type check even if the parametrization is same
         assert not self.data_access_spec_internal.check_integrity(self.access_spec_internal)
 
@@ -84,3 +119,99 @@ class TestDataAccessSpec:
         assert DatasetSignalSourceAccessSpec.get_partition_key_count(filter_3) == 3
         assert DatasetSignalSourceAccessSpec.get_partition_key_count({}) == 0
         assert DatasetSignalSourceAccessSpec.get_partition_key_count(None) == 0
+
+    def test_data_signal_source_access_spec_schema_definition(self):
+        def _create_data_spec_with_schema(schema_def):
+            return DatasetSignalSourceAccessSpec(
+                self.data_access_spec_internal_with_attrs.source,
+                self.data_access_spec_internal_with_attrs.path_format,
+                {
+                    k: v
+                    for k, v in list(self.data_access_spec_internal_with_attrs.attrs.items())
+                    + [(DATASET_SCHEMA_DEFINITION_KEY, schema_def)]
+                },
+            )
+
+        assert _create_data_spec_with_schema(None), "'None' schema def should be ok!"
+
+        # schema def must be a list
+        with pytest.raises(ValueError):
+            _create_data_spec_with_schema({})
+
+        # cannot be an empty list
+        with pytest.raises(ValueError):
+            _create_data_spec_with_schema([])
+
+        # go over various cases bad field definitions
+        with pytest.raises(ValueError):
+            _create_data_spec_with_schema([{}])
+
+        with pytest.raises(ValueError):
+            _create_data_spec_with_schema([1])
+
+        with pytest.raises(ValueError):
+            _create_data_spec_with_schema([1, 2, 3])
+
+        with pytest.raises(ValueError):
+            _create_data_spec_with_schema([()])
+
+        # name should be a string
+        with pytest.raises(ValueError):
+            _create_data_spec_with_schema([(1, "IntegerType()", True)])
+
+        _create_data_spec_with_schema([("column1", "IntegerType()", True)])
+
+        # check data "type" now
+        with pytest.raises(ValueError):
+            _create_data_spec_with_schema([("column1", None, True)])
+
+        with pytest.raises(ValueError):
+            _create_data_spec_with_schema([("column1", 1234, True)])
+
+        # nullable should be boolean
+        with pytest.raises(ValueError):
+            _create_data_spec_with_schema([("column1", "IntegerType()", "True")])
+
+        # check Nested definitions
+        #
+        #  nested definition cannot be empty
+        with pytest.raises(ValueError):
+            _create_data_spec_with_schema([("column1", "IntegerType()", True), ("column2", [], True)])
+        # nested definition cannot be empty
+        with pytest.raises(ValueError):
+            _create_data_spec_with_schema([("column1", "IntegerType()", True), ("column2", None, True)])
+
+        _create_data_spec_with_schema([("column1", "IntegerType()", True), ("column2", [("column2_1", "my_type", True)], True)])
+
+        array = SparkType.ArrayType(SparkType.StringType)
+        map = SparkType.MapType(SparkType.StringType, SparkType.LongType)
+        _create_data_spec_with_schema([("column1", array, True), ("column2", [("column2_1", map, True)], True)])
+
+        # validate nested level 2
+        _create_data_spec_with_schema(
+            [
+                ("column1", SparkType.IntegerType, True),
+                ("column2", [("column2_1", [("column2_1_1", SparkType.TimestampType, True)], True)], True),
+            ]
+        )
+
+        with pytest.raises(ValueError):
+            _create_data_spec_with_schema(
+                [
+                    ("column1", SparkType.IntegerType, True),
+                    (
+                        "column2",
+                        [
+                            (
+                                "column2_1",
+                                [
+                                    # missing name
+                                    (SparkType.TimestampType, True)
+                                ],
+                                True,
+                            )
+                        ],
+                        True,
+                    ),
+                ]
+            )

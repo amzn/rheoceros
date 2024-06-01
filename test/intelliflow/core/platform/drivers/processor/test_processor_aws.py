@@ -29,7 +29,6 @@ from intelliflow.mixins.aws.test import AWSTestBase
 
 
 class TestAWSLambdaProcessorBasic(AWSTestBase, DriverTestUtils):
-
     # "https://queue.amazonaws.com" is deprecated in newer versions of boto3: https://github.com/boto/botocore/issues/2705
     expected_queue_path = "123456789012/if-AWSLambdaProcessorBasic-{}-us-east-1-DLQ"
     expected_queue_arn = "arn:aws:sqs:us-east-1:123456789012:if-AWSLambdaProcessorBasic-{}-us-east-1-DLQ"
@@ -126,6 +125,8 @@ class TestAWSLambdaProcessorBasic(AWSTestBase, DriverTestUtils):
         "s3://dex-ml-eureka-model-training-data/cradle_eureka_p3/v8_00/all-data-prod/partition_day=2020-12-02/_SUCCESS"
     )
 
+    CORE_LAMBDA_CONCURRENCY_TEST = 3
+
     def setup_platform_and_params(self):
         self.params = {}
         self.init_common_utils()
@@ -134,6 +135,7 @@ class TestAWSLambdaProcessorBasic(AWSTestBase, DriverTestUtils):
         self.params[CommonParams.ACCOUNT_ID] = self.account_id
         self.params[CommonParams.IF_DEV_ROLE] = "DevRole"
         self.params[CommonParams.IF_EXE_ROLE] = "ExeRole"
+        self.params[AWSLambdaProcessorBasic.CORE_LAMBDA_CONCURRENCY_PARAM] = self.CORE_LAMBDA_CONCURRENCY_TEST
 
     def get_driver_and_platform(self):
         mock_platform = HostPlatform(
@@ -195,6 +197,7 @@ class TestAWSLambdaProcessorBasic(AWSTestBase, DriverTestUtils):
         assert mock_processor._bucket_name == AWSLambdaProcessorBasic.BOOTSTRAPPER_ROOT_FORMAT.format(
             "awslambda".lower(), mock_host_platform._context_id.lower(), self.account_id, self.region
         )
+        assert mock_processor._desired_core_lambda_concurrency == self.CORE_LAMBDA_CONCURRENCY_TEST
         self.patch_aws_stop()
 
     def test_processor_dlq_name_len_max_80_exception(self):
@@ -301,6 +304,7 @@ class TestAWSLambdaProcessorBasic(AWSTestBase, DriverTestUtils):
         assert error.typename == "NotImplementedError"
         self.patch_aws_stop()
 
+
     def test_processor_process_external_new_glue_table_successful(self):
         context_id = "test123_l_6"
         self.patch_aws_start()
@@ -311,6 +315,8 @@ class TestAWSLambdaProcessorBasic(AWSTestBase, DriverTestUtils):
         mock_processor.dev_init(mock_host_platform)
         mock_processor.activate()
         mock_processor._process_external_glue_table({self.test_signal_andes}, {})
+        response = events.list_targets_by_rule(Rule=mock_processor._andes_event_channel_rule_id)
+        assert response["Targets"][0]["Id"] == self.expected_filter_lambda_name.format(context_id)
         self.patch_aws_stop()
 
     def test_processor_process_external_old_glue_table_successful(self):
@@ -323,6 +329,8 @@ class TestAWSLambdaProcessorBasic(AWSTestBase, DriverTestUtils):
         mock_processor.dev_init(mock_host_platform)
         mock_processor.activate()
         mock_processor._process_external_glue_table({self.test_signal_andes}, {})
+        response = events.list_targets_by_rule(Rule=mock_processor._andes_event_channel_rule_id)
+        assert response["Targets"][0]["Id"] == self.expected_filter_lambda_name.format(context_id)
         num_of_remove_calls_previous = processor_driver.remove_permission.call_count
         mock_processor._process_external_glue_table({}, {self.test_signal_andes})
         num_of_remove_calls_current = processor_driver.remove_permission.call_count

@@ -414,7 +414,6 @@ class GlueTableDataNode(ExternalDataNode):
             )
 
     def __init__(self, desc: Descriptor, data_id: str, domain_spec: SignalDomainSpec) -> None:
-
         if domain_spec.integrity_check_protocol is not None:
             logger.critical(
                 f"Signal integrity protocol defined for {data_id!r} will be ignored on events coming from "
@@ -502,7 +501,6 @@ class SNSNode(ExternalDataNode):
             return SNSSignalSourceAccessSpec(self._topic_name, self._account_id, self._region, self._retain_ownership, **self._data_kwargs)
 
     def __init__(self, desc: Descriptor, data_id: str, domain_spec: SignalDomainSpec) -> None:
-
         if domain_spec.integrity_check_protocol is not None:
             logger.critical(
                 f"Signal integrity protocol defined for {data_id!r} will be ignored on events coming from "

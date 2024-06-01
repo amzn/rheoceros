@@ -151,6 +151,9 @@ dimensions = output_param['dimension_map']
 
 # TODO move to a separate module under 'execution' (we now bootstrap RheocerOS).
 def load_input_df(input, sc, aws_region):
+    if input.get("data_type", "dataset") not in ["dataset", None]:
+        return None, None
+
     if input['encryption_key']:
         # first set encryption (if defined)
         if input['resource_type'] == 'S3':
@@ -214,7 +217,12 @@ def load_input_df(input, sc, aws_region):
                     # TODO read IF 'data_schema_file' for internal datasets when 'data_header_exists' is False
                     #      - mandatory for Athena CSV based CTAS outputs (which lack header)
                     #  if header is false and schema does not exist, fail!
-                    new_df = spark.read.load(resource_path, format=input['data_format'], sep=input['delimiter'], inferSchema='true', header='true')
+                    schema_def = input.get("data_schema_def", None)
+                    if schema_def:
+                        spark_schema_def = create_spark_schema(schema_def)
+                        new_df = spark.read.load(resource_path, format=input['data_format'], sep=input['delimiter'], schema=spark_schema_def, header=input['data_header_exists'])
+                    else:
+                        new_df = spark.read.load(resource_path, format=input['data_format'], sep=input['delimiter'], inferSchema='true', header=input['data_header_exists'])
             # Path not found exception is considered Analysis Exception within Spark code. Please check the
             # link below for reference.
             # https://github.com/apache/spark/blob/1b609c7dcfc3a30aefff12a71aac5c1d6273b2c0/sql/catalyst/src/main/scala/org/apache/spark/sql/errors/QueryCompilationErrors.scala#L977
@@ -257,6 +265,10 @@ for i, input in enumerate(input_map['data_inputs']):
         raise ValueError("Input data type {{}} not supported in Athena executions yet! Input alias: '{{}}'".format(input['resource_type'], input['alias']))
     else:
         input_df, input_partition_index_from_tip  = load_input_df(input, sc, aws_region)
+    
+    if input_df is None:
+        continue 
+        
     # TODO use input_signal for more elegant path extraction below
     # input_signal = Signal.deserialize(input['serialized_signal'])
 

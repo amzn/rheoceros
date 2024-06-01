@@ -57,7 +57,6 @@ class _RandomFailureCompute(IInlinedCompute):
 
 
 class InlinedComputeRetryVerifier(IInlinedCompute):
-
     FOLDER: ClassVar[str] = "test_inlined_compute_data"
 
     def __init__(

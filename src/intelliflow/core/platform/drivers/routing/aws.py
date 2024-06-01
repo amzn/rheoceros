@@ -39,6 +39,7 @@ from ...definitions.aws.ddb.client_wrapper import (
     create_table,
     delete_ddb_item,
     delete_table,
+    enable_PITR,
     get_ddb_item,
     put_ddb_item,
     query_ddb_table,
@@ -861,6 +862,7 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
             if error.response["Error"]["Code"] not in ["ResourceNotFoundException"]:
                 raise
 
+    # overrides
     def _clear_all(self) -> None:
         module_logger.info(f"{self.__class__.__name__}: Clearing all of the routing tables...")
         self._delete_table(self._routing_table_name)
@@ -883,6 +885,7 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
             f"have been cleared!"
         )
 
+    # overrides
     def _clear_active_routes(self) -> None:
         module_logger.info(f"{self.__class__.__name__}: Clearing active routes table {self._routing_table_name}...")
         self._delete_table(self._routing_table_name)
@@ -901,6 +904,13 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
             f"{self._routing_lock_table_name!r}"
             f" have been cleared!"
         )
+
+    # overrides
+    def clear_history(self) -> None:
+        module_logger.info(f"{self.__class__.__name__}: Clearing historical/inactive compute records...")
+        self._delete_table(self._routing_history_table_name)
+        self._create_route_history_table()
+        module_logger.info(f"Table " f"{self._routing_history_table_name!r}, " f"has been cleared!")
 
     def terminate(self) -> None:
         """Designed to be resilient against repetitive calls in case of retries in the high-level
@@ -1252,6 +1262,9 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
         except ClientError as error:
             if error.response["Error"]["Code"] == "ResourceInUseException":
                 self._update_route_table_scaling(self._routing_table_name)
+                # BACKWARDS compatibility
+                # FUTURE remove (create_table and update_table enables PITR)
+                enable_PITR(self._routing_table)
             raise
 
         self._update_route_table_scaling(self._routing_table_name)
@@ -1321,6 +1334,9 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
         except ClientError as error:
             if error.response["Error"]["Code"] == "ResourceInUseException":
                 self._update_route_table_scaling(self._routing_history_table_name, rcu_min=400, rcu_max=1000, wcu_min=50, wcu_max=1000)
+                # BACKWARDS compatibility
+                # FUTURE remove (create_table and update_table enables PITR)
+                enable_PITR(self._routing_history_table)
             raise
 
         self._update_route_table_scaling(self._routing_history_table_name, rcu_min=400, rcu_max=1000, wcu_min=50, wcu_max=1000)
@@ -1354,6 +1370,9 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
                 self._update_route_table_scaling(
                     self._routing_pending_nodes_table_name, rcu_min=100, rcu_max=1000, wcu_min=75, wcu_max=1000
                 )
+                # BACKWARDS compatibility
+                # FUTURE remove (create_table and update_table enables PITR)
+                enable_PITR(self._routing_pending_nodes_table)
             raise
 
         self._update_route_table_scaling(self._routing_pending_nodes_table_name, rcu_min=100, rcu_max=1000, wcu_min=75, wcu_max=1000)
@@ -1387,6 +1406,9 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
                 self._update_route_table_scaling(
                     self._routing_active_compute_records_table_name, rcu_min=100, rcu_max=1000, wcu_min=50, wcu_max=1000
                 )
+                # BACKWARDS compatibility
+                # FUTURE remove (create_table and update_table enables PITR)
+                enable_PITR(self._routing_active_compute_records_table)
             raise
 
         self._update_route_table_scaling(
@@ -1400,6 +1422,9 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
         except ClientError as error:
             if error.response["Error"]["Code"] == "ResourceInUseException":
                 self._update_route_table_scaling(self._routing_lock_table_name, rcu_min=20, wcu_min=50, wcu_max=1000)
+                # BACKWARDS compatibility
+                # FUTURE remove (create_table and update_table enables PITR)
+                enable_PITR(self._routing_lock_table)
             raise
 
         self._update_route_table_scaling(self._routing_lock_table_name, rcu_min=20, wcu_min=50, wcu_max=1000)

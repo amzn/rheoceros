@@ -31,7 +31,7 @@ if app.state != ApplicationState.INACTIVE:
 eureka_offline_training_data = app.add_external_data(
     data_id="eureka_training_data",
     s3_dataset=S3("111111111111",
-                  "foo-bucket",
+                  "<BUCKET_NAE>",
                   "folder_1/folder_2/dataset_name",
                   # partitions
                   StringVariant('NA', 'region'),

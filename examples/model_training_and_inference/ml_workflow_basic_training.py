@@ -31,7 +31,7 @@ app = AWSApplication(
 )
 
 training = app.marshal_external_data(
-    S3Dataset("AWS_ACCOUNT_ID_1", "eureka-model-training-data", "eureka_p3/v8_00/all-data-prod",
+    S3Dataset("AWS_ACCOUNT_ID_1", "<TRAINING_DATA_BUCKET>", "eureka_p3/v8_00/all-data-prod",
               "partition_day={}", dataset_format=DataFormat.CSV,
               header=False,
               schema=None,
@@ -53,7 +53,7 @@ training = app.marshal_external_data(
 validation = app.add_external_data(
     "eureka_validation_data",
     S3("AWS_ACCOUNT_ID_1",
-       "eureka-model-training-data",
+       "<TRAINING_DATA_BUCKET>",
        "eureka_p3/v8_00/training-data",
        StringVariant('NA', 'region'),
        AnyDate('day', {'format': '%Y-%m-%d'}),

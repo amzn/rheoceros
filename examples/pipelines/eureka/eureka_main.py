@@ -50,7 +50,7 @@ app = flow.create_or_update_application(app_name,
                                                                      .build()))
 
 eureka_offline_data = app.marshal_external_data(
-                S3Dataset("<BUCKET_ACC_ID>", "eureka-model-training-data", "eureka_p3/v8_00/training-data", "{}", "{}", dataset_format=DataFormat.CSV)
+                S3Dataset("<BUCKET_ACC_ID>", "<TRAINING_DATA_BUCKET>", "eureka_p3/v8_00/training-data", "{}", "{}", dataset_format=DataFormat.CSV)
                 , "eureka_training_features"
                 # DEFINE Data Signal Spec (Flow <Type> / Dimensions)
                 , {

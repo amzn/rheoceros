@@ -109,7 +109,9 @@ class _SignalRangeAnalyzer(_SignalAnalyzer):
                         if slot_types and all([slot_type.is_inlined_compute() for slot_type in slot_types]):
                             # try to find the record in routing_table
                             route_id = signal.resource_access_spec.route_id
-                            missing_output_signal = signal.create(signal.type, signal.resource_access_spec.source, full_path)
+                            missing_output_signal = signal.create(
+                                signal.type, signal.resource_access_spec.source, full_path, from_transformed=True
+                            )
                             inactive_record = platform.routing_table.load_inactive_compute_record(
                                 route_id,
                                 missing_output_signal,
@@ -136,16 +138,17 @@ class _SignalRangeAnalyzer(_SignalAnalyzer):
                     database = resource_access_spec.database
                     table = resource_access_spec.table_name
 
-                    session = platform.routing_table.session
-                    region = platform.routing_table.region
-                    if dimension_values:
-                        glue = session.client("glue", region_name=region)
-                        if glue_catalog.is_partition_present(glue, database, table, [str(d) for d in dimension_values]):
+                    if not checked:
+                        session = platform.routing_table.session
+                        region = platform.routing_table.region
+                        if dimension_values:
+                            glue = session.client("glue", region_name=region)
+                            if glue_catalog.is_partition_present(glue, database, table, [str(d) for d in dimension_values]):
+                                completed_paths.add(path)
+                        else:
+                            # cannot even call GetPartition with no partitions
+                            # it is the entire table and we assume it is ready
                             completed_paths.add(path)
-                    else:
-                        # cannot even call GetPartition with no partitions
-                        # it is the entire table and we assume it is ready
-                        completed_paths.add(path)
 
                 elif signal.resource_access_spec.source == SignalSourceType.S3:
                     from intelliflow.core.platform.development import RuntimePlatform
@@ -184,7 +187,7 @@ class _SignalRangeAnalyzer(_SignalAnalyzer):
                                 f"name is specified. Signal: {signal.unique_key()!r}, Path: {path!r}"
                             )
                         prefix = prefix + signal.resource_access_spec.path_delimiter() + required_resource_name
-                        if object_exists(s3, bucket, prefix):
+                        if object_exists(s3, bucket, prefix, critical_path=True):
                             completed_paths.add(path)
                     else:
                         if prefix.endswith("*"):  # e.g 's3://bucket/folder/part*'
@@ -238,6 +241,7 @@ class RuntimeLinkNode(SignalLinkNode):
         # maintain the state of range_check
         self._range_check_complete: bool = not self.range_check_required
         self._range_check_state: Dict[SignalUniqueKey, _SignalAnalysisResult] = {}
+        self._blocked_range_check_state: Dict[SignalUniqueKey, Set[str]] = {}
 
     @property
     def node_id(self) -> str:
@@ -274,6 +278,11 @@ class RuntimeLinkNode(SignalLinkNode):
         return self._range_check_state
 
     @property
+    def blocked_range_check_state(self) -> Dict[SignalUniqueKey, Set[str]]:
+        self._blocked_range_check_state = getattr(self, "_blocked_range_check_state", {})
+        return self._blocked_range_check_state
+
+    @property
     def range_check_required(self) -> bool:
         return any([s.range_check_required or s.nearest_the_tip_in_range for s in self._signals])
 
@@ -298,6 +307,9 @@ class RuntimeLinkNode(SignalLinkNode):
 
     def is_ready(self, check_ranges: Optional[bool] = False, platform: Optional["Platform"] = None, fail_fast: bool = True) -> bool:
         if len(self._signals) != len(self._ready_signals):
+            return False
+
+        if self.blocked_range_check_state:
             return False
 
         if self.range_check_required and check_ranges:
@@ -366,7 +378,16 @@ class RuntimeLinkNode(SignalLinkNode):
 
     def transfer_ranges(self, other_nodes: Set["RuntimeLinkNode"]) -> None:
         """Transfers range_check state from other nodes if they maintain it or merely use the ready signals
-        from them."""
+        from them.
+        Transfer blocked range state from other nodes.
+        """
+        # 1- blocked range state
+        for other_node in other_nodes:
+            for blocked_paths_set in other_node.blocked_range_check_state.values():
+                for blocked_path in blocked_paths_set:
+                    self._update_blocked_ranges(blocked_path, is_blocked=True)
+
+        # 2- range check state
         if not self.range_check_required:
             return
 
@@ -383,6 +404,17 @@ class RuntimeLinkNode(SignalLinkNode):
                     self._update_ranges(ready_signal)
 
     def _update_ranges(self, candidate_signal_or_path: Union[Signal, str]) -> None:
+        if isinstance(candidate_signal_or_path, Signal):
+            candidate_signal = cast(Signal, candidate_signal_or_path)
+            if candidate_signal.is_dependent:
+                # Don't let artificially injected events used here. `Application::execute` is the only path.
+                # This should not have any side effect as these signal types should either be inferred from others (ref)
+                # or detected by range check mechanism (nearest) anyways.
+                # If "dependent" signals mark paths as completed, then it might cause premature executions in "execute"
+                # API and also sticky paths in dependency check state of all future pending nodes due to
+                # `transfer_ranges` optimization.
+                return
+
         # from a signal only the TIP
         satisfied_path: str = (
             candidate_signal_or_path.get_materialized_resource_paths()[0]
@@ -417,6 +449,36 @@ class RuntimeLinkNode(SignalLinkNode):
             if not current_analysis_result or satisfied_path not in current_analysis_result.completed_paths:
                 return True
         return False
+
+    def _update_blocked_ranges(self, candidate_signal_or_path: Union[Signal, str], is_blocked: bool) -> None:
+        # from a signal only the TIP
+        blocked_path: str = (
+            candidate_signal_or_path.get_materialized_resource_paths()[0]
+            if isinstance(candidate_signal_or_path, Signal)
+            else candidate_signal_or_path
+        )
+        # check the ready signals in the node
+        for ready_signal in self._ready_signals:
+            if blocked_path in ready_signal.get_materialized_resource_paths():
+                self._update_blocked_signal_range(ready_signal, blocked_path, is_blocked)
+
+        # check the signals which are (by nature) already materialized and not in the ready_signals yet.
+        # very safe operation (nested ifs are just to avoid unnecessary computation), key logic is the check
+        # against the materialized_resource_paths using the new 'satisfied_path' from the incoming event (candidate sig)
+        for signal in self._signals:
+            if signal not in self._ready_signals:  # and signal.domain_spec.dimension_filter_spec.is_material():
+                if blocked_path in signal.get_materialized_resource_paths():
+                    self._update_blocked_signal_range(signal, blocked_path, is_blocked)
+
+    def _update_blocked_signal_range(self, signal: Signal, blocked_path: str, is_blocked: bool) -> None:
+        blocked_range = self.blocked_range_check_state.setdefault(signal.unique_key(), set())
+        if is_blocked:
+            blocked_range.add(blocked_path)
+        elif blocked_path in blocked_range:
+            blocked_range.remove(blocked_path)
+
+        if not blocked_range:
+            del self.blocked_range_check_state[signal.unique_key()]
 
     def _check_links(self, candidate_signal: Signal) -> bool:
         if not self._ready_signals:
@@ -566,11 +628,14 @@ class RuntimeLinkNode(SignalLinkNode):
         output_for_ref_check: Signal = None,
         output_dim_matrix: DimensionLinkMatrix = None,
         update_ranges: bool = True,
+        is_blocked: bool = False,
     ) -> bool:
         consumed: bool = False
 
         if set(incoming_signal.get_materialized_resource_paths()).issubset(self._processed_resource_paths):
             consumed = True
+            if update_ranges:
+                self._update_blocked_ranges(incoming_signal.tip(), is_blocked=is_blocked)
         else:
             for s in self._signals:
                 if s == incoming_signal:
@@ -598,8 +663,11 @@ class RuntimeLinkNode(SignalLinkNode):
                                     satisfied_path: str = candidate_signal.get_materialized_resource_paths()[0]
                                     if self._is_needed_within_signal_range(candidate_signal, satisfied_path):
                                         consumed = True
+                                elif candidate_signal.is_reference:
+                                    consumed = True
                             if update_ranges:
                                 self._update_ranges(candidate_signal)
+                                self._update_blocked_ranges(candidate_signal, is_blocked=is_blocked)
                         else:
                             # this happens when the incoming signal matches the same input with different alias'
                             # let's be opportunistic and check if it is zombie using the links between those inputs.
@@ -796,6 +864,10 @@ class RouteExecutionHook(CoreData):
             checkpoints=checkpoints,
         )
 
+    @staticmethod
+    def aggregate(*hooks: "RouteExecutionHook") -> "RouteExecutionHook":
+        return _aggregate_hooks(*hooks)
+
 
 class RoutePendingNodeHook(CoreData):
     def __init__(
@@ -856,6 +928,22 @@ class RoutePendingNodeHook(CoreData):
             on_expiration=_ChainedHookCallback("on_expiration", *pending_node_hook),
             checkpoints=checkpoints,
         )
+
+    @staticmethod
+    def aggregate(*hooks: "RoutePendingNodeHook") -> "RoutePendingNodeHook":
+        return _aggregate_hooks(*hooks)
+
+
+def _aggregate_hooks(*hooks):
+    aggregated_hook = None
+    # Filter out uninitialized hooks
+    final_hooks = filter(lambda x: x, hooks)
+    for hook in final_hooks:
+        if not aggregated_hook:
+            aggregated_hook = hook
+        else:
+            aggregated_hook.chain(hook)
+    return aggregated_hook
 
 
 class _ChainedHookCallback(Callable, ComputeDescriptor, Slot):
@@ -1160,14 +1248,14 @@ class Route(Serializable):
         self.pending_node_hook = other.pending_node_hook
         self.pending_node_ttl_in_secs = other.pending_node_ttl_in_secs
 
-    def receive(self, incoming_signal: Signal, platform: Optional["Platform"] = None) -> Optional[Response]:
+    def receive(self, incoming_signal: Signal, platform: Optional["Platform"] = None, is_blocked: bool = False) -> Optional[Response]:
         if not self._link_node.can_receive(incoming_signal):
             return None
 
         has_consumed: bool = False
         if self._pending_nodes:
             for pending_node in self._pending_nodes:
-                if pending_node.receive(incoming_signal, self._output, self._output_dim_matrix):
+                if pending_node.receive(incoming_signal, self._output, self._output_dim_matrix, is_blocked=is_blocked):
                     has_consumed = True
                     # keep iterating since multiple nodes/windows might be active on the same Route.
 
@@ -1177,9 +1265,11 @@ class Route(Serializable):
             #               So the non-references are the "determinants" for a node and let's wait for them.
             #               we don't return immediately and go over the pending nodes because incoming ref might have
             #               satisfied a path in any of them and made them 'ready'.
-            if not incoming_signal.is_reference:
+            #               But skip this optimization when the signal was sent in for blocking purposes
+            #               (e.g Application::execute(update_dependency_tree=True)
+            if not incoming_signal.is_reference or is_blocked:
                 new_node = RuntimeLinkNode(self._link_node)
-                if new_node.receive(incoming_signal, self._output, self._output_dim_matrix):
+                if new_node.receive(incoming_signal, self._output, self._output_dim_matrix, is_blocked=is_blocked):
                     # we just need to do this transfer once here, then node itself will keep it self up to date.
                     new_node.transfer_ranges(self._pending_nodes)
                     self._pending_nodes.add(new_node)
@@ -1248,3 +1338,4 @@ class Route(Serializable):
         self._pending_nodes = self._pending_nodes - completed_nodes
 
         return Route.Response([], new_executions, set())
+

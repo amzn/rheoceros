@@ -27,7 +27,11 @@ def create_topic_arn(region: str, account_id: str, topic_name: str) -> str:
 
 
 def get_topic_policy(sns, topic_arn: str) -> Optional[Dict[str, Any]]:
-    policy_str = exponential_retry(sns.get_topic_attributes, ["InternalErrorException", "NotFoundException"], TopicArn=topic_arn,)[
+    policy_str = exponential_retry(
+        sns.get_topic_attributes,
+        ["InternalErrorException", "NotFoundException"],
+        TopicArn=topic_arn,
+    )[
         "Attributes"
     ].get("Policy", None)
     return json.loads(policy_str) if policy_str else None

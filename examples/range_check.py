@@ -14,7 +14,7 @@ app = AWSApplication("range-check", "us-east-1", "286245245617")
 
 # The following external dataset has 2020-10-24 to 2020-10-31 range available.
 rush_order_analysis = app.marshal_external_data(
-    S3Dataset("286245245617", "edx-to-s3-dexml-commondc-beta", "dex-ml/glue-data/all/rush-order-analysis", "{}", "{}",
+    S3Dataset("286245245617", "<BUCKET--s3-commondc-beta>", "dex-ml/glue-data/all/rush-order-analysis", "{}", "{}",
               dataset_format=DataFormat.CSV)
     , "rush_order_analysis"
     , {

@@ -14,7 +14,7 @@ app = AWSApplication("i-fanout", "us-east-1")
 try:
     app.marshal_external_data(
         S3Dataset("427809481713",
-                  "if-adpd-training-427809481713-us-east-1",
+                  "<BUCKET_NAME>",
                   "datanet_data/transit_time_map",
                    dataset_format=DataFormat.CSV,
                   delimiter="|")
@@ -27,7 +27,7 @@ except ValueError:
 # show that import will succeed, but we won't use this external data in this example.
 app.marshal_external_data(
     S3Dataset("427809481713",
-              "if-adpd-training-427809481713-us-east-1",
+              "<BUCKET_NAME>",
               "datanet_data/transit_time_map",
               dataset_format=DataFormat.CSV,
               delimiter="|")
@@ -37,9 +37,9 @@ app.marshal_external_data(
 
 
 # Import the following external, raw datasource
-# https://s3.console.aws.amazon.com/s3/buckets/adpd-prod?region=us-east-1&prefix=adpds-output-data/1/2021/09/15/&showversions=false
+# https://s3.console.aws.amazon.com/s3/buckets/<BUCKET_NAME>?region=us-east-1&prefix=adpds-output-data/1/2021/09/15/&showversions=false
 adpd_shadow_json_AS_SIGNAL = app.marshal_external_data(
-    external_data_desc= S3Dataset("427809481713", "adpd-prod", "adpds-output-data", "{}", "{}", "{}", "{}",
+    external_data_desc= S3Dataset("427809481713", "<BUCKET_NAME>", "adpds-output-data", "{}", "{}", "{}", "{}",
                                   dataset_format=DataFormat.JSON)
     # in spark code, this will be the default DataFrame name/alias (but you can overwrite it in 'inputs' if you use map instead of list)
     , id="adpd_shadow_data"

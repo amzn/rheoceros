@@ -50,8 +50,8 @@ app.process({
             "s3":{
                 "s3SchemaVersion":"1.0",
                 "bucket":{
-                    "name":"eureka-model-training-data",
-                    "arn":"arn:aws:s3:::eureka-model-training-data"
+                    "name":"<TRAINING_DATA_BUCKET>",
+                    "arn":"arn:aws:s3:::<TRAINING_DATA_BUCKET>"
                 },
                 "object":{
                     "key":"eureka_p3/v8_00/training-data/NA/2020-08-01/_SUCCESS",

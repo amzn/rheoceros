@@ -681,7 +681,7 @@ class TestAWSApplicationExecutionRecursive(AWSTestBase):
                 BatchCompute(
                     code="output=C2P_TOMMY_DATA_1_1",
                     lang=Lang.PYTHON,
-                    GlueVersion="2.0",
+                    GlueVersion="4.0",
                     WorkerType=GlueWorkerType.G_1X.value,
                     NumberOfWorkers=25,
                     Timeout=8 * 60,

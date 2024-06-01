@@ -60,6 +60,7 @@ from ...definitions.aws.s3.bucket_wrapper import (
 )
 from ...definitions.aws.s3.object_wrapper import (
     build_object_key,
+    delete_folder,
     delete_objects,
     empty_bucket,
     get_object,
@@ -127,8 +128,12 @@ class AWSS3StorageBasic(AWSConstructMixin, Storage):
     def save_object(self, data: bytes, folders: Sequence[str], object_name: str) -> None:
         put_object(self._bucket, build_object_key(folders, object_name), data)
 
-    def delete(self, folders: Sequence[str], object_name: str) -> None:
-        delete_objects(self._bucket, [build_object_key(folders, object_name)])
+    def delete(self, folders: Sequence[str], object_name: Optional[str] = None) -> None:
+        if object_name:
+            delete_objects(self._bucket, [build_object_key(folders, object_name)])
+        else:
+            folder_prefix = "/".join(folders)
+            delete_folder(self._bucket, folder_prefix)
 
     def check_folder(self, prefix_or_folders: Union[str, Sequence[str]]) -> bool:
         folder = prefix_or_folders if isinstance(prefix_or_folders, str) else prefix_or_folders.join("/")
@@ -182,20 +187,13 @@ class AWSS3StorageBasic(AWSConstructMixin, Storage):
             for path in internal_signal.get_materialized_resource_paths():
                 prefixes.append(path.lstrip(internal_signal.resource_access_spec.path_delimiter()))
 
+        return self._delete_objects(prefixes)
+
+    def _delete_objects(self, prefixes: Sequence[str]) -> bool:
         completely_wiped_out = True
         for prefix in prefixes:
-            objects_in_folder = list_objects(self._bucket, prefix)
-            keys = []
-            for object in objects_in_folder:
-                key = object.key
-                keys.append(key)
-                if len(keys) == 50:
-                    if not delete_objects(self._bucket, keys):
-                        completely_wiped_out = False
-                    keys = []
-            if keys:
-                if not delete_objects(self._bucket, keys):
-                    completely_wiped_out = False
+            if not delete_folder(self._bucket, prefix):
+                completely_wiped_out = False
         return completely_wiped_out
 
     def is_internal(self, source_type: SignalSourceType, resource_path: str) -> bool:

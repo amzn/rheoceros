@@ -26,7 +26,6 @@ from intelliflow.mixins.aws.test import AWSTestBase
 
 
 class TestAWSGlueBatchComputeBasic(AWSTestBase, DriverTestUtils):
-
     expected_glue_job_name = "IntelliFlow-AWSGlueBatchComputeBasic-GlueDefaultABIPython-test123-us-east-1"
     expected_glue_job_arn = (
         "arn:aws:glue:us-east-1:123456789012:job/IntelliFlow-AWSGlueBatchComputeBasic-GlueDefaultABIPython-test123-us-east-1"
@@ -177,6 +176,34 @@ class TestAWSGlueBatchComputeBasic(AWSTestBase, DriverTestUtils):
         assert error.typename == "ValueError"
         self.patch_aws_stop()
 
+    def test_compute_provide_output_attributes(self):
+        self.patch_aws_start()
+        self.setup_platform_and_params()
+        mock_compute, mock_host_platform = self.get_driver_and_platform()
+        input_signal, test_slot, materialized_output = self.get_signals_slots()
+        mock_compute.provide_output_attributes([input_signal], test_slot, dict())
+
+        test_slot.extra_params.update({"partition_by": "1/0"})
+        with pytest.raises(ValueError):
+            mock_compute.provide_output_attributes([input_signal], test_slot, dict())
+
+        test_slot.extra_params.update({"partition_by": [1, 2]})
+        with pytest.raises(ValueError):
+            mock_compute.provide_output_attributes([input_signal], test_slot, dict())
+
+        test_slot.extra_params.update({"partition_by": '["col1", "col2"]'})
+        with pytest.raises(ValueError):
+            mock_compute.provide_output_attributes([input_signal], test_slot, dict())
+
+        test_slot.extra_params.update({"partition_by": ["col1", "col2"]})
+        mock_compute.provide_output_attributes([input_signal], test_slot, dict())
+
+        test_slot.code_lang = Lang.SCALA
+        with pytest.raises(ValueError):
+            mock_compute.provide_output_attributes([input_signal], test_slot, dict())
+
+        self.patch_aws_stop()
+
     def test_compute_hook_external_not_supported_signal_exception(self):
         self.patch_aws_start()
         self.setup_platform_and_params()
@@ -229,15 +256,15 @@ class TestAWSGlueBatchComputeBasic(AWSTestBase, DriverTestUtils):
         mock_host_platform._context_id = "glue_test5"
         mock_compute.dev_init(mock_host_platform)
         mock_compute._extract_used_glue_jobs = MagicMock(
-            side_effect=lambda: {GlueJobLanguage.PYTHON: {"1.0", "2.0", "3.0"}, GlueJobLanguage.SCALA: {"1.0", "2.0", "3.0"}}
+            side_effect=lambda: {GlueJobLanguage.PYTHON: {"1.0", "2.0", "3.0", "4.0"}, GlueJobLanguage.SCALA: {"1.0", "2.0", "3.0", "4.0"}}
         )
         mock_compute.activate()
         s3 = boto3.resource("s3")
         assert bucket_exists(s3, mock_compute._bucket_name)
         # now for each version we create another job
-        # currently three versions ("1.0", "2.0" and "3.0") multiplied by the # of langs (2),
-        # so we expect the call_count to be 6.
-        assert compute_driver.create_glue_job.call_count == 6
+        # versions multiplied by the number of langs (2),
+        # so we expect the call_count to be 8.
+        assert compute_driver.create_glue_job.call_count == 8
         assert compute_driver.delete_glue_job.call_count == 0
 
         mock_compute._extract_used_glue_jobs = MagicMock(
@@ -245,9 +272,9 @@ class TestAWSGlueBatchComputeBasic(AWSTestBase, DriverTestUtils):
         )
         mock_compute.activate()
         # now we expect the call_count to increase by 4 only as "1.0" version is not used.
-        assert compute_driver.create_glue_job.call_count == (6 + 4)
+        assert compute_driver.create_glue_job.call_count == (8 + 4)
         # two glue jobs (python-1.0 and scala-1.0) must be deleted
-        assert compute_driver.delete_glue_job.call_count == (0 + 2)
+        assert compute_driver.delete_glue_job.call_count == (0 + 4)
         self.patch_aws_stop()
 
     def test_compute_computefunc_successful(self):
@@ -290,6 +317,54 @@ class TestAWSGlueBatchComputeBasic(AWSTestBase, DriverTestUtils):
                 "StateChangeReason": {
                     "Code": "BOOTSTRAP_FAILURE",
                     "Message": "On the master instance (i-0991cbf940d71cbfd), application provisioning failed",
+                },
+            },
+            {
+                "State": "TERMINATED_WITH_ERRORS",
+                "StateChangeReason": {
+                    "Code": "INTERNAL_ERROR",
+                    "Message": "EC2 is out of capacity for r5.24xlarge in availability zone us-east-1a. Learn more at https://docs.aws.amazon.com/console/elasticmapreduce/ERROR_noinstancecapacity",
+                },
+            },
+            {
+                "State": "TERMINATED_WITH_ERRORS",
+                "StateChangeReason": {
+                    "Code": "INTERNAL_ERROR",
+                    "Message": "Throttled from Amazon EC2 while launching cluster",
+                },
+            },
+            {
+                "State": "TERMINATED_WITH_ERRORS",
+                "StateChangeReason": {
+                    "Code": "INTERNAL_ERROR",
+                    "Message": "Failed to provision instances due to throttling from Amazon EC2",
+                },
+            },
+            {
+                "State": "TERMINATED_WITH_ERRORS",
+                "StateChangeReason": {
+                    "Code": "INTERNAL_ERROR",
+                    "Message": "Request exceeds the EC2 service quota for that type.",
+                },
+            },
+            {
+                "State": "TERMINATED_WITH_ERRORS",
+                "ErrorDetails": [
+                    {
+                        "ErrorCode": "INTERNAL_ERROR_EC2_INSUFFICIENT_CAPACITY_AZ",
+                        "ErrorData": [
+                            {"instance-type": "a_random_scifi_concept"},
+                            {"availability-zone": "check your subnet"},
+                            {
+                                "public-doc": "https://docs.aws.amazon.com/emr/latest/ManagementGuide/INTERNAL_ERROR_EC2_INSUFFICIENT_CAPACITY_AZ.html"
+                            },
+                        ],
+                        "ErrorMessage": "we believe you are doing the right thing",
+                    }
+                ],
+                "StateChangeReason": {
+                    "Code": "INTERNAL_ERROR",
+                    "Message": "MAKE SURE that TRANSIENT error is extracted from ErrorDetails",
                 },
             },
         ],

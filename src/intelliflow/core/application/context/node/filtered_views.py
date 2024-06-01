@@ -127,7 +127,6 @@ class FilteredView(ABC, SignalProvider, metaclass=_FilterViewMeta):
         )
 
     def __getitem__(self, slice_filter: Any) -> "FilteredView":
-
         """Convenience indexing method for high-level modules to build new filters for a Signal.
 
         This tries to complete the hierarchy (expected) structure of the filter by appending a new

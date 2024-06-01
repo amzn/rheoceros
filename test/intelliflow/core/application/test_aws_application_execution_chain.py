@@ -22,7 +22,6 @@ from intelliflow.mixins.aws.test import AWSTestBase
 
 
 class TestAWSApplicationExecutionChain(AWSTestBase):
-
     app: Application = None
 
     def test_application_signal_propagation(self):
@@ -79,7 +78,7 @@ class TestAWSApplicationExecutionChain(AWSTestBase):
 
         # join_node must have been calculated already
         join_output_partition_path, _ = self.app.poll(join_node[1]["2020-12-28"])
-        assert join_output_partition_path.endswith("internal_data/JOIN_NODE/1/2020-12-28 00:00:00")
+        assert join_output_partition_path.endswith("internal_data/JOIN_NODE/1/2020-12-28")
 
         # 2- THREE LEVEL PROPAGATION
         # now add a tail node to the pipeline that will have two compute targets.

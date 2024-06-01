@@ -1,13 +1,15 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import concurrent.futures
 import copy
 import json
 import logging
 import os
 import socket
 import time
-from datetime import datetime
+from concurrent.futures import Executor
+from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Set, Tuple, Type, Union, cast
 
@@ -51,6 +53,7 @@ from intelliflow.core.signal_processing.definitions.metric_alarm_defs import (
 )
 from intelliflow.core.signal_processing.dimension_constructs import (
     DIMENSION_VARIANT_IDENTICAL_MAP_FUNC,
+    AnyVariant,
     Dimension,
     DimensionFilter,
     DimensionSpec,
@@ -58,6 +61,7 @@ from intelliflow.core.signal_processing.dimension_constructs import (
     DimensionVariantFactory,
     DimensionVariantMapFunc,
     RawDimensionFilterInput,
+    RelativeVariant,
 )
 from intelliflow.core.signal_processing.routing_runtime_constructs import (
     Route,
@@ -76,13 +80,16 @@ from intelliflow.core.signal_processing.signal import (
     SignalIntegrityProtocol,
     SignalLinkNode,
     SignalProvider,
+    SignalType,
 )
 from intelliflow.core.signal_processing.signal_source import (
     DataFrameFormat,
     DatasetSignalSourceAccessSpec,
     DatasetSignalSourceFormat,
+    InternalDatasetSignalSourceAccessSpec,
     SignalSourceAccessSpec,
     SignalSourceType,
+    SystemSignalSourceAccessSpec,
 )
 from intelliflow.core.signal_processing.slot import SlotType
 
@@ -1097,7 +1104,6 @@ class Application(CoreApplication):
             dim_spec: DimensionSpec = external_data_desc.provide_default_dimension_spec()
 
         if dim_spec is not None:
-
             if dimension_filter is not None:
                 dim_filter: DimensionFilter = (
                     DimensionFilter.load_raw(dimension_filter, cast=dim_spec, error_out=True)
@@ -1838,6 +1844,7 @@ class Application(CoreApplication):
         target_route_id: Optional[Union[RouteID, MarshalerNode]] = None,
         is_async=True,
         retry_if_deferred=True,
+        is_blocked=False,
     ) -> Optional[List["RoutingTable.Response"]]:
         """Injects a new signal or raw event into the system.
 
@@ -1864,6 +1871,7 @@ class Application(CoreApplication):
         the remote call will be async or not.
         :param retry_if_deferred: implicitly retry if the one of the target routes is locked or somehow the signal is
         deferred (temporarily rejected) by the core for any reason.
+        :param is_blocked: mark all of the possible executions of dependent/downstream nodes using `input` as "blocked".
         """
         if with_activated_processor and self.state != ApplicationState.ACTIVE:
             raise RuntimeError(
@@ -1894,6 +1902,7 @@ class Application(CoreApplication):
             processing_mode,
             target_route_id if isinstance(target_route_id, RouteID) else self._get_route_id(target_route_id),
             is_async,
+            is_blocked=is_blocked,
         )
         if retry_if_deferred and responses:
             for response in responses:
@@ -1909,6 +1918,7 @@ class Application(CoreApplication):
                                 processing_mode,
                                 route.route_id,
                                 is_async,
+                                is_blocked=is_blocked,
                             )[0]
                             if not sub_response.deferred_signals:
                                 # transfer the new execution context to the original response to be returned to the caller
@@ -2353,10 +2363,20 @@ class Application(CoreApplication):
         return (
             signal.resource_access_spec.source == SignalSourceType.INTERNAL
             and signal.resource_access_spec.get_owner_context_uuid() == self.uuid
+            and not signal.resource_access_spec.is_projection
         )
 
+    @classmethod
+    def _is_projection(cls, signal: Signal) -> bool:
+        return signal.resource_access_spec.source == SignalSourceType.INTERNAL and signal.resource_access_spec.is_projection
+
     def _execute_recursive(
-        self, output_node: MarshalerNode, inputs: Sequence[Union[FilteredView, MarshalerNode, Signal]], wait: bool, integrity_check: bool
+        self,
+        output_node: MarshalerNode,
+        inputs: Sequence[Union[FilteredView, MarshalerNode, Signal]],
+        wait: bool,
+        integrity_check: bool,
+        parents_to_be_ignored: Optional[Set[str]] = None,
     ) -> Sequence[int]:
         """Internal executor impl designed to crawl up the dependency chain of a node given as a 'target' to
         Application::execute API.
@@ -2364,7 +2384,11 @@ class Application(CoreApplication):
         Once called by 'execute' API, it checks each input range and recursively do new 'execute' call for each
         missing resource (e.g partition)
 
-        :returns indexes of 'inputs' whose TIPs are triggered. this list is then used by 'execute' API to avoid
+        `parents_to_be_ignored` are assumed to be being handled by caller and guaranteed to execute eventually. They will
+        be skipped in the recursive calls to parents and treated as "recursively executed" already. So their indexes are
+        added to the returned list.
+
+        :returns indexes of 'inputs' whose TIPs are triggered plus the index of `parents_to_be_ignored`. this list is then used by 'execute' API to avoid
         redundant event injections via process API.
         """
         internal_data_node = cast(InternalDataNode, output_node.bound)
@@ -2406,6 +2430,10 @@ class Application(CoreApplication):
                 # we are just trying to access the reference of parent node, so picking the first link here is jut fine.
                 instruction = inst.get_inbound_links(ready_signal)[0].instruction
                 # instruction is None for upstream nodes
+                if instruction and (parents_to_be_ignored and instruction.symbol_tree._id in parents_to_be_ignored):
+                    # treat ignored parent as "recursively triggered"
+                    executed_input_indexes.append(i)
+                    continue
                 input_node: Optional[MarshalerNode] = instruction.output_node if instruction else None
                 analysis_result: "_SignalAnalysisResult" = link_node.range_check_state.get(ready_signal.unique_key(), None)
                 if analysis_result is None:
@@ -2433,7 +2461,13 @@ class Application(CoreApplication):
                             # input_node -> input_node['NA']['2021-06-21']
                             for dim_value in partition:
                                 input_view = input_view[dim_value]
-                        self.execute(target=input_view, wait=wait, recursive=True, integrity_check=integrity_check)
+                        self.execute(
+                            target=input_view,
+                            wait=wait,
+                            recursive=True,
+                            integrity_check=integrity_check,
+                            _active_dependency_tree=parents_to_be_ignored,
+                        )
                         # only add TIPs (represented by input signals), so in this case it is the TIP by default
                         executed_input_indexes.append(i)
                 else:
@@ -2442,12 +2476,15 @@ class Application(CoreApplication):
                         if not self._is_executable(ready_signal):
                             # since we force range_check = True above to reuse dependency check from within RuntimeLinkNode,
                             # now we need to get the original ref to see if it is actually required before erroring out
-                            org_non_executable_signal = internal_data_node.signal_link_node._signals[i]
+                            org_non_executable_signal = [
+                                s for s in internal_data_node.signal_link_node._signals if s.alias == ready_signal.alias
+                            ][0]
                             # raise only when:
                             # - user explicitly wants the range check
                             # - or the input signal/event is required (which is basically / implicitly a range check on the TIP)
                             if org_non_executable_signal.range_check_required or (
                                 not org_non_executable_signal.is_reference
+                                and not self._is_projection(org_non_executable_signal)
                                 and ready_signal.get_materialized_resource_paths()[0] in analysis_result.remaining_paths
                             ):
                                 raise ValueError(
@@ -2480,9 +2517,318 @@ class Application(CoreApplication):
                             # input_node -> input_node['NA'][1]['2021-06-21']
                             for dim_value in dimension_values:
                                 input_view = input_view[dim_value]
-                            self.execute(target=input_view, wait=need_to_enforce_wait or wait, recursive=True)
+                            self.execute(
+                                target=input_view,
+                                wait=need_to_enforce_wait or wait,
+                                recursive=True,
+                                _active_dependency_tree=parents_to_be_ignored,
+                            )
 
         return executed_input_indexes
+
+    def _update_child_dependency_tree(
+        self,
+        child_instruction: Instruction,
+        materialized_output: Signal,
+        recursive: bool,
+        dependency_tree: Set[str],
+        dependency_tree_scan_range_in_days: int,
+        dependency_tree_scan_end: Optional[datetime] = None,
+        concurrent_executor_pool: Optional[Executor] = None,
+    ):
+        child_data_node: InternalDataNode = child_instruction.symbol_tree
+        route_id = child_data_node.route_id
+
+        # Example:
+        # A["2023-11-08"] yields direct pending/blocked execution on B["2023-11-08"]
+        direct_output: str = self.execute(
+            target=child_instruction.output_node,  # target partitions/dimension values will be inferred from material_inputs
+            material_inputs=[materialized_output],
+            wait=False,
+            recursive=recursive,  # this would make recursion here bouncing back upwards into "all" ancestor nodes with missing outputs
+            update_dependency_tree=True,
+            dependency_tree_scan_range_in_days=dependency_tree_scan_range_in_days,
+            dependency_tree_scan_end=dependency_tree_scan_end,
+            blocked_inputs=[materialized_output],  # setup everything but block execution on this input
+            _active_dependency_tree=dependency_tree,
+            concurrent_executor_pool=concurrent_executor_pool,
+        )
+
+        # OPTIMIZATION: check if the child has ranged access into the output.
+        # if not then skip the time-consuming operation of scanning past executions and re-executing them.
+        # there might be multiple links into the same parent.
+        # Example:
+        #   b = app.create_data("B", inputs=[ a[:-7] ], ...)
+        #
+        #   A partition of B relies on 7 partitions of A.
+        inbound_links: List["InstructionLink"] = child_instruction.get_inbound_links(materialized_output)
+        has_ranged_access = False
+        for link in inbound_links:
+            filter = link.signal.domain_spec.dimension_filter_spec
+            if any(
+                (
+                    (isinstance(dim, RelativeVariant) and abs(dim.relative_index) > 1)
+                    or dim.params.get(RelativeVariant.RANGE_SHIFT_FIELD_ID, None)
+                )
+                for dim in filter.get_flattened_dimension_map().values()
+            ):
+                has_ranged_access = True
+
+        if has_ranged_access:
+            # find all of the past executions that have used the "materialized_output" as input and revive them
+            # as pending executions blocked on this output.
+            # these must be using the input in ranged mode (e.g last 30 days: where materialized_output here
+            # maps to older partitions).
+            # Example:
+            # A["2023-11-08"] yields direct pending/blocked execution on B["2023-11-09"], ..., B["2023-11-14"]
+            # assuming that B uses A in a weekly ranged manner. B <- A[:-7]
+            # For this particular example, we will end up spawning 6 more pending executions
+            end = datetime.utcnow() if dependency_tree_scan_end is None else dependency_tree_scan_end
+            datum = int((end - timedelta(days=dependency_tree_scan_range_in_days)).timestamp())
+            end = int(end.timestamp())
+            trigger_range = (datum, end)
+            inactive_records = self.platform.routing_table.load_inactive_compute_records(route_id, False, trigger_range)
+            if inactive_records:
+                overlapped_records = []
+                processed_child_output_paths = {direct_output}  # we might have multiple runs on the same output, use the most recent one
+
+                blocked_input_paths = set(self._materialize_internal(materialized_output).get_materialized_resource_paths())
+                for inactive_record in inactive_records:
+                    # check if any successful/COMPLETED past execution has used this "output" as an input in child node
+                    if not inactive_record:
+                        continue
+
+                    if inactive_record.trigger_timestamp_utc < datum:
+                        break
+
+                    if inactive_record.trigger_timestamp_utc <= end:
+                        if inactive_record.session_state and inactive_record.session_state.state_type == ComputeSessionStateType.COMPLETED:
+                            past_output_path = inactive_record.materialized_output.get_materialized_resource_paths()[0]
+                            if past_output_path not in processed_child_output_paths:
+                                # check if we have an overlap/hit (where materialized_output is used as an input partition)
+                                range_hit = False
+                                for materialized_past_input in inactive_record.materialized_inputs:
+                                    # e.g "s3://b/f/1/2023-11-08" is subset of {"s3://b/f/1/2023-11-07", "s3://b/f/1/2023-11-08", "s3://b/f/1/2023-11-09"}
+                                    # please note that in this particular example the past output partition is one day ahead but we still need to update
+                                    # it because of a change in ones of its input partitions.
+                                    if blocked_input_paths.issubset(set(materialized_past_input.get_materialized_resource_paths())):
+                                        range_hit = True
+                                        break
+
+                                if range_hit:
+                                    overlapped_records.append(inactive_record)
+                                    processed_child_output_paths.add(past_output_path)
+
+                for overlapped_record in overlapped_records:
+                    # let's emulate a user action using execute call with both output and inputs.
+                    execution_target_signal = overlapped_record.materialized_output
+                    # e.g [['NA', '2021-06-21'], ['NA', '2021-06-22']]
+                    partitions = execution_target_signal.resource_access_spec.get_dimensions(
+                        execution_target_signal.domain_spec.dimension_filter_spec
+                    )
+                    execution_target = child_instruction.output_node
+                    if partitions:
+                        partition = partitions[0]
+                        # input_node -> input_node['NA']['2021-06-21']
+                        for dim_value in partition:
+                            execution_target = execution_target[dim_value]
+                    materialized_inputs = [
+                        child_instruction.inbound[i].signal.filter(s.domain_spec.dimension_filter_spec)
+                        for i, s in enumerate(overlapped_record.materialized_inputs)
+                    ]
+                    self.execute(
+                        target=execution_target,
+                        material_inputs=materialized_inputs,
+                        wait=False,
+                        recursive=recursive,
+                        update_dependency_tree=True,
+                        dependency_tree_scan_range_in_days=dependency_tree_scan_range_in_days,
+                        dependency_tree_scan_end=dependency_tree_scan_end,
+                        # not necessary as the direct execute above should mark this output as blocked already
+                        # and the state should transfer over to this new pending executions.
+                        # blocked_inputs=[materialized_output],
+                        _active_dependency_tree=dependency_tree,
+                        concurrent_executor_pool=concurrent_executor_pool,
+                    )
+
+    def _update_dependency_tree(
+        self,
+        output_node: MarshalerNode,
+        materialized_output: Signal,
+        recursive: bool,
+        dependency_tree: Set[str],
+        dependency_tree_scan_range_in_days: int,
+        dependency_tree_scan_end: Optional[datetime] = None,
+        concurrent_executor_pool: Optional[Executor] = None,
+    ):
+        """Get into the dependency tree using output_node as the root and recurse into all of them to mark their
+        pending executions as "blocked" on the output here or create new pending executions only to be blocked on
+        the output again.
+        This implementation heavily depends on "blocked_inputs" support by execute API. So we basically reuse the
+        execute flow almost entirely with one subtle difference of marking upstream "output" nodes as "blocked".
+        Entire flow is asynchronous, once pending nodes are created in RoutingTable, then the rest of the flow will
+        unwind remotely. Completed upstream events in remote platform will implicitly unblock pending executions and
+        desired tree update will be achieved eventually.
+        """
+        internal_data_node = cast(InternalDataNode, output_node.bound)
+
+        active_version = self.get_data(
+            internal_data_node.data_id, Application.QueryApplicationScope.CURRENT_APP_ONLY, Application.QueryContext.ACTIVE_RUNTIME_CONTEXT
+        )
+
+        instructions = self.active_context.get_instructions(active_version[0])
+        latest_inst: Instruction = instructions[-1:][0]
+
+        # Extract all of the dependent data nodes and let them know about the blocked input.
+        # Blocking logic in tree update has to be "breadth first", to avoid recursive executions climbing up the
+        # hierarchy and hitting one of these childs early without output_node being updated.
+        child_instructions = [down_links[0].instruction for down_links in latest_inst.outbound.values()]
+        child_data_intructions = []
+        for child_instruction in child_instructions:
+            if isinstance(child_instruction.symbol_tree, InternalDataNode):
+                child_data_intructions.append(child_instruction)
+                child_data_node: InternalDataNode = child_instruction.symbol_tree
+
+                # We need to mark all the children blocked before recursively processing them, otherwise recursion
+                # might bounce back from bottom and cause premature execution using the previous version of this node
+                response: RoutingTable.Response = self.process(
+                    self._get_input_signal(materialized_output),
+                    with_activated_processor=False,
+                    processing_mode=FeedBackSignalProcessingMode.ONLY_HEAD,
+                    target_route_id=child_data_node.route_id,
+                    retry_if_deferred=True,
+                    is_blocked=True,
+                )[0]
+
+        executors = []
+        for child_instruction in child_data_intructions:
+            if concurrent_executor_pool and len(child_data_intructions) > 1:
+                executors.append(
+                    concurrent_executor_pool.submit(
+                        self._update_child_dependency_tree,
+                        child_instruction,
+                        materialized_output,
+                        recursive,
+                        dependency_tree,
+                        dependency_tree_scan_range_in_days,
+                        dependency_tree_scan_end,
+                        concurrent_executor_pool,
+                    )
+                )
+            else:
+                self._update_child_dependency_tree(
+                    child_instruction,
+                    materialized_output,
+                    recursive,
+                    dependency_tree,
+                    dependency_tree_scan_range_in_days,
+                    dependency_tree_scan_end,
+                )
+
+        if executors:
+            logger.critical(
+                f"Waiting on the completion of parallel execution on child nodes [count={len(executors)}] of root {internal_data_node.data_id!r}..."
+            )
+            concurrent.futures.wait(executors)
+
+    def _get_dependency_tree(self, internal_data_id: str) -> Set[str]:
+        """Creates a set of IDs of all the nodes that belong to the tree using this node as the root"""
+        active_version = self.get_data(
+            internal_data_id, Application.QueryApplicationScope.CURRENT_APP_ONLY, Application.QueryContext.ACTIVE_RUNTIME_CONTEXT
+        )
+        active_dependency_tree: List[Instruction] = self.active_context.get_dependency_set(active_version[0])
+        tree: Set[str] = set([instruction.symbol_tree._id for instruction in active_dependency_tree])
+        tree.add(internal_data_id)
+        return tree
+
+    def execute_batch(
+        self,
+        targets: List[Union[MarshalingView, MarshalerNode]],
+        wait: Optional[bool] = True,
+        recursive: bool = False,
+        integrity_check: bool = True,
+        update_dependency_tree: bool = False,
+        dependency_tree_scan_range_in_days: int = 6 * 30,
+        dependency_tree_scan_end: Optional[datetime] = None,
+        blocked_inputs: Optional[
+            Union[Sequence[Union[Signal, FilteredView, MarshalerNode]], Union[Signal, FilteredView, MarshalerNode]]
+        ] = None,
+        _active_dependency_tree: Optional[Set[str]] = None,
+        concurrent_executor_pool: Optional[Executor] = None,
+    ):
+        """Convenience method particularly designed to help solve the range update on a single node with
+        `update_dependency_tree` set `True`. But it can be used in other execute modes as well. Has a workflow to
+        guarantee all of the downstream dependencies (tree instances / branches) for the entire range to be setup first
+        before initiating executions on the root (e.g multiple date values).
+
+        If an executor pool is provided, it modifies the trees in parallel (which is the most time-consuming part of
+        that execute mode), and finally initiates the executions for each value from the range of dimensions. The rest is
+        event propagation outside of the scope of this method.
+
+        Parametrization is identical to `Application::execute` with only difference of accepting multiple values on the
+        materialized instances of same internal node (`targets`).
+        """
+        batch_executor_pool = None
+        if len(targets) > 1:
+            batch_executor_pool = concurrent.futures.ThreadPoolExecutor(max_workers=len(targets))
+
+        executors = []
+        for target in targets:
+            if batch_executor_pool:
+                executors.append(
+                    batch_executor_pool.submit(
+                        self.execute,
+                        target,
+                        None,
+                        wait,
+                        recursive,
+                        integrity_check,
+                        update_dependency_tree,
+                        dependency_tree_scan_range_in_days,
+                        dependency_tree_scan_end,
+                        blocked_inputs,
+                        _active_dependency_tree,
+                        concurrent_executor_pool,
+                        # defer root execution if multiple targets (dimension range of same node) is being updated
+                        _defer_tree_root_execution=update_dependency_tree,
+                    )
+                )
+            else:
+                self.execute(
+                    target,
+                    None,
+                    wait,
+                    recursive,
+                    integrity_check,
+                    update_dependency_tree,
+                    dependency_tree_scan_range_in_days,
+                    dependency_tree_scan_end,
+                    blocked_inputs,
+                    _active_dependency_tree,
+                    concurrent_executor_pool,
+                    # defer root execution if multiple targets (dimension range of same node) is being updated
+                    # since executions on each tree relies on async propagation we would face a race condition and
+                    # data consistency issues if we won't synchronize executions across multiple dimensions (e.g
+                    # date range).
+                    _defer_tree_root_execution=update_dependency_tree,
+                )
+
+        if executors:
+            logger.critical(f"Waiting for the completion of dependency tree updates for the batch executions...")
+            concurrent.futures.wait(executors)
+
+        if update_dependency_tree:
+            logger.critical(f"Initiating execution sequence on each root node and its dependency tree...")
+            for target in targets:
+                self.execute(
+                    target,
+                    None,
+                    wait,
+                    recursive,
+                    integrity_check,
+                    False,  # update_dependency_tree,
+                    _defer_tree_root_execution=False,
+                )
 
     def execute(
         self,
@@ -2493,6 +2839,15 @@ class Application(CoreApplication):
         wait: Optional[bool] = True,
         recursive: bool = False,
         integrity_check: bool = True,
+        update_dependency_tree: bool = False,
+        dependency_tree_scan_range_in_days: int = 6 * 30,
+        dependency_tree_scan_end: Optional[datetime] = None,
+        blocked_inputs: Optional[
+            Union[Sequence[Union[Signal, FilteredView, MarshalerNode]], Union[Signal, FilteredView, MarshalerNode]]
+        ] = None,
+        _active_dependency_tree: Optional[Set[str]] = None,
+        concurrent_executor_pool: Optional[Executor] = None,
+        _defer_tree_root_execution: bool = False,
     ) -> str:
         """Activates the application and starts an execution only against the input data node using the materialized
         input signals.
@@ -2514,9 +2869,43 @@ class Application(CoreApplication):
         target).
         :param recursive: traverse the upstream dependency chain (ancestor nodes) and execute them (if required) to
         make sure that desired execution on target would not fail due to missing data on inputs.
+        If `update_dependency_tree` is True, then this flag will even be passed down to downstream dependent nodes in
+        the dependency tree and their ancestor nodes, even the ones outside of the dependency chain of `target`, will
+        be executed / backfilled if their required outputs are missing. So setting those flags to True would be the
+        most convenient (but costly) backfilling experience with this API.
         :param integrity_check: if the target data node exists already (in the active state of the app), do an integrity
         check on its parameters and its downstream dependent nodes traversing the entire topology to detect a change
         and to do an implicit activation accordingly.
+        :param update_dependency_tree: once the execution of this node (and its upstream dependencies when
+        `recursive=True`) are done, then make sure that the entire set of downstream dependencies will be updated
+        eventually.
+        :param dependency_tree_scan_range_in_days: when "update_dependency_tree=True", this is used to limit the search
+        for past executions from the routing history table. In topologies where "ranged use of ancestor nodes" is common,
+        this flag helps the algorithm narrow down the search for past executions that will be rerun after the completion
+        of this execution. Default value is 6 months (180 days). Can be used along with `dependency_tree_scan_end` to
+        shift the search interval.
+        :param dependency_tree_scan_end: to restart past executions when "update_dependency_tree=True" the application
+        needs to find them from the routing history table. Datum here determines the datetime used as the end of the search
+        interval. Hence, the start of the interval is then determined by "datum - dependency_tree_scan_range_in_days".
+        If left as None, current time (datetime.utcnow) is used as the end of the interval.
+        :param blocked_inputs: execution can be deferred by just marking these inputs as blocked. A typical use-case is
+        to mark any of the parent nodes (inputs here) as 'being backfilled' that will eventually send in completion
+        signals into the system and unblock the execution. Internally used to achieve dependency tree update in a fast,
+        asynchronous and simple way.
+        :param _active_dependency_tree: used when `recursive=True` and `update_dependency_tree=True`. Represents the tree of
+        node IDs that is currently going through an update. These nodes will be skipped during the recursive executions
+        on the same set of nodes so that only upstream (ancestor) nodes that are not part of the "dependency tree" will
+        be updated. This is automatically calculated and passed down to recursive executions on downstream nodes.
+        The use of this set by the algorithm prevents early executions on the ancestor nodes that will eventually be
+        executed by the platform when the entire dependency set is made execution ready. Algorithm recursively gets into
+        dependent nodes (when `update_dependency_tree=True`) and when recursive flag is True (meaning the backfilling
+        of upstream nodes) it can again crawl up the hierarchy and start executions on the parent nodes if this set is
+        not used. This would cause race-conditions, inconsistencies or in the best case redundant executions on parent
+        nodes.
+        :param concurrent_executor_pool: determines the level of parallelism in recursive dependency tree update and/or
+        bottom-up (recursive=True) executions. E.g ThreadExecutorPool or ProcessorExecutorPool can be provided to speed
+        up the process. Pool is not managed by the framework, the caller needs to manage it by calling `shutdown` or
+        via a context manager.
 
         :returns a materialized/physical resource path that represents the outcome of this execution on 'target'.
 
@@ -2544,6 +2933,9 @@ class Application(CoreApplication):
                 f" with uuid={owner_context_uuid!r}"
             )
 
+        instructions: List[Instruction] = self._dev_context.get_instructions(node)
+        inst: Instruction = instructions[-1:][0]
+
         output: Signal = self._get_input_signal(target)
         auto_generated_material_inputs: Set[Signal] = set()
         if not material_inputs:
@@ -2563,14 +2955,17 @@ class Application(CoreApplication):
         else:
             material_inputs = material_inputs if isinstance(material_inputs, List) else [material_inputs]
             material_input_signals = [
-                self._get_input_signal(input) if not isinstance(input, Signal) else input for input in material_inputs
+                self._get_input_signal(input, alias=None) if not isinstance(input, Signal) else input.clone(alias=None, deep=False)
+                for input in material_inputs
             ]
             if len(material_inputs) != len(internal_data_node.signal_link_node.signals):
                 if not output.domain_spec.dimension_filter_spec.is_material():
                     # try to materialize output from other materialized inputs
                     test_node = RuntimeLinkNode(internal_data_node.signal_link_node)
+                    # mark all the unprovided inputs as reference so that link node will infer them from these inputs
+                    test_node._signals = [(s.as_reference() if s not in material_input_signals else s) for s in test_node.signals]
                     for input in material_input_signals:
-                        test_node.receive(input)
+                        test_node.receive(input, output, internal_data_node.output_dim_matrix)
                     output = test_node.materialize_output(output, internal_data_node.output_dim_matrix, force=True)
 
                 if output.domain_spec.dimension_filter_spec.is_material():
@@ -2706,7 +3101,45 @@ class Application(CoreApplication):
                             self.activate()
                             break
 
-        # 1.2 - check upstream if 'recursive' is True, just before injecting inputs into the system
+        # 1.2- check downstream dependency tree if 'update_dependency_tree' is True
+        #
+        # We have to do this operation now before the execution(s) on this node and the upstream nodes start.
+        # Because this algorithm relies on eventual propagation of completion signals into the downstream pending
+        # execution nodes. If we run the following backfilling algo after recursive execution, then we might face
+        # race condition:
+        # The algorithm either updates or creates new pending execution nodes (`RuntimeLinkNode`) on each downstream
+        # node in a special way that uses parent node signals with a special resource spec attribute "backfilling".
+        # Then routing/orchestration never unblocks executions on those till a normal completion signal is received on
+        # them. Against the possibility of having premature executions on existing pending execution nodes, algo always
+        # injects the upstream nodes touched by this context first. Because, if the pending node already has a legit
+        # ready signal on one of the backfilling upstream nodes here, then injecting a non-backfilling upstream node
+        # would cause a premature execution (see `RuntimeLinkNode::receive`).
+        if update_dependency_tree:
+            is_root: bool = False
+            if _active_dependency_tree is None and blocked_inputs is None:
+                # root node. calculate the tree and pass it down
+                _active_dependency_tree = self._get_dependency_tree(internal_data_node.data_id)
+                is_root = True
+
+            self._update_dependency_tree(
+                node,
+                materialized_output,
+                recursive,
+                _active_dependency_tree,
+                dependency_tree_scan_range_in_days,
+                dependency_tree_scan_end,
+                concurrent_executor_pool,
+            )
+
+            if is_root and _defer_tree_root_execution:
+                logger.critical(
+                    f"Dependency tree of root node {internal_data_node.data_id!r} is ready for update but exiting "
+                    f"without initiating the execution sequence as it's been defferred by the user. "
+                    f"Application::execute call on the root node can initiate the execution sequence later on."
+                )
+                return self._materialize_internal(materialized_output).get_materialized_resource_paths()[0]
+
+        # 1.3 - check upstream if 'recursive' is True, just before injecting inputs into the system
         #
         # technically we have to recurse with 'wait=True', otherwise here is the challenge:
         #  - some of the inputs might actually be ready but their range might have missing data
@@ -2723,10 +3156,15 @@ class Application(CoreApplication):
         # So today, we will use this condition to enforce 'wait=True' in recursive execution on an input
         # with existing TIP but a missing data in its range.
         recursively_triggered_input_indexes = (
-            self._execute_recursive(node, inputs, wait=wait, integrity_check=integrity_check) if recursive else []
+            self._execute_recursive(node, inputs, wait=wait, integrity_check=integrity_check, parents_to_be_ignored=_active_dependency_tree)
+            if recursive
+            else []
         )
         recursively_triggered_aliases = [alias_list[i] for i, _ in enumerate(alias_list) if i in recursively_triggered_input_indexes]
-        if set(recursively_triggered_input_indexes).issuperset([j for j, s in enumerate(input_signals) if not s.is_dependent]):
+        if not blocked_inputs and set(recursively_triggered_input_indexes).issuperset(
+            [j for j, s in enumerate(input_signals) if not s.is_dependent]
+        ):
+            # skip the rest of the flow if all of the normal (unblocked) inputs are recursively triggered above:
             # necessary trigger condition is already satisfied and remote orchestration might have initiated it already.
             # try to hook up with the execution
             logger.critical(f"All of the independent input signals {recursively_triggered_aliases!r} have been triggered recursively!")
@@ -2776,9 +3214,55 @@ class Application(CoreApplication):
         logger.critical(f"Sending input signals from {alias_list!r} into the system...")
         execution_context_and_records: Tuple["Route.ExecutionContext", List["RoutingTable.ComputeRecord"]] = None
         idempotency_check_detected: bool = False
+        enumerated_inputs = list(enumerate(inputs))
+        if blocked_inputs:
+            # as explained above, we have to sure that blocked inputs are injected first so that any existing pending
+            # executions (waiting for the unblocked inputs here) dont get executed prematurely. we want to create
+            # pending executions that would wait on "blocked inputs" here.
+            blocked_input_signals = [self._get_input_signal(input) if not isinstance(input, Signal) else input for input in blocked_inputs]
+            # not directly blocked, but being updated as part of the same dependency tree
+            #    A -> B -> C
+            #    |         ^
+            #    | _ _ _ _ |
+            # in this case "A" is an blocked ancestor (assuming that execute call got started on A initially).
+            blocked_ancestor_input_signals = []
+            if _active_dependency_tree:
+                for _, input in enumerated_inputs:
+                    if input not in blocked_input_signals:
+                        instruction = inst.get_inbound_links(input)[0].instruction
+                        if instruction and (instruction.symbol_tree._id in _active_dependency_tree):
+                            blocked_ancestor_input_signals.append(input)
+
+            def _is_input_blocked(input: Signal, blockeds: List[Signal]) -> bool:
+                return any(
+                    (input == b and input.tip().domain_spec.dimension_filter_spec.is_equivalent(b.tip().domain_spec.dimension_filter_spec))
+                    for b in blockeds
+                )
+
+            blocked_inputs = [
+                (input[0], input[1], True)
+                for input in enumerated_inputs
+                if _is_input_blocked(input[1], blocked_input_signals) or input[1] in blocked_ancestor_input_signals
+            ]
+            unblocked_inputs = [
+                (input[0], input[1], False)
+                for input in enumerated_inputs
+                if not _is_input_blocked(input[1], blocked_input_signals) and input[1] not in blocked_ancestor_input_signals
+            ]
+            enumerated_inputs = blocked_inputs + unblocked_inputs
+            logger.critical(
+                f"Will create pending execution on {materialized_output.get_materialized_resource_paths()[0]!r} with blocked inputs {[i.get_materialized_resource_paths()[0] for _, i, _ in blocked_inputs]!r}"
+            )
+        else:
+            enumerated_inputs = [(input[0], input[1], False) for input in enumerated_inputs]
+
         while not execution_context_and_records:
-            for i, input in enumerate(inputs):
-                if i in recursively_triggered_input_indexes:
+            for i, input, is_blocked in enumerated_inputs:
+                # do not skip if blocked, blocked signal should be sent in via `process` to update orchestration
+                # there is no risk of causing premature execution with a blocked parent from dependency tree.
+                # an input is put in the recursively triggered list by `_execute_recursive` if it is as part of ongoing
+                # dependency tree update/backfill process.
+                if i in recursively_triggered_input_indexes and not is_blocked:
                     logger.critical(
                         f"Skipping recursively injected input signal {alias_list[i]!r} on execution of {internal_data_node.data_id!r}! "
                         f"Path: {input_signals[i].get_materialized_resource_paths()[0]!r}"
@@ -2791,6 +3275,7 @@ class Application(CoreApplication):
                     processing_mode=FeedBackSignalProcessingMode.ONLY_HEAD,
                     target_route_id=internal_data_node.route_id,
                     retry_if_deferred=True,
+                    is_blocked=is_blocked,
                 )[0]
                 execution_contexts: Optional[
                     Dict["Route.ExecutionContext", List["RoutingTable.ComputeRecord"]]
@@ -3808,6 +4293,178 @@ class Application(CoreApplication):
 
         current_data = self._dev_context.get_dashboard(dashboard_id)
         self.platform.diagnostics.add_metric_widget(current_data, metric_signals_or_alarm, title, **kwargs)
+
+    # ADVANCED GENERIC OPERATIONS ON INPUT SIGNALS
+    class _ProjectedInputProvider(SignalProvider):
+        def __init__(self, input: Signal):
+            self._input = input
+
+        # overrides
+        def get_signal(self, alias: str = None) -> Signal:
+            return self._input.clone(alias, deep=False).as_reference().range_check(False)
+
+    def project(
+        self,
+        id: str,
+        input: Union[FilteredView, MarshalerNode],
+        output_dimension_spec: Union[Dict[str, Any], DimensionSpec],
+        output_dimension_filter: Optional[Union[DimensionFilter, RawDimensionFilterInput]] = None,
+        execution_hook: RouteExecutionHook = None,
+        **kwargs,
+    ) -> MarshalerNode:
+        """Creates a new implicit node, a new signal which is structurally an extension of the `input` signal
+        with new dimensions and material values on those new dimensions.
+
+        At runtime, projection causes the system to receive multiple new versions of the input signal based on the
+        values defined by the user in `output_dimension_filter`. Each branch in "output_dimension_spec" will yield a
+        different instance of the incoming signal (defined by "input").
+
+        In cases when a fan-out of the input is required over a new domain (input dimensions + new dimensions) and
+        if multiple instances of this input ([original dim value] X [new dim values from user]) at runtime are expected
+        to fed into the system, hence into the downstream nodes, then this can be used.
+
+        *Example*: a timer signal can be projected as multiple timer-based signals having user provided new dimensions
+        and their values. Assume that we want to regionalize a timer signal over material values as region-marketplace
+        maps ("region1": ["marketplace_1", marketplace_2"], "region2": ["marketplace2_1"])
+
+            timer [date1] ->
+                projected_timer [date1, "region_1", "marketplace_1"]
+                projected_timer [date1, "region_1", "marketplace_2"]
+                projected_timer [date1, "region_2", "marketplace_2_1"]
+
+        The system will receive three different incoming signals ana possibly three different executions on nodes
+        depending on them.
+
+        :param input: A single "input" node. The signal to be extended and projected. See `create_data` API "inputs" param.
+        :param output_dimension_spec: "DimensionSpec" to include the original input "dimension" and the definitions for
+        the new dimensions for which "output_dimension_filter" will provide values for.
+        :param "output_dimension_filter": "DimensionFilter" that will contain the actual, material values for new
+        dimensions defined in "output_dimension_spec" (not the original dimension). The original dimensions must have
+        "*" (`AnyVariant`) as the value in all the places where it should be defined along with the other dimensions,
+        and depending on the structure of the dimension spec. Not using "*" value for the original dimension will cause
+        build-time prefiltering on projected signal making it dedicated to the values defined at runtime.
+
+        :return: A new MarshalerNode for "pseudo" internal data created implicitly (via "create_data" API).
+         Automatically created compute of this node handles the fan-out, projection at runtime. Returned value can be
+         used as an input to many other Application APIs in a convenient way. Most important of them is 'create_data'
+         for the downstream nodes on which the projection is expected to have an effect on (e.g multiple triggers).
+         which can use MarshalerNode and its filtered version (FilteredView) as inputs. When using this as an input in
+         downstream nodes, filtering to be applied (e.g `projected_node[dim1]...[dimN]`) must be compatible with the
+         `output_dimension_spec` provided here.
+        """
+        if output_dimension_spec and not isinstance(output_dimension_spec, (DimensionSpec, dict)):
+            raise ValueError(
+                f"Wrong type {output_dimension_spec!r} for 'output_dimension_spec'! It should be of type DimensionSpec or Dict[str, Any]."
+            )
+
+        if not output_dimension_spec:
+            raise ValueError(f"'output_dimension_spec' must be provided to project input {id!r} to a new domain!")
+
+        output_dim_spec: DimensionSpec = (
+            DimensionSpec.load_from_pretty(output_dimension_spec)
+            if not isinstance(output_dimension_spec, DimensionSpec)
+            else output_dimension_spec
+        )
+
+        if not output_dimension_filter:
+            raise ValueError(f"'output_dimension_filter' must be provided to project input {id!r} to a new domain!")
+
+        projection_filter: DimensionFilter = (
+            DimensionFilter.load_raw(output_dimension_filter, cast=output_dim_spec, error_out=True)
+            if not isinstance(output_dimension_filter, DimensionFilter)
+            else output_dimension_filter
+        )
+        if projection_filter is None:
+            raise ValueError(
+                f"project (id={id}): 'dimension_filter' parameter "
+                f"(type: {type(output_dimension_filter)}) is not valid! "
+                f"Provide a dict or an instance of DimensionFilter for 'dimension_filter'."
+            )
+
+        if not projection_filter.check_spec_match(output_dim_spec):
+            raise ValueError(
+                f"project (id={id}): Dimension filter {output_dimension_filter!r} is not compatible "
+                f"with the dimension spec {output_dimension_spec!r}"
+            )
+
+        projection_filter.set_spec(output_dim_spec)
+
+        # create the projected (pseudo) version of the input as an pseudo internal signal (e.g timer -> internal signal)
+        input_signal = self._check_upstream([self._get_input_signal(input)])[0]
+        # why not move this into Signal class? this operation (spec overwrite) should not be allowed/exposed by module.
+        projected_signal = Signal(
+            SignalType.INTERNAL_PSEUDO,
+            # path format should be flexible, universal/generic spec that would allow that is the internal data spec
+            # e.g for path format transformation that projects a single dim onto three dimensional regionalized version:
+            #  "/timer/DAILY_TIMER/{}"  -> "/internal_data/DAILY_TIMER/{}/{}/{}"
+            # InternalDatasetSignalSourceAccessSpec(input_signal.alias, output_dim_spec, **{SignalSourceAccessSpec.OWNER_CONTEXT_UUID: self.uuid}),
+            SystemSignalSourceAccessSpec(input_signal.alias, output_dim_spec, **{SignalSourceAccessSpec.OWNER_CONTEXT_UUID: self.uuid}),
+            SignalDomainSpec(output_dim_spec, projection_filter, input_signal.domain_spec.integrity_check_protocol),
+            input_signal.alias,
+            input_signal.is_reference,
+            input_signal.range_check_required,
+            input_signal.nearest_the_tip_in_range,
+            input_signal.is_termination,
+            input_signal.is_inverted,
+        )
+        projected_input_provider = Application._ProjectedInputProvider(projected_signal)
+
+        # get the new dimensions the input will be projected on
+        projected_dims = set(projected_signal.dimension_type_map().keys()) - set(input_signal.dimension_type_map().keys())
+
+        def do_project(input_map: Dict[str, Signal], materialized_output: Signal, params: "ConstructParamsDict") -> Any:
+            from intelliflow.core.signal_processing.signal_source import InternalDatasetSignalSourceAccessSpec
+
+            runtime_platform = params["runtime_platform"]
+            materialized_projected_input: Signal = input_map["projected_signal"]
+
+            output_dim_spec = materialized_output.domain_spec.dimension_spec
+
+            # project output and create a completion signal for each branch of projected values
+            for projected_path in materialized_projected_input.get_materialized_resource_paths():
+                # e.g projected_path "../internal_data/projected_signal/NA/1/2023-10-18"
+                projected_branch_values: List[Any] = materialized_projected_input.extract_dimensions(projected_path)
+                # e.g values: ["NA", 1, "2023-10-18"]
+                projected_output_filter = DimensionFilter.load_raw(projected_branch_values, cast=output_dim_spec)
+
+                projected_output_signal = materialized_output.filter(projected_output_filter)
+                # covert it to generic internal representation to facilitate the following persistence operation
+                # e.g (e.g "s3://.../internal_data/NA/1/..." -> "/internal_data/NA/1/...")
+                projected_output_signal_internal = runtime_platform.storage.map_materialized_signal(projected_output_signal)
+
+                # e.g path -> "/internal_data/NA/1/2023-10-18"
+                path = projected_output_signal_internal.get_materialized_resource_paths()[0]
+                # e.g folder -> "NA/1/2023-10-18"
+                folder = path[path.find(InternalDatasetSignalSourceAccessSpec.FOLDER) :]
+                runtime_platform.storage.save("", [folder], "_SUCCESS")
+
+                # let the orchestration know that it can feed this signal into downstream dependent nodes.
+                # note: setting filter=True to avoid recursive calls on the Processor (e.g AWS Lambda), it is logically
+                # recursive but we still want it to go through first layer filter (if any).
+                runtime_platform.processor.process(projected_output_signal, use_activated_instance=True, filter=True)
+
+        from intelliflow.core.signal_processing.signal_source import DataType
+
+        kwargs.update({InternalDatasetSignalSourceAccessSpec.IS_PROJECTION: True})
+
+        return self.create_data(
+            id=id,
+            # output will automatically adapt the dimension spec of the projected signal
+            inputs={"projected_signal": projected_input_provider, "original_signal": input},
+            compute_targets=[InternalDataNode.InlinedComputeDescriptor(do_project)],
+            output_dim_links=[
+                (projected_dim, DIMENSION_VARIANT_IDENTICAL_MAP_FUNC, AnyVariant.ANY_DIMENSION_VALUE_SPECIAL_CHAR)
+                for projected_dim in projected_dims
+            ],
+            execution_hook=execution_hook,
+            auto_input_dim_linking_enabled=True,
+            auto_output_dim_linking_enabled=True,
+            protocol=InternalDataNode.DEFAULT_DATA_COMPLETION_PROTOCOL,  # e.g _SUCCESS file
+            # this is a pure signal, no data will be written actually. so we don't want downstream compute attempt
+            # to load it
+            data_type=DataType.RAW_CONTENT,
+            **kwargs,
+        )
 
 
 __test__ = {name: value for name, value in locals().items() if name.startswith("test_")}

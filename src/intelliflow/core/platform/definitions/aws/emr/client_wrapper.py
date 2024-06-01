@@ -7,7 +7,7 @@ import logging
 import re
 from enum import Enum, unique
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple, Union
 
 from botocore.exceptions import ClientError
 from packaging import version
@@ -49,6 +49,9 @@ class EmrJobLanguage(str, Enum):
 class EmrReleaseLabel(Enum):
     """
     Versions have to be placed in ASC order
+
+    https://docs.aws.amazon.com/emr/latest/ReleaseGuide/Spark-release-history.html
+    https://docs.aws.amazon.com/emr/latest/ReleaseGuide/Hadoop-release-history.html
     """
 
     AUTO = None, None, None
@@ -56,6 +59,9 @@ class EmrReleaseLabel(Enum):
     VERSION_5_36_0 = version.parse("5.36.0"), version.parse("2.4.8"), version.parse("2.10.1")
     VERSION_6_3_1 = version.parse("6.3.1"), version.parse("3.1.1"), version.parse("3.2.1")
     VERSION_6_4_0 = version.parse("6.4.0"), version.parse("3.1.2"), version.parse("3.2.1")
+    VERSION_6_6_0 = version.parse("6.6.0"), version.parse("3.2.0"), version.parse("3.2.1")
+    VERSION_6_8_0 = version.parse("6.8.0"), version.parse("3.3.0"), version.parse("3.2.1")
+    VERSION_6_10_0 = version.parse("6.10.0"), version.parse("3.3.1"), version.parse("3.3.3")
 
     def __init__(self, emr_version: Version, spark_version: Version, hadoop_version: Version):
         """
@@ -175,13 +181,27 @@ def get_emr_cluster_state_type(cluster_status: Dict[str, Any]):
 
 
 def get_emr_cluster_failure_type(cluster_status: Dict[str, Any]):
+    # refer https://docs.aws.amazon.com/emr/latest/APIReference/API_DescribeCluster.html
+    error_details: List[Dict[str, str]] = cluster_status.get("ErrorDetails", [])
+    error_codes: Set[Optional[str]] = {error_detail.get("ErrorCode", None) for error_detail in error_details}
+    error_codes.discard(None)
+    if "INTERNAL_ERROR_EC2_INSUFFICIENT_CAPACITY_AZ" in error_codes:
+        # https://docs.aws.amazon.com/emr/latest/ManagementGuide/INTERNAL_ERROR_EC2_INSUFFICIENT_CAPACITY_AZ.html
+        return ComputeFailedSessionStateType.TRANSIENT
+
     state_change_reason = cluster_status["StateChangeReason"]
     code = state_change_reason["Code"]
     if code in ["USER_REQUEST"]:
         return ComputeFailedSessionStateType.STOPPED
     elif code in ["INTERNAL_ERROR", "VALIDATION_ERROR", "INSTANCE_FAILURE", "BOOTSTRAP_FAILURE", "STEP_FAILURE"]:
+        # refer
+        #   https://docs.aws.amazon.com/emr/latest/ManagementGuide/emr-troubleshoot-errors.html
         msg = state_change_reason["Message"]
         if code == "INTERNAL_ERROR" and "exceeds the EC2 service quota for that type." in msg:
+            return ComputeFailedSessionStateType.TRANSIENT
+        elif code == "INTERNAL_ERROR" and "EC2 is out of capacity" in msg:
+            return ComputeFailedSessionStateType.TRANSIENT
+        elif code == "INTERNAL_ERROR" and ("Throttled from Amazon EC2" in msg or "throttling from Amazon EC2" in msg):
             return ComputeFailedSessionStateType.TRANSIENT
         elif code == "VALIDATION_ERROR" and "The EBS volume limit was exceeded" in msg:
             return ComputeFailedSessionStateType.TRANSIENT
@@ -204,8 +224,11 @@ def get_emr_cluster_failure_type(cluster_status: Dict[str, Any]):
 def translate_glue_worker_type(worker_type: Union[GlueWorkerType, str]) -> str:
     return {
         "STANDARD": "m5.large",
+        "G.025X": "m5.large",
         "G.1X": "m5.xlarge",
         "G.2X": "m5.2xlarge",
+        "G.4X": "m5.4xlarge",
+        "G.8X": "m5.8xlarge",
     }[worker_type.value if isinstance(worker_type, GlueWorkerType) else worker_type]
 
 
@@ -222,7 +245,6 @@ def start_emr_job_flow(
     security_config: str,
     bootstrap_actions: Optional[List] = None,
 ):
-
     step_params = [
         {"Name": job_name, "ActionOnFailure": "TERMINATE_CLUSTER", "HadoopJarStep": {"Jar": "command-runner.jar", "Args": emr_cli_args}},
     ]
@@ -277,6 +299,7 @@ def build_glue_catalog_configuration(account_id: Optional[str] = None):
         "Classification": "spark-hive-site",
         "Properties": {
             "hive.metastore.client.factory.class": "com.amazonaws.glue.catalog.metastore.AWSGlueDataCatalogHiveClientFactory",
+            # "hive.metastore.client.factory.class": "com.amazonaws.glue.catalog.metastore.lakeformation.AWSGlueDataCatalogHiveClientFactoryForRedshift",
             # TODO support cross account glue catalog
             # https://docs.aws.amazon.com/emr/latest/ReleaseGuide/emr-spark-glue.html
             glue_catalog_id_key: account_id,
@@ -310,17 +333,18 @@ def terminate_emr_job_flow(emr_client, job_flow_ids: List[str]) -> Dict[Any, Any
     )
 
 
-def create_job_flow_instance_profile(iam_client, if_exec_role):
+def create_job_flow_instance_profile(iam_client, if_exec_role, instance_profile_name=None):
     try:
+        profile_name = if_exec_role if not instance_profile_name else instance_profile_name
         create_instance_profile_res = exponential_retry(
             iam_client.create_instance_profile,
             ["AccessDenied", "LimitExceededException", "ConcurrentModificationException", "ServiceFailureException"],
-            InstanceProfileName=if_exec_role,
+            InstanceProfileName=profile_name,
         )
         exponential_retry(
             iam_client.add_role_to_instance_profile,
             ["LimitExceededException", "ServiceFailureException"],
-            InstanceProfileName=if_exec_role,
+            InstanceProfileName=profile_name,
             RoleName=if_exec_role,
         )
         return create_instance_profile_res
@@ -330,18 +354,19 @@ def create_job_flow_instance_profile(iam_client, if_exec_role):
             raise
 
 
-def delete_instance_profile(iam_client, if_exec_role):
+def delete_instance_profile(iam_client, if_exec_role, instance_profile_name=None):
+    profile_name = if_exec_role if not instance_profile_name else instance_profile_name
     try:
         exponential_retry(
             iam_client.remove_role_from_instance_profile,
             ["LimitExceededException", "ServiceFailureException"],
-            InstanceProfileName=if_exec_role,
+            InstanceProfileName=profile_name,
             RoleName=if_exec_role,
         )
         exponential_retry(
             iam_client.delete_instance_profile,
             ["LimitExceededException", "ServiceFailureException", "DeleteConflictException"],
-            InstanceProfileName=if_exec_role,
+            InstanceProfileName=profile_name,
         )
     except ClientError as err:
         if "NoSuchEntity" not in get_code_for_exception(err):

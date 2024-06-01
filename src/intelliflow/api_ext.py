@@ -53,6 +53,7 @@ from .core.signal_processing.dimension_constructs import (
     DimensionVariantMapFunc,
 )
 from .core.signal_processing.routing_runtime_constructs import Route, RouteID, RuntimeLinkNode
+from .utils.spark import SparkType
 
 logger = logging.getLogger(__name__)
 
@@ -261,6 +262,38 @@ class SagemakerTransformJob(InternalDataNode.BatchComputeDescriptor):
             )
 
         super().__init__("", Lang.AWS_SAGEMAKER_TRANSFORM_JOB, ABI.NONE, extra_permissions, retry_count, **kwargs)
+
+
+class AWSBatchJob(InternalDataNode.BatchComputeDescriptor):
+    def __init__(
+        self,
+        jobDefinition: Union[str, Dict],
+        jobQueue: Union[str, Dict],
+        extra_permissions: List[Permission] = None,
+        retry_count: int = 0,
+        **kwargs,
+    ) -> None:
+        """Define a AWS Batch Job compute with at least jobDefinition and jobQueue parameters.
+        Parameter naming and values/types are compatible with
+        https://docs.aws.amazon.com/batch/latest/APIReference/API_SubmitJob.htmlo
+
+        with convenience exceptions of options;
+         - to define `jobDefinition` or `jobQueue` as strings (names) pointing to unmanaged
+        external resources (define `OrchestratorRoleARN` if they are from another account)
+        - or to define them as dictionaries for managed resources to be provisioned by the framework
+            - jobQueues can have "compute environment"s declared in nested dictionaries or again as unmanaged / external
+              resource strings (ARNs)
+        """
+        if not jobDefinition:
+            raise ValueError("AWS Batch job must have 'jobDefinition' defined!")
+
+        if not jobQueue:
+            raise ValueError("AWS Batch job must have 'jobQueue' defined!")
+
+        kwargs.update({"jobDefinition": jobDefinition})
+        kwargs.update({"jobQueue": jobQueue})
+
+        super().__init__("", Lang.AWS_BATCH_JOB, ABI.NONE, extra_permissions, retry_count, **kwargs)
 
 
 class ApplicationExt(Application):

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT-0
 
 import logging
-from typing import ClassVar, List
+from typing import ClassVar, List, Optional
 from uuid import uuid4
 
 import requests
@@ -27,7 +27,11 @@ from intelliflow.core.platform.definitions.aws.common import (
     get_aws_region_from_arn,
     put_inlined_policy,
 )
-from intelliflow.core.platform.definitions.compute import ComputeInternalError, ComputeRetryableInternalError
+from intelliflow.core.platform.definitions.compute import (
+    ComputeInternalError,
+    ComputeRetryableInternalError,
+    ComputeRuntimeTemplateRenderer,
+)
 from intelliflow.core.serialization import dumps
 from intelliflow.core.signal_processing import Signal, Slot
 from intelliflow.core.signal_processing.slot import SlotType
@@ -45,6 +49,7 @@ class SlackAction(RoutingComputeInterface.IInlinedCompute, RoutingHookInterface.
         self._permissions = (
             [Permission(resource=[arn], action=[self.AWS_GET_SECRET_VALUE_ACTION]) for arn in slack.aws_secret_arns] if slack else None
         )
+        self._permissions_for_secret = None
 
     @property
     def slack(self):
@@ -55,8 +60,28 @@ class SlackAction(RoutingComputeInterface.IInlinedCompute, RoutingHookInterface.
         self._slack = slack_obj
 
     @property
-    def permissions(self):
-        return self._permissions
+    def permissions(self) -> Optional[List[Permission]]:
+        if self._permissions and self._permissions_for_secret:
+            return self._permissions + self._permissions_for_secret
+        elif self._permissions:
+            return self._permissions
+        elif self._permissions_for_secret:
+            return self._permissions_for_secret
+
+        return None
+
+    # overrides (ComputeDescriptor::parametrize)
+    def parametrize(self, platform: "HostPlatform") -> None:
+        if self.slack:
+            # add permission to use aws/secretmanager AWS managed key (implicitly used by GetSecretValue action)
+            account_id = platform.conf.get_param(AWSCommonParams.ACCOUNT_ID)
+            region = platform.conf.get_param(AWSCommonParams.REGION)
+            self._permissions_for_secret = [
+                Permission(
+                    action=["kms:Encrypt", "kms:Decrypt", "kms:ReEncrypt*", "kms:GenerateDataKey*", "kms:DescribeKey"],
+                    resource=[f"arn:aws:kms:{region}:{account_id}:key/*"],
+                )
+            ]
 
     # overrides (ComputeDescriptor::create_slot)
     def create_slot(self, output_signal: Signal) -> Slot:
@@ -116,7 +141,6 @@ class SlackAction(RoutingComputeInterface.IInlinedCompute, RoutingHookInterface.
         *args,
         **params,
     ) -> Any:
-
         # establish params dict for inlined compute. 'params' as kwargs is to be compatible with IHook interface. so
         # it should be an empty dict for IInlinedCompute.
         # we don't provide params as kwargs in IInlinedCompute interface, so for backwards compatibility reasons
@@ -126,8 +150,16 @@ class SlackAction(RoutingComputeInterface.IInlinedCompute, RoutingHookInterface.
         inlined_compute_args = InlinedComputeParamExtractor(
             input_map_OR_routing_table, materialized_output_OR_route_record, *args, **params
         )
+        message = self.slack.message
         if inlined_compute_args:
             _, _, params = inlined_compute_args
+            if message:
+                # runtime parametrization of desc (e.g variables mapping to input/output alias' and output dimensions)
+                # using the pattern ${VARIABLE} will be mapped to their runtime values.
+                renderer = ComputeRuntimeTemplateRenderer(
+                    list(input_map_OR_routing_table.values()), materialized_output_OR_route_record, params
+                )
+                message = renderer.render(message)
 
         route_id, node_info = get_route_information_from_callback(
             input_map_OR_routing_table, materialized_output_OR_route_record, *args, **params
@@ -139,7 +171,7 @@ class SlackAction(RoutingComputeInterface.IInlinedCompute, RoutingHookInterface.
         # simply removing {}""'' from output string for a better look
         trans_table = node_info.maketrans("", "", "{}\"\"''")
 
-        data = {"Content": self.slack.message + node_info.translate(trans_table)}
+        data = {"Content": message + node_info.translate(trans_table)}
 
         for recipient in self.slack.recipient_list:
             try:

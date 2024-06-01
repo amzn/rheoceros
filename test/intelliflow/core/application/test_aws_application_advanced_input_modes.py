@@ -683,6 +683,16 @@ class TestAWSApplicationAdvancedInputModes(AWSTestBase):
         app._dev_context = dev_context
         #
 
+        app.activate()
+
+        now = datetime.now()
+
+        # "nearest" range is not satisfied. no partition exists within 7 days range
+        with pytest.raises(RuntimeError):
+            app.execute(default_selection_features["NA"][now])
+
+        add_test_data(app, eureka_offline_all_data[now - timedelta(2)], "_SUCCESS", "")
+
         # happy path, system will satisfy both inputs and nearest will operate as a normal input over the same date
         # partition. no difference here.
         assert app.execute(default_selection_features["NA"][datetime.now()])
@@ -696,8 +706,17 @@ class TestAWSApplicationAdvancedInputModes(AWSTestBase):
         assert not path
         assert len(app.get_active_route(default_selection_features).route.pending_nodes) == 1
 
-        # event for 'nearest' comes in for the day before but it should be ok since it is within the range
+        # show that this will have no effect on pending node for 2020-03-18
+        # incoming events for "dependent" signals (reference, nearest) are just ignored in dependency check.
+        # we always read from remote partition for resource / partition existence.
         app.process(eureka_offline_all_data["2020-03-17"])
+        path, _ = app.poll(default_selection_features["NA"]["2020-03-18"])
+        assert not path
+
+        # 'nearest' detects the completion for the day before but it should be ok since it is within the range
+        add_test_data(app, eureka_offline_all_data["2020-03-17"], "_SUCCESS", "")
+        # force next-cycle (orchestrator checks pending executions, etc)
+        app.update_active_routes_status()
         path, _ = app.poll(default_selection_features["NA"]["2020-03-18"])
         # succeeded! output using '2020-03-17' for 'offline_data' is ready.
         assert path
@@ -713,32 +732,16 @@ class TestAWSApplicationAdvancedInputModes(AWSTestBase):
             output_dim_links=[("day", EQUALS, eureka_offline_training_data("day"))],
         )
         # again this trivial case should succeed as usual
+        add_test_data(app, eureka_offline_all_data["2020-04-01"], "_SUCCESS", "")
         assert app.execute(default_selection_features_reverse_inputs["2020-04-01"])
         assert len(app.get_active_route(default_selection_features_reverse_inputs).route.pending_nodes) == 0
 
-        # 2.1 - satisfy the nearest. it is different than 'ref' signals, this won't get wasted and cause a pending signal.
-        app.process(eureka_offline_all_data["2020-04-02"])
-        assert len(app.get_active_route(default_selection_features_reverse_inputs).route.pending_nodes) == 1
-
-        # 2.2 - the following day event comes for normal/independent (second) input
-        #       nearest is automatically materialized for 2020-04-03 and since it is range is satisfied already
-        #       execution begins. This happens thanks to range transfer from previous node (2020-04-02)
-        app.process(eureka_offline_training_data["NA"]["2020-04-03"])
-        path, _ = app.poll(default_selection_features_reverse_inputs["2020-04-03"])
-        assert path
-        assert len(app.get_active_route(default_selection_features_reverse_inputs).route.pending_nodes) == 1
-
-        # 3- finally do the previous test with artifical partitions
+        # 2- do another test with artifical partitions
         add_test_data(app, eureka_offline_all_data["2020-05-01"], "_SUCCESS", "")
         # this should be enough to cause a trigger on the following day.
         app.process(eureka_offline_training_data["NA"]["2020-05-02"])
         path, _ = app.poll(default_selection_features_reverse_inputs["2020-05-02"])
         assert path
-        # remaining node is from "2.1"
-        assert len(app.get_active_route(default_selection_features_reverse_inputs).route.pending_nodes) == 1
-
-        # consume the remaining node
-        app.process(eureka_offline_training_data["NA"]["2020-04-02"])
         assert len(app.get_active_route(default_selection_features_reverse_inputs).route.pending_nodes) == 0
 
         self.patch_aws_stop()
@@ -777,6 +780,10 @@ class TestAWSApplicationAdvancedInputModes(AWSTestBase):
         app._dev_context = dev_context
         #
 
+        app.activate()
+
+        add_test_data(app, eureka_offline_training_data["NA"]["2020-04-01"], "_SUCCESS", "")
+
         # again this trivial case should succeed as usual
         assert app.execute(default_selection_features["2020-04-01"])
         assert len(app.get_active_route(default_selection_features).route.pending_nodes) == 0
@@ -786,7 +793,8 @@ class TestAWSApplicationAdvancedInputModes(AWSTestBase):
         assert app.process(daily_timer["2020-05-01"])
         assert not app.poll(default_selection_features["2020-05-01"])[0]
         assert len(app.get_active_route(default_selection_features).route.pending_nodes) == 1
-        app.process(eureka_offline_training_data["NA"]["2020-05-02"])
+        add_test_data(app, eureka_offline_training_data["NA"]["2020-05-02"], "_SUCCESS", "")
+        app.update_active_routes_status()
         assert app.poll(default_selection_features["2020-05-01"])[0]
         assert len(app.get_active_route(default_selection_features).route.pending_nodes) == 0
 

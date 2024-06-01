@@ -30,7 +30,6 @@ def signal_dimension_tuple(signal: Signal, dimension_name_or_variant: Union[str,
 
 
 class TestSignalLinkNode:
-
     signal_link_node_1 = SignalLinkNode([TestSignal.signal_internal_1])
     signal_link_node_1_cloned = copy.deepcopy(signal_link_node_1)
 

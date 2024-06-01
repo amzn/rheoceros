@@ -34,6 +34,7 @@ from intelliflow.utils.digest import calculate_bytes_sha256
 from ...constructs import (
     FEEDBACK_SIGNAL_PROCESSING_MODE_KEY,
     FEEDBACK_SIGNAL_TYPE_EVENT_KEY,
+    SIGNAL_IS_BLOCKED_KEY,
     SIGNAL_TARGET_ROUTE_ID_KEY,
     ConstructInternalMetricDesc,
     ConstructParamsDict,
@@ -110,7 +111,7 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
     MAIN_LOOP_INTERVAL_IN_MINUTES: ClassVar[int] = 1
     REPLAY_LOOP_INTERVAL_IN_MINUTES: ClassVar[int] = 5
 
-    #  TODO turn into a app-level exposed driver param
+    CORE_LAMBDA_CONCURRENCY_PARAM: ClassVar[str] = "CORE_LAMBDA_CONCURRENCY"
     MAX_CORE_LAMBDA_CONCURRENCY: ClassVar[int] = 15  # set to None to remove limit
     MAX_REPLAY_LAMBDA_CONCURRENCY: ClassVar[int] = 1
 
@@ -140,6 +141,7 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
 
         self._main_loop_timer_id = None
         self._replay_loop_timer_id = None
+        self._update_desired_core_lambda_concurrency()
 
     def _deserialized_init(self, params: ConstructParamsDict) -> None:
         super()._deserialized_init(params)
@@ -148,6 +150,16 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
         self._bucket = get_bucket(self._s3, self._bucket_name)
         self._sqs = self._session.client(service_name="sqs", region_name=self._region)
         self._sns = self._session.client(service_name="sns", region_name=self._region)
+        self._update_desired_core_lambda_concurrency()
+
+    def _update_desired_core_lambda_concurrency(self) -> None:
+        self._desired_core_lambda_concurrency = self._params.get(self.CORE_LAMBDA_CONCURRENCY_PARAM, self.MAX_CORE_LAMBDA_CONCURRENCY)
+        if self._desired_core_lambda_concurrency <= 0:
+            raise ValueError(f"{self.CORE_LAMBDA_CONCURRENCY_PARAM!r} must be greater than zero!")
+
+    @property
+    def desired_core_lambda_concurrency(self) -> int:
+        return self._desired_core_lambda_concurrency
 
     def _serializable_copy_init(self, org_instance: "BaseConstruct") -> None:
         AWSConstructMixin._serializable_copy_init(self, org_instance)
@@ -165,6 +177,7 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
         target_route_id: Optional[RouteID] = None,
         is_async=True,
         filter=False,
+        is_blocked=False,
     ) -> Optional[List[RoutingTable.Response]]:
         if isinstance(signal_or_event, Signal):
             lambda_event = {
@@ -176,6 +189,9 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
 
         if target_route_id:
             lambda_event.update({SIGNAL_TARGET_ROUTE_ID_KEY: target_route_id})
+
+        if is_blocked:
+            lambda_event.update({SIGNAL_IS_BLOCKED_KEY: is_blocked})
 
         if use_activated_instance or not self._dev_platform:
             while True:
@@ -231,7 +247,7 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
     def resume(self) -> None:
         concurreny_limit = self.concurrency_limit
         if concurreny_limit is None:
-            concurreny_limit = self.MAX_CORE_LAMBDA_CONCURRENCY
+            concurreny_limit = self._desired_core_lambda_concurrency
 
         if concurreny_limit:
             exponential_retry(
@@ -331,6 +347,7 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
             # then add permission with "lambda:InvokeFunction" using self._lambda_arn
             # (for that, we should build lambda_arn during dev_init, not as a response to create_function)
             ConstructPermission([self._lambda_arn], ["lambda:InvokeFunction"]),
+            ConstructPermission([self._filter_lambda_arn], ["lambda:InvokeFunction"]),
             # DLQ (let exec-role send messages to DLQ)
             ConstructPermission(
                 [
@@ -728,7 +745,7 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
 
         concurreny_limit = self.concurrency_limit
         if concurreny_limit is None:
-            concurreny_limit = self.MAX_CORE_LAMBDA_CONCURRENCY
+            concurreny_limit = self._desired_core_lambda_concurrency
         if concurreny_limit:
             exponential_retry(
                 put_function_concurrency,
@@ -2401,6 +2418,7 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
         # currently we check the queue optimistically at the end of each cycle
         routing_responses: List[RoutingTable.Response] = []
         target_route_id = event.get(SIGNAL_TARGET_ROUTE_ID_KEY, None)
+        is_blocked = event.get(SIGNAL_IS_BLOCKED_KEY, False)
         serialized_feed_back_signal: str = event.get(FEEDBACK_SIGNAL_TYPE_EVENT_KEY, None)
 
         if not serialized_feed_back_signal:
@@ -2433,7 +2451,7 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
 
                         resource_path = resource_path + source_spec.path_delimiter() + required_resource_name
                     routing_response = runtime_platform.routing_table.receive(
-                        feed_back_signal.type, source_spec.source, resource_path, target_route_id, filter_only, routing_session
+                        feed_back_signal.type, source_spec.source, resource_path, target_route_id, filter_only, routing_session, is_blocked
                     )
                     routing_responses.append(routing_response)
                     if processing_mode == FeedBackSignalProcessingMode.ONLY_HEAD:
@@ -2522,7 +2540,7 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
                     # reactions are expected to be put in processor queue.
                     # let router will take care of them as well.
                     routing_response = runtime_platform.routing_table.receive(
-                        signal_type, SignalSourceType.S3, resource_path, target_route_id, filter_only, routing_session
+                        signal_type, SignalSourceType.S3, resource_path, target_route_id, filter_only, routing_session, is_blocked
                     )
                     routing_responses.append(routing_response)
 
@@ -2564,7 +2582,7 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
                         signal_type = SignalType.CW_ALARM_STATE_CHANGE
 
                     routing_response = runtime_platform.routing_table.receive(
-                        signal_type, source_type, resource_path, target_route_id, filter_only, routing_session
+                        signal_type, source_type, resource_path, target_route_id, filter_only, routing_session, is_blocked
                     )
                     routing_responses.append(routing_response)
         elif "source" in event and event["source"] == "aws.glue":
@@ -2598,6 +2616,7 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
                         target_route_id,
                         filter_only,
                         routing_session,
+                        is_blocked,
                     )
                     routing_responses.append(routing_response)
         elif "source" in event and event["source"] == "aws.events":
@@ -2612,7 +2631,13 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
                         # if timer_id is not internal poller
                         resource_path: str = TimerSignalSourceAccessSpec.create_resource_path(timer_id, event_time)
                         routing_response = runtime_platform.routing_table.receive(
-                            SignalType.TIMER_EVENT, SignalSourceType.TIMER, resource_path, target_route_id, filter_only, routing_session
+                            SignalType.TIMER_EVENT,
+                            SignalSourceType.TIMER,
+                            resource_path,
+                            target_route_id,
+                            filter_only,
+                            routing_session,
+                            is_blocked,
                         )
                         routing_responses.append(routing_response)
                     else:
@@ -2621,7 +2646,7 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
                         # NEXT CYCLE IN MAIN LOOP
                         runtime_platform.routing_table.check_active_routes(routing_session)
                 except NameError as bad_code_path:
-                    module_logger.error(
+                    module_logger.critical(
                         f"Processor failed to process resource: {resource!r} due to a missing internal "
                         f" dependency or symbol!"
                         f" Signal Type: {SignalType.TIMER_EVENT},"
@@ -2631,9 +2656,9 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
                     # we cannot bail out at this point, since we need to iterate over other signals
                     self.metric("processor.event.failure.type")["NameError"].emit(1)
                 except Exception as error:
-                    module_logger.error(
+                    module_logger.critical(
                         f"Received event: {event} contains an unrecognized resource: {resource}!"
-                        f" Error: {str(error)}"
+                        f" Error: '{str(error)}'."
                         f" Ignoring and moving to the next event resource..."
                     )
                     self.metric("processor.event.failure.type")["Exception"].emit(1)
@@ -2650,8 +2675,8 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
             module_logger.critical(f"Consuming {len(queued_events)} events from queue.")
             self.metric(f"processor{'.filter' if filter_only else ''}.event.type")["ProcessorQueue"].emit(len(queued_events))
             for event in queued_events:
-                # recursive call (create another lambda context for the handling of this event)
-                runtime_platform.processor.process(event, True)
+                # recursive call through filter lambda (create another lambda context for the handling of this event)
+                runtime_platform.processor.process(event, True, filter=True)
                 module_logger.critical("Recursive invocation successful!")
             runtime_platform.processor_queue.delete(queued_events)
 

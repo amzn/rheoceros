@@ -16,7 +16,7 @@ timer_signal_daily = app.add_timer(id="daily_timer"
 
 xdex = app.marshal_external_data(
     external_data_desc=S3Dataset("111222333444",
-                                 "dxg-dev-external-data-poc",
+                                 "<dxg-dev-external-data-poc_BUCKET>",
                                  "xdex",
                                  # placeholder for 'region'
                                  "{}",

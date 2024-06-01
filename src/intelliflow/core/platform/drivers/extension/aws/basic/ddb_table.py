@@ -16,7 +16,7 @@ from intelliflow.core.signal_processing.signal_source import CWMetricSignalSourc
 from .....constructs import ConstructInternalMetricDesc, ConstructParamsDict, ConstructPermission, ConstructSecurityConf
 from .....definitions.aws.common import CommonParams as AWSCommonParams
 from .....definitions.aws.common import exponential_retry
-from .....definitions.aws.ddb.client_wrapper import BillingMode, create_table, delete_table, update_table
+from .....definitions.aws.ddb.client_wrapper import BillingMode, create_table, delete_table, update_table, update_ttl
 from .....definitions.common import ActivationParams
 from ....aws_common import AWSConstructMixin
 
@@ -35,12 +35,14 @@ class AWSDDBTableExtension(AWSConstructMixin, Extension):
             table_name: Optional[str] = None,
             key_schema: List[Dict[str, str]] = [{"AttributeName": "id", "KeyType": "HASH"}],
             attribute_def: List[Dict[str, str]] = [{"AttributeName": "id", "AttributeType": "S"}],
+            ttl_attribute_name: Optional[str] = None,
             **extra_boto_args,
         ) -> None:
             super().__init__(extension_id, **extra_boto_args)
             self._table_name = table_name
             self._key_schema = key_schema
             self._attribute_def = attribute_def
+            self._ttl_attribute_name = ttl_attribute_name
             self._billing_mode = BillingMode.PAY_PER_REQUEST
 
             if "TableName" in extra_boto_args:
@@ -63,6 +65,10 @@ class AWSDDBTableExtension(AWSConstructMixin, Extension):
         @property
         def attribute_def(self) -> List[Dict[str, str]]:
             return self._attribute_def
+
+        @property
+        def ttl_attribute_name(self) -> Optional[str]:
+            return self._ttl_attribute_name
 
         @property
         def billing_mode(self) -> BillingMode:
@@ -96,6 +102,10 @@ class AWSDDBTableExtension(AWSConstructMixin, Extension):
     @property
     def table_name(self) -> str:
         return self._table_name
+
+    @property
+    def table_arn(self) -> str:
+        return f"arn:aws:dynamodb:{self._region}:{self._account_id}:table/{self._table_name}"
 
     def _deserialized_init(self, params: ConstructParamsDict) -> None:
         super()._deserialized_init(params)
@@ -375,6 +385,8 @@ class AWSDDBTableExtension(AWSConstructMixin, Extension):
             else:
                 module_logger.error(f"An error occurred while trying to create/reset {self._table_name}")
                 raise
+
+        update_ttl(self._table, self.desc.ttl_attribute_name)
 
         super().activate()
 

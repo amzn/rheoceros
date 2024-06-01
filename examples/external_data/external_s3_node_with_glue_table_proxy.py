@@ -22,7 +22,7 @@ app.set_security_conf(Storage, ConstructSecurityConf(persisting=ConstructPersist
 
 encryption_key = "arn:aws:kms:us-east-1:800261124827:key/5be55530-bb8e-4e95-8185-6e1afab0de54"
 search_tommy_data = app.marshal_external_data(
-    external_data_desc= S3Dataset("800261124827", "a9-sa-data-tommy-datasets-prod", "tommy-asin-parquet-hourly", "{}", "{}", "{}",
+    external_data_desc= S3Dataset("800261124827", "<a9-sa-data-tommy-datasets-prod>", "tommy-asin-parquet-hourly", "{}", "{}", "{}",
                                   dataset_format=DataFormat.PARQUET, encryption_key=encryption_key)
                             .link(
                                   # Link the PROXY !!!

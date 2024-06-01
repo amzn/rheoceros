@@ -28,6 +28,6 @@ setuptools~=65.5.1
 python-dateutil~=2.8.2
 dill~=0.3.4
 packaging~=21.3
-shortuuid~=1.0.11
-overrides~=7.4.0
-validators~=0.20.0
+shortuuid
+overrides
+validators

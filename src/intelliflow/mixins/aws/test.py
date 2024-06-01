@@ -4,6 +4,7 @@
 # TODO
 #  - move Spark related mixins from Catalog app here as reusable mixins.
 #  - partition and migrate reusable parts of test.intelliflow.core.platform.test_commons here as mixins.
+import concurrent.futures
 import datetime
 import os
 import threading
@@ -14,12 +15,14 @@ from unittest.mock import MagicMock
 import boto3
 import pytest
 from dateutil.tz import tzlocal
+from moto import mock_batch_simple  # so as to avoid docket in the background (oterhwise use mock_batch)
 from moto import (
     mock_applicationautoscaling,
     mock_athena,
     mock_autoscaling,
     mock_cloudwatch,
-    mock_dynamodb2,
+    mock_dynamodb,
+    mock_ec2,
     mock_emr,
     mock_events,
     mock_glue,
@@ -69,7 +72,7 @@ class AWSTestBase:
         mock_glue(),
         mock_emr(),
         mock_events(),
-        mock_dynamodb2(),
+        mock_dynamodb(),
         mock_iam(),
         mock_sts(),
         mock_s3(),
@@ -82,6 +85,8 @@ class AWSTestBase:
         mock_ses(),
         mock_athena(),
         mock_cloudwatch(),
+        mock_batch_simple(),
+        mock_ec2(),
     ]
 
     # COMPENSATE MOTO
@@ -140,6 +145,9 @@ class AWSTestBase:
     # Application layer
     _real_external_nodes_glue_catalog = external_nodes.glue_catalog
     _real_platform_development_attach_aws_managed_policy = development.attach_aws_managed_policy
+    # TODO temp fix till boto update
+    _real_platform_development_update_role = development.update_role
+    _real_platform_development_update_role_trust_policy = development.update_role_trust_policy
 
     # signal_processing
     _real_routing_runtime_constructs_glue_catalog = routing_runtime_constructs.glue_catalog
@@ -166,7 +174,7 @@ class AWSTestBase:
 
     @pytest.fixture(scope="class")
     def ddb_resource(self, aws_credentials):
-        with mock_dynamodb2():
+        with mock_dynamodb():
             yield boto3.resource(service_name="dynamodb", region_name=self.region)
 
     @pytest.fixture(scope="class")
@@ -186,6 +194,7 @@ class AWSTestBase:
         glue_job_exists=False,
         glue_catalog_has_all_tables=False,
         glue_catalog: Optional[AWSTestGlueCatalog] = None,
+        concurrent_executor_pool_size: int = 0,
     ):
         for service in self._aws_services:
             service.start()
@@ -221,6 +230,8 @@ class AWSTestBase:
             routing_runtime_constructs.glue_catalog = glue_catalog
 
         development.attach_aws_managed_policy = MagicMock()
+        development.update_role = MagicMock()
+        development.update_role_trust_policy = MagicMock()
 
         # orchestration local message loop
         self._processor_thread: threading.Thread = None
@@ -229,6 +240,10 @@ class AWSTestBase:
         self._cycle_time_in_secs: int = None
 
         self._routingtable_route_mutex_map: Dict[routing_runtime_constructs.RouteID, threading.RLock] = dict()
+
+        self.pool: concurrent.futures.ThreadPoolExecutor = None
+        if concurrent_executor_pool_size > 0:
+            self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=concurrent_executor_pool_size)
 
     def activate_event_propagation(self, app: "Application", cycle_time_in_secs: int = 60):
         if self._processor_thread:
@@ -314,6 +329,11 @@ class AWSTestBase:
         routing_runtime_constructs.glue_catalog = AWSTestBase._real_routing_runtime_constructs_glue_catalog
 
         development.attach_aws_managed_policy = AWSTestBase._real_platform_development_attach_aws_managed_policy
+        development.update_role = AWSTestBase._real_platform_development_update_role
+        development.update_role_trust_policy = AWSTestBase._real_platform_development_update_role_trust_policy
+
+        if self.pool:
+            self.pool.shutdown(wait=False)
 
     def _patch_lambda_start(self, invoke_lambda_function_mock=None):
         def create_lambda_function(

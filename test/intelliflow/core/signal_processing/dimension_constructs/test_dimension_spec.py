@@ -67,7 +67,6 @@ class TestDimension:
 
 
 class TestDimensionSpec:
-
     dimension_spec_single_dim = DimensionSpec([Dimension("dim_1_1", Type.LONG)], [None])
 
     dimension_spec_branch_lvl_2 = DimensionSpec(

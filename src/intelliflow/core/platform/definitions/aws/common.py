@@ -9,7 +9,7 @@ import logging
 import os
 import time
 from enum import Enum, unique
-from typing import Any, Dict, Iterator, List, Sequence, Set, Tuple, Union, cast, overload
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union, cast, overload
 
 import boto3
 import botocore
@@ -108,6 +108,7 @@ AWS_COMMON_RETRYABLE_ERRORS = [
     "Unavailable",
     "InternalFailure",
     "InternalError",
+    "InternalServerError",
     "LimitExceededException",
     "ServiceUnavailable",
     "ServiceUnavailableException",
@@ -296,7 +297,7 @@ def is_assumed_role_session(user_arn: str) -> bool:
     return user_arn.startswith(AWS_STS_ARN_ROOT) and user_arn.split(":")[5].startswith("assumed-role")
 
 
-def _get_trust_policy(allowed_services: Sequence[str], allowed_aws_entities: Set[str], external_id: str) -> str:
+def _get_trust_policy(allowed_services: Sequence[str], allowed_aws_entities: Set[str], external_ids: List[str]) -> str:
     """Example allowed_service: 'ec2.amazonaws.com'"""
 
     statement = []
@@ -310,18 +311,16 @@ def _get_trust_policy(allowed_services: Sequence[str], allowed_aws_entities: Set
         )
 
     if allowed_aws_entities:
-        account_statement = [
-            {"Effect": "Allow", "Principal": {"AWS": entity}, "Action": "sts:AssumeRole"} for entity in allowed_aws_entities
-        ]
-        account_statement = account_statement + [
-            {"Effect": "Allow", "Principal": {"AWS": entity}, "Action": "sts:TagSession"} for entity in allowed_aws_entities
+        account_statements = [
+            {"Effect": "Allow", "Principal": {"AWS": entity}, "Action": ["sts:AssumeRole", "sts:TagSession"]}
+            for entity in allowed_aws_entities
         ]
 
-        if external_id:
-            for statement in account_statement:
-                statement.update({"Condition": {"StringEquals": {"sts:ExternalId": [external_id]}}})
+        if external_ids:
+            for acct_statement in account_statements:
+                acct_statement.update({"Condition": {"StringEquals": {"sts:ExternalId": external_ids}}})
 
-        statement.extend(account_statement)
+        statement.extend(account_statements)
 
     trust_policy.update({"Statement": statement})
     return json.dumps(trust_policy)
@@ -356,7 +355,7 @@ def create_role(
     auto_trust_caller_identity=True,
     allowed_services: Sequence[str] = [],
     allowed_aws_entities: Sequence[str] = [],
-    external_id: str = None,
+    external_ids: Optional[List[str]] = None,
 ):
     """
     Creates a role that lets a list of specified services assume the role.
@@ -374,7 +373,7 @@ def create_role(
             iam.create_role,
             ["AccessDenied", "ServiceFailureException"],
             RoleName=role_name,
-            AssumeRolePolicyDocument=_get_trust_policy(allowed_services, trusted_entities, external_id),
+            AssumeRolePolicyDocument=_get_trust_policy(allowed_services, trusted_entities, external_ids),
             MaxSessionDuration=MAX_ASSUME_ROLE_DURATION,
         )
         if "role_exists" in iam.waiter_names:
@@ -406,6 +405,22 @@ def attach_aws_managed_policy(role_name: str, managed_policy_name: str, base_ses
         raise
 
 
+def has_aws_managed_policy(managed_policy_name: str, base_session: boto3.Session) -> bool:
+    """
+    managed_policy_name: can be a full AWS managed policy arn or just the policy name
+    """
+    iam = base_session.client("iam")
+    policy_arn = normalize_policy_arn(managed_policy_name)
+    try:
+        response = exponential_retry(iam.get_policy, ["ServiceFailureException", "AccessDenied"], PolicyArn=policy_arn)
+        if response and "Policy" in response:
+            return True
+    except ClientError as err:
+        if err.response["Error"]["Code"] not in ["NoSuchEntity", "NoSuchEntityException"]:
+            raise
+    return False
+
+
 def normalize_policy_arn(managed_policy_name):
     return managed_policy_name if managed_policy_name.startswith("arn:") else f"arn:aws:iam::aws:policy/{managed_policy_name}"
 
@@ -418,7 +433,7 @@ def update_role(
     allowed_services: Sequence[str] = [],
     new_allowed_aws_entities: Sequence[str] = [],
     keep_existing_aws_entities: bool = False,
-    external_id: str = None,
+    external_ids: Optional[List[str]] = None,
 ) -> None:
     """
     Updates a role that lets a list of specified services and entities assume the role (trust policy).
@@ -446,7 +461,7 @@ def update_role(
         exponential_retry(
             iam.update_assume_role_policy,
             ["Throttling", "MalformedPolicyDocument"],  # malformed policy might be received if any of the entities is new
-            PolicyDocument=_get_trust_policy(allowed_services, trusted_entities, external_id),
+            PolicyDocument=_get_trust_policy(allowed_services, trusted_entities, external_ids),
             RoleName=role_name,
         )
         module_logger.info(f"Updated role {role_name} for new services {allowed_services} and new entities {new_allowed_aws_entities}")

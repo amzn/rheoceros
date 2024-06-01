@@ -221,10 +221,10 @@ class TestAWSApplicationComputeTargets(AWSTestBase):
                 BatchCompute(
                     scala_script(
                         """ this won't get executed in this unit-test, so don't matter. """,
-                        external_library_paths=["s3://{JAR_BUCKET}/batch/glue-super.jar"],
+                        external_library_paths=["s3://if-awsglue-adex-ml-230392972774-us-east-1/batch/DexmlBladeGlue-super.jar"],
                     ),
                     lang=Lang.SCALA,
-                    GlueVersion="2.0",
+                    GlueVersion="4.0",
                     WorkerType=GlueWorkerType.G_1X.value,
                     NumberOfWorkers=2,
                     Timeout=3 * 60,  # 3 hours
@@ -299,8 +299,8 @@ class TestAWSApplicationComputeTargets(AWSTestBase):
                     scala_script(
                         """ this won't get executed in this unit-test, so don't matter. """,
                         external_library_paths=[
-                            "s3://{JAR_BUCKET}/batch/DexmlBladeGlue-super.jar",
-                            "s3://{THIS_IS}/A NEW LIBRARY PATH",
+                            "s3://if-awsglue-adex-ml-230392972774-us-east-1/batch/DexmlBladeGlue-super.jar",
+                            "s3://THIS_IS/A NEW LIBRARY PATH",
                         ],
                     ),
                     lang=Lang.SCALA,
@@ -505,7 +505,7 @@ class TestAWSApplicationComputeTargets(AWSTestBase):
                 BatchCompute(
                     scala_script(
                         dummy_scala_code,
-                        external_library_paths=["s3://{JAR_BUCKET}/batch/DexmlBladeGlue-super.jar"],
+                        external_library_paths=["s3://if-awsglue-adex-ml-230392972774-us-east-1/batch/DexmlBladeGlue-super.jar"],
                     ),
                     lang=Lang.SCALA,
                     GlueVersion="2.0",

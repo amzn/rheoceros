@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -15,7 +15,6 @@ from intelliflow.utils.test.inlined_compute import NOOPCompute
 
 
 class TestAWSApplicationExternalDataLinking(AWSTestBase):
-
     app: Application = None
 
     def test_application_external_data_linking(self):
@@ -322,5 +321,86 @@ class TestAWSApplicationExternalDataLinking(AWSTestBase):
 
         path, compute_records = self.app.poll(tommy_daily_2["se"]["2021-03-08"])
         assert path
+
+        self.patch_aws_stop()
+
+    def test_application_external_data_linking_with_shift(self):
+        self.patch_aws_start(glue_catalog_has_all_andes_tables=True)
+
+        REGION_DIMENSION = "region_id"
+        MARKETPLACE_DIMENSION = "marketplace_id"
+        DATE_DIMENSION = "date"
+
+        PIPELINE_DIMENSION_SPEC = {
+            REGION_DIMENSION: {
+                type: DimensionType.LONG,
+                MARKETPLACE_DIMENSION: {
+                    type: DimensionType.LONG,
+                    DATE_DIMENSION: {type: DimensionType.DATETIME, "granularity": DatetimeGranularity.DAY, "format": "%Y-%m-%d"},
+                },
+            }
+        }
+
+        self.app = AWSApplication("shifted-link", self.region)
+
+        pdex_logs = self.app.andes(
+            "dex-ml",
+            "pdex_logs",
+            partition_keys=["region_id", "dateset_date"],
+            dimension_spec={
+                "region_id": {
+                    type: DimensionType.STRING,
+                    "dataset_date": {type: DimensionType.DATETIME, "format": "%Y-%m-%d %H:00:00", "granularity": DatetimeGranularity.HOUR},
+                }
+            },
+        )
+
+        daily_timer = self.app.add_timer(
+            "weekly_timer",
+            "cron(0 0 ? * SAT *)",  # every SAT UTC 00:00. Octopus data cadence is weekly and partition date is using SAT
+            time_dimension_id="date",
+            time_dimension_granularity=DatetimeGranularity.DAY,
+        )
+
+        valve = self.app.project(
+            f"REGIONAL_DAILY_TIMER",
+            input=daily_timer,
+            output_dimension_spec=PIPELINE_DIMENSION_SPEC,
+            output_dimension_filter={
+                1: {
+                    1: {"*": {}},
+                },
+            },
+        )
+
+        pdex_daily = self.app.create_data(
+            id="PDEX_DAILY",
+            inputs={
+                "valve": valve,
+                "pdex": pdex_logs["*"][23 : -(24 + 12)].ref.range_check(False),
+            },
+            compute_targets=[NOOPCompute],
+            input_dim_links=[
+                (pdex_logs("dataset_date"), lambda x: x - timedelta(1), valve(DATE_DIMENSION)),
+                (valve(DATE_DIMENSION), lambda x: x + timedelta(1), pdex_logs("dataset_date")),
+                (
+                    pdex_logs("region_id"),
+                    lambda region_id: {1: "NA", 2: "EU", 3: "FE", 4: "EU", 5: "EU"}[region_id],
+                    valve(REGION_DIMENSION),
+                ),
+            ],
+            output_dim_links=[
+                (DATE_DIMENSION, EQUALS, pdex_logs("dataset_date")),
+                # TODO this should not be required
+                #  due to auto_output_dim_linking_enabled=True, output has date dimension equal to date dimensions from
+                #  both inputs in an inconsistent way. this is being tracked a backlog item already.
+                #  https://issues.amazon.com/issues/OLAF-11814
+                (valve(DATE_DIMENSION), lambda x: x + timedelta(1), DATE_DIMENSION),
+            ],
+            output_dimension_spec=PIPELINE_DIMENSION_SPEC,
+            dataset_format=DataFormat.PARQUET,
+        )
+
+        assert self.app.execute(pdex_daily[1][1]["2023-11-04"], wait=True, recursive=True), "Node must be executable!"
 
         self.patch_aws_stop()
