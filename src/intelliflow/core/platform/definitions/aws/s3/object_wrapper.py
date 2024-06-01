@@ -22,22 +22,28 @@ def build_object_key(folders: Sequence[str], object_name: str) -> str:
     return "/".join(folders + [object_name])
 
 
-def get_object_metadata(s3, bucket: str, object_key: str) -> Dict[str, Any]:
+def get_object_metadata(s3, bucket: str, object_key: str, critical_path: bool = False) -> Dict[str, Any]:
     """
     Fetch S3 object's information as dict, which contains metadata, or None if object is not available.
     :param s3: S3 client.
     :param bucket: The bucket to receive the data, as str.
     :param object_key: The key of the object in the bucket, as str
+    :param critical_path: whether the call is made on a critical call path or not, meaning that it would cause
+    regression on critical execution management related runtime code-paths of the framework. So changes the retry
+    approach accordingly.
     :return dict structure of object's metadata, or None if such object is not accessible/not-exist.
     """
+    # retry on 'Forbidden': eventual consistency during app activation
+    retryable_errors = ["403"] if not critical_path else []
+    max_sleep_interval = 257 if not critical_path else 9
     try:
         return exponential_retry(
             s3.meta.client.head_object,
-            ["403"],  # retry on 'Forbidden': eventual consistency during app activation
+            retryable_errors,
             Bucket=bucket,
             Key=object_key,
             RequestPayer="requester",
-            **{MAX_SLEEP_INTERVAL_PARAM: 257},  # use a longer duration than usual
+            **{MAX_SLEEP_INTERVAL_PARAM: max_sleep_interval},  # use a longer duration than usual
         )
     except ClientError as ex:
         if ex.response["Error"]["Code"] == "404":
@@ -60,16 +66,19 @@ def get_object_sha256_hash(s3, bucket: str, object_key: str) -> Optional[str]:
     return metadata_section["sha256"] if metadata_section is not None else None
 
 
-def object_exists(s3, bucket, object_key: str) -> bool:
+def object_exists(s3, bucket, object_key: str, critical_path: bool = False) -> bool:
     """
     Check if object is available.
     :param s3: S3 client.
     :param bucket: The S3 bucket as str.
     :param object_key: The key of the object in the bucket.
+    :param critical_path: whether the call is made on a critical call path or not, meaning that it would cause
+    regression on critical execution management related runtime code-paths of the framework. So changes the retry
+    approach accordingly.
     :return true if the object exists and accessible, None if not exist or not accessible.
     """
     if "*" not in object_key:
-        return None is not get_object_metadata(s3, bucket.name, object_key)
+        return None is not get_object_metadata(s3, bucket.name, object_key, critical_path)
     else:
         key_parts = object_key.split("*")
         root_part = key_parts[0]

@@ -24,27 +24,22 @@ def _current_timestamp() -> int:
 
 
 def create_lock_table(ddb_resource, lock_table_name):
-    table = None
-    try:
-        table = exponential_retry(
-            create_table,
-            ["LimitExceededException", "InternalServerError"],
-            ddb_resource=ddb_resource,
-            table_name=lock_table_name,
-            key_schema=[{"AttributeName": "lock", "KeyType": "HASH"}],
-            attribute_def=[{"AttributeName": "lock", "AttributeType": "S"}],
-            provisioned_throughput={"ReadCapacityUnits": 20, "WriteCapacityUnits": 20},
-        )
+    table = exponential_retry(
+        create_table,
+        ["LimitExceededException", "InternalServerError"],
+        ddb_resource=ddb_resource,
+        table_name=lock_table_name,
+        key_schema=[{"AttributeName": "lock", "KeyType": "HASH"}],
+        attribute_def=[{"AttributeName": "lock", "AttributeType": "S"}],
+        provisioned_throughput={"ReadCapacityUnits": 20, "WriteCapacityUnits": 20},
+    )
 
-        exponential_retry(
-            table.meta.client.update_time_to_live,
-            ["InternalServerError"],
-            TableName=lock_table_name,
-            TimeToLiveSpecification={"Enabled": True, "AttributeName": "ttl"},
-        )
-    except botocore.exceptions.ClientError as e:
-        if e.response["Error"]["Code"] != "ResourceInUseException":
-            raise
+    exponential_retry(
+        table.meta.client.update_time_to_live,
+        ["InternalServerError"],
+        TableName=lock_table_name,
+        TimeToLiveSpecification={"Enabled": True, "AttributeName": "ttl"},
+    )
 
     return table
 

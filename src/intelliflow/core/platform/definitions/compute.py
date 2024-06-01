@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+import re
 from datetime import datetime
 from enum import Enum, unique
 from typing import Any, ClassVar, Dict, List, Optional, Sequence, Type, Union
@@ -36,7 +37,7 @@ class ComputeFailedResponseType(str, Enum):
     TRANSIENT = "TRANSIENT"
     TRANSIENT_FORCE_STOPPED = "TRANSIENT_FORCE_STOPPED"
     TIMEOUT = "TIMEOUT"  # cannot decide BAD or TRANSIENT, but workload took too much time
-    STOPPED = "STOPPED"  # RheocerOS assumes that a stopped execution is a failed one
+    STOPPED = "STOPPED"  # IntelliFlow assumes that a stopped execution is a failed one
     FORCE_STOPPED = "FORCE_STOPPED"
     APP_INTERNAL = "APP_INTERNAL"  # app session/workload logic failed internally
     COMPUTE_INTERNAL = "COMPUTE_INTERNAL"  # compute impl failed internally (no comm/transient issues but smthg else)
@@ -181,7 +182,6 @@ class ComputeExecutionDetails(CoreData):
 
 
 class ComputeSessionState:
-
     EXECUTION_DETAILS_DEPTH: ClassVar[int] = 5
 
     def __init__(
@@ -290,6 +290,7 @@ class BasicBatchDataInputMap(CoreData):
                         "data_schema_type": (
                             signal.resource_access_spec.data_schema_type.value if signal.resource_access_spec.data_schema_type else None
                         ),
+                        "data_schema_def": signal.resource_access_spec.data_schema_definition,
                         "partition_keys": signal.resource_access_spec.partition_keys,
                         "partitions": signal.resource_access_spec.get_partitions(signal.domain_spec.dimension_filter_spec),
                         "primary_keys": signal.resource_access_spec.primary_keys,
@@ -375,6 +376,7 @@ class BasicBatchDataOutput(CoreData):
                 "data_schema_type": self.output.resource_access_spec.data_schema_type.value
                 if self.output.resource_access_spec.data_schema_type
                 else None,
+                "data_schema_def": self.output.resource_access_spec.data_schema_definition,
                 "delimiter": self.output.resource_access_spec.data_delimiter,
                 "if_signal_type": self.output.type.value,
                 "serialized_signal": self.output.serialize(),
@@ -391,3 +393,40 @@ class ComputeLogQuery(CoreData):
         self.records = records
         self.resource_urls = resource_urls
         self.next_token = next_token
+
+
+class ComputeRuntimeTemplateRenderer:
+    PARAMETRIZATION_PATTERN = re.compile(r"\$\{(.+?)\}")
+
+    def __init__(
+        self,
+        materialized_inputs: List[Signal],
+        materialized_output: Signal,
+        scope: Optional[Dict[str, str]] = None,
+    ):
+        self._scope = dict(scope) if scope is not None else dict()
+        # input alias' mapped to input paths
+        self._scope.update({input.alias: input.get_materialized_resource_paths()[0] for input in materialized_inputs})
+        # inputs as indexes mapped to input paths
+        self._scope.update({f"input{i}": input.get_materialized_resource_paths()[0] for i, input in enumerate(materialized_inputs)})
+        # output alias mapped to the output path
+        self._scope.update({"output": materialized_output.get_materialized_resource_paths()[0]})
+        # output dimension names mapped to runtime values (e.g {"region": "NA", "date": "2024-03-28"})
+        dimensions_map = create_output_dimension_map(materialized_output)
+        self._scope.update(dimensions_map)
+
+    # logic adapted from "new_app_template.template_engine" module
+    def _replacement(self, match: re.Match) -> str:
+        code = match.group(1)
+        try:
+            return str(eval(code, self._scope))
+        except SyntaxError:
+            # Means code is assignment statement, just execute it and return empty string
+            return ""
+        except NameError as err:
+            raise NameError(
+                f"Error in {self.__class__.__name__} while rendering template param {code!r}! It does not exist in runtime scope."
+            ) from err
+
+    def render(self, template: str) -> str:
+        return self.PARAMETRIZATION_PATTERN.sub(self._replacement, template)

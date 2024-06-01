@@ -66,6 +66,7 @@ class SignalType(Enum):
     # BACKFILLING SUPPORT for internal marshaled data coming from the same application
     # requesting trigger on upstream routes/records.
     INTERNAL_PARTITION_CREATION_REQUEST = 10
+    INTERNAL_PSEUDO = 15
 
     # BACKFILLING SUPPORT for External Marshaled Data (from other RheocerOS apps)
     # Cross Application Types
@@ -407,7 +408,8 @@ class Signal(Serializable["Signal"]):
         signal_type: SignalType,
         source_type: SignalSourceType,
         materialized_resource_path: str,
-        is_termination: Optional[bool] = False,
+        is_termination: bool = False,
+        from_transformed: bool = False,
     ) -> Optional["Signal"]:
         if not self.resource_access_spec.proxy:
             # if there is no proxy linked to the resource access spec, then this simple check is enough to reject.
@@ -432,7 +434,13 @@ class Signal(Serializable["Signal"]):
                     signal_source.dimension_values, cast=self.domain_spec.dimension_spec, error_out=False
                 )
                 if dimension_filter is not None:  # bad cast -> None
-                    chained_filter = self.domain_spec.dimension_filter_spec.chain(dimension_filter)
+                    self_filter = self.domain_spec.dimension_filter_spec
+                    if from_transformed:
+                        # TODO drop transformation metadata from dimension_filter. if returned signal is used again for
+                        #   path rendering then transformation would be applied again. Currently "from_transformed" is
+                        #   only used by analyzer in a very limited way.
+                        self_filter = self_filter.transform()
+                    chained_filter = self_filter.chain(dimension_filter)
                     if chained_filter or (not self.domain_spec.dimension_filter_spec and chained_filter is not None):
                         # Do not use the chained filter but use it to do the following
                         # param transfer:
@@ -596,7 +604,6 @@ class Signal(Serializable["Signal"]):
     def get_required_resource_name(self) -> Optional[str]:
         required_resource_name: Optional[str] = None
         if self.domain_spec.integrity_check_protocol:
-
             integrity_checker = INTEGRITY_CHECKER_MAP[self.domain_spec.integrity_check_protocol.type]
             required_resource_name = integrity_checker.get_required_resource_name(
                 self.resource_access_spec, self.domain_spec.integrity_check_protocol
@@ -917,7 +924,6 @@ class SignalLinkNode:
                 # first check if these unlinked dimensions are already materialized.
                 # 'b'
                 for unlinked_dim in unlinked_dimensions:
-
                     # FUTURE consider following logic if we observe materialized ref dim not being detected here
                     # (e.g "*" being detected on top of a range of materialized values). this should not occur anymore (but legit though).
                     # already_materialized_variants = [variant for variant in input_signal.domain_spec.dimension_filter_spec.get_dimension_variants(required.dimension.name)

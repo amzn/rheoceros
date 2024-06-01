@@ -15,7 +15,6 @@ from intelliflow.utils.test.inlined_compute import NOOPCompute
 
 
 class TestAWSApplicationExternalData(AWSTestBase, AWSTestGlueCatalog):
-
     # overrides
     def get_table(self, DatabaseName: str, Name: str) -> Dict[str, Any]:
         if DatabaseName == "booker" and Name == "d_unified_cust_shipment_items":
@@ -1033,13 +1032,12 @@ output=DEXML_DUCSI.limit(100).join(d_ad_orders_na.limit(100), ['customer_id']).l
         assert path
 
         # and now emulate a scenario where '2021-05-10' partition event on d_ad_orders_na is received
-        # even before range analysis detects it. This will satisfy range analysis for trigger group on 2021-05-10
-        # created above after injecting ducsi (first input) via app.process(ducsi_data[1]['2021-05-10'])
+        # this will be ignored by dependency check mechanism ("is_dependent = True" ignored)
         app.process(d_ad_orders_na["2021-05-10"])
         path, _ = app.poll(ducsi_with_ad_orders[1]["2021-05-10"])
-        assert path
+        assert not path
         path, _ = app.poll(ducsi_with_ad_orders_2[1]["2021-05-10"])
-        assert path
+        assert not path
         # end 3
 
         # 4- Reset the application topology and do the test by swapping inputs: making parquet version of DUCSI data

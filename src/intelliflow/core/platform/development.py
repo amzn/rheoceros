@@ -12,6 +12,7 @@ from intelliflow.core.platform.definitions.aws.sagemaker import notebook
 from intelliflow.core.platform.definitions.aws.sagemaker.common import SAGEMAKER_NOTEBOOK_INSTANCE_ASSUMED_ROLE_USER
 from intelliflow.core.platform.endpoint import DevEndpoint
 
+from ..permission import Permission, PermissionContext
 from ..serialization import DeserializationError, Serializable, SerializationError
 from ..signal_processing.routing_runtime_constructs import Route
 from ..signal_processing.signal import Signal
@@ -61,6 +62,7 @@ from .definitions.aws.common import (
     has_role,
     is_assumed_role_session,
     is_in_role_trust_policy,
+    normalize_policy_arn,
     put_inlined_policy,
     update_role,
     update_role_trust_policy,
@@ -69,6 +71,7 @@ from .definitions.aws.refreshable_session import RefreshableBotoSession
 from .definitions.common import ActivationParams
 from .drivers.compute.aws import AWSGlueBatchComputeBasic
 from .drivers.compute.aws_athena import AWSAthenaBatchCompute
+from .drivers.compute.aws_batch import AWSBatchCompute
 from .drivers.compute.aws_emr import AWSEMRBatchCompute
 from .drivers.compute.aws_sagemaker.training_job import AWSSagemakerTrainingJobBatchCompute
 from .drivers.compute.aws_sagemaker.transform_job import AWSSagemakerTransformJobBatchCompute
@@ -191,6 +194,18 @@ class Configuration(Serializable):
 
         def with_extensions(self, extensions: List[Extension.Descriptor]):
             return self.with_param(CompositeExtension.EXTENSIONS_PARAM, extensions)
+
+        def with_trusted_entities(self, entities: List[str]):
+            return self.with_param(ActivationParams.TRUSTED_ENTITIES, entities)
+
+        def with_default_policies(self, policies: Set[str]):
+            return self.with_param(ActivationParams.DEFAULT_POLICIES, policies)
+
+        def with_permissions(self, permissions: List[Permission]):
+            return self.with_param(ActivationParams.PERMISSIONS, permissions)
+
+        def with_remote_dev_env_support(self, enabled: bool = True):
+            return self.with_param(ActivationParams.REMOTE_DEV_ENV_SUPPORT, enabled)
 
         def with_param(self, key: str, value: Any) -> "_Builder":
             self._new_conf.add_param(key, value)
@@ -410,7 +425,7 @@ class Configuration(Serializable):
             for cons in self._activated_construct_instance_map.values()
             for trusted_entity in cons.provide_runtime_trusted_entities()
             if trusted_entity
-        ]
+        ] + self._params.get(ActivationParams.TRUSTED_ENTITIES, [])
 
     def provide_runtime_default_policies(self) -> Set[str]:
         return {
@@ -418,7 +433,7 @@ class Configuration(Serializable):
             for cons in self._activated_construct_instance_map.values()
             for policy in cons.provide_runtime_default_policies()
             if policy
-        }
+        }.union(self._params.get(ActivationParams.DEFAULT_POLICIES, set()))
 
     def provide_runtime_construct_permissions(self) -> List[ConstructPermission]:
         return [
@@ -426,6 +441,10 @@ class Configuration(Serializable):
             for cons in self._activated_construct_instance_map.values()
             for construct_permission in cons.provide_runtime_permissions()
             if construct_permission
+        ] + [
+            ConstructPermission(resource=perm.resource, action=perm.action)
+            for perm in self._params.get(ActivationParams.PERMISSIONS, [])
+            if perm.context in [PermissionContext.ALL, PermissionContext.RUNTIME]
         ]
 
     def provide_devtime_construct_permissions(self) -> List[ConstructPermission]:
@@ -434,6 +453,10 @@ class Configuration(Serializable):
             for cons_type in self._active_construct_map.values()
             for dev_time_permission in cons_type.provide_devtime_permissions(self._params)
             if dev_time_permission
+        ] + [
+            ConstructPermission(resource=perm.resource, action=perm.action)
+            for perm in self._params.get(ActivationParams.PERMISSIONS, [])
+            if perm.context in [PermissionContext.ALL, PermissionContext.DEVTIME]
         ]
 
     @abstractmethod
@@ -621,6 +644,7 @@ class AWSConfiguration(Configuration):
                 AWSEMRBatchCompute,
                 AWSSagemakerTrainingJobBatchCompute,
                 AWSSagemakerTransformJobBatchCompute,
+                # AWSBatchCompute,
             ],
         )
 
@@ -787,8 +811,11 @@ class AWSConfiguration(Configuration):
                         True,
                         ["sagemaker.amazonaws.com", "glue.amazonaws.com"],
                     )
-                    exponential_retry(
-                        attach_aws_managed_policy, ["ServiceFailureException"], if_dev_role_name, "AmazonSageMakerFullAccess", session
+
+                    if self._params.get(ActivationParams.REMOTE_DEV_ENV_SUPPORT, True):
+                        exponential_retry(
+                            attach_aws_managed_policy, ["ServiceFailureException"], if_dev_role_name, "AmazonSageMakerFullAccess", session
+                        )
                     )
                 else:
                     # TODO support restoration of trusted-services as well (e.g. if role's trust policy is not manually restored after Conduit wipes it out).
@@ -825,6 +852,15 @@ class AWSConfiguration(Configuration):
                         ),
                         # allow upstream connections (granular control is from upstream trust policy)
                         ConstructPermission([IF_DEV_ROLE_FORMAT.format("*", "*", "*")], ["sts:AssumeRole"]),
+                        # should be able to check the existence of managed policies
+                        ConstructPermission(
+                            [
+                                f"arn:aws:iam::{self._params[AWSCommonParams.ACCOUNT_ID]}:policy/*",
+                                f"arn:aws:iam::{self._params[AWSCommonParams.ACCOUNT_ID]}:policy/*/*",
+                                normalize_policy_arn("*"),
+                            ],
+                            ["iam:GetPolicy"],
+                        ),
                     ]
                     put_inlined_policy(
                         if_dev_role_name, IF_DEV_POLICY_NAME_FORMAT.format(self._context_id), set(devrole_permissions), session
@@ -1133,6 +1169,7 @@ class AWSConfiguration(Configuration):
                 AWSEMRBatchCompute,
                 AWSSagemakerTrainingJobBatchCompute,
                 AWSSagemakerTransformJobBatchCompute,
+                AWSBatchCompute,
             },
             RoutingTable: {AWSDDBRoutingTable},
             Diagnostics: {AWSCloudWatchDiagnostics},
@@ -1715,6 +1752,9 @@ class HostPlatform(DevelopmentPlatform):
 
     def provision_remote_dev_env(self, endpoint_attrs: Dict[str, Any]) -> DevEndpoint:
         """Provisions and returns the reference for remote dev endpoint"""
+        if not self._conf._params.get(ActivationParams.REMOTE_DEV_ENV_SUPPORT, True):
+            raise ValueError(f"{ActivationParams.REMOTE_DEV_ENV_SUPPORT.value!r} is not enabled for this platform!")
+
         # move it into conf provision_remote_dev_env.
         #  remote env type will decide on how to generate the bundle.
         self.sync_bundle()

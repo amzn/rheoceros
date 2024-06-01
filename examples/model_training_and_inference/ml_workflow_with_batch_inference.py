@@ -12,9 +12,9 @@ from intelliflow.core.platform.drivers.compute.aws import AWSGlueBatchComputeBas
 from intelliflow.core.platform.drivers.compute.aws_emr import AWSEMRBatchCompute, RuntimeConfig
 from intelliflow.core.platform.drivers.compute.aws_sagemaker.training_job import AWSSagemakerTrainingJobBatchCompute
 from intelliflow.core.platform.drivers.compute.aws_sagemaker.transform_job import AWSSagemakerTransformJobBatchCompute
+from intelliflow.core.platform.drivers.processor.aws import AWSLambdaProcessorBasic
 
 from intelliflow.core.signal_processing.dimension_constructs import StringVariant
-
 
 app_name = "ml-flow-batch"
 
@@ -28,16 +28,34 @@ app = AWSApplication(app_name, HostPlatform(AWSConfiguration.builder()
                                             .with_param(CompositeBatchCompute.BATCH_COMPUTE_DRIVERS_PARAM,
                                                         [
                                                             AWSGlueBatchComputeBasic,
-                                                            AWSEMRBatchCompute,
                                                             AWSSagemakerTrainingJobBatchCompute,
                                                             AWSSagemakerTransformJobBatchCompute
                                                         ])
-
+                                            .with_param(AWSLambdaProcessorBasic.CORE_LAMBDA_CONCURRENCY_PARAM, 3)
                                             .build()))
 
 daily_timer = app.add_timer("daily_timer",
                             "rate(7 days)",
                             time_dimension_id="day")
+
+titanic_schema = [
+    # SparkType is just a helper, second field (type) expects a string, actual type object is to be 'eval'ed in the
+    # compute environment. We are expected to provide a schema definition compatible with the compute environment
+    # (which is Glue/pyspark in this example [see ML_PROCESSED node's compute definition]).
+    # ("PassengerId", "LongType()", True),
+    ("PassengerId", SparkType.LongType, True),
+    ("Survived", SparkType.ShortType, True),
+    ("Pclass", SparkType.ShortType, True),
+    ("Name", SparkType.StringType, True),
+    ("Sex", SparkType.StringType, True),
+    ("Age", SparkType.ShortType, True),
+    ("SibSp", SparkType.ShortType, True),
+    ("Parch", SparkType.ShortType, True),
+    ("Ticket", SparkType.StringType, True),
+    ("Fare", SparkType.DecimalType, True),
+    ("Cabin", SparkType.StringType, True),
+    ("Embarked", SparkType.StringType, True),
+]
 
 raw_data = app.add_external_data(
     "raw_data",
@@ -45,7 +63,9 @@ raw_data = app.add_external_data(
        bucket="rheoceros-tutorial-2023",
        key_prefix="titanic",
        dataset_format=DataFormat.CSV,
-       delimiter=","),
+       delimiter=",",
+       schema_def=titanic_schema
+       ),
     completion_file=None)
 
 preprocessed_data = app.create_data(
@@ -160,6 +180,7 @@ test_no_label = app.create_data(
     ],
     # Sagemaker XGBoost and BatchTransform both require input dataset has no header row
     header=False,
+    schema=None,
     protocol=None
 )
 
@@ -218,31 +239,30 @@ evaluation = app.create_data(
                 # import pyspark.sql.functions as F
                 # 
 
-                # # join the labels with scores
-                # test_data = TEST.withColumn('id', F.monotonically_increasing_id())
-                # score_data = BATCH_INFERENCE.toDF('score').withColumn('id', F.monotonically_increasing_id())
-                # test_data = test_data.join(score_data, on='id')
-                # 
 
-                # # evaluation
-                # eval_data_rdd = test_data.select('Survived', 'score').withColumn(
-                #     'Survived', F.col('Survived').cast('float')).rdd
+                # join the labels with scores
+                test_data = TEST.withColumn('id', F.monotonically_increasing_id())
+                score_data = BATCH_INFERENCE.toDF('score').withColumn('id', F.monotonically_increasing_id())
+                test_data = test_data.join(score_data, on='id')
 
-                # metrics = BinaryClassificationMetrics(eval_data_rdd)
-                # auc = metrics.areaUnderROC
-                # 
 
-                # # collect metric in DF
-                # data = [(auc,)]
-                # schema = StructType([
+                # evaluation
+                eval_data_rdd = test_data.select('Survived', 'score').withColumn(
+                    'Survived', F.col('Survived').cast('float')).rdd
 
-                #     StructField("AUC",DoubleType(),True)
+                metrics = BinaryClassificationMetrics(eval_data_rdd)
+                auc = metrics.areaUnderROC
 
-                #   ])
 
-                # output = spark.createDataFrame(data=data,schema=schema)
+                # collect metric in DF
+                data = [(auc,)]
+                schema = StructType([
 
-                output = BATCH_INFERENCE
+                    StructField("AUC",DoubleType(),True)
+
+                  ])
+
+                output = spark.createDataFrame(data=data,schema=schema)
             """,
             NumberOfWorkers=3,
         )

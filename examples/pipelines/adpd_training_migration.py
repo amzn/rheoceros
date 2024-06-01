@@ -82,7 +82,7 @@ spark.read.parquet(*s3_paths).select("fc_name", "iaid", "planning_date", "ramp_c
 output = spark.sql(
     "select * from denorm_archive where ship_option = 'second-nominated-day' and marketplace_id={MARKETPLACE_ID} and context_name = 'f2p_production' ")
                                          """,
-                                         extra_permissions=[Permission(resource=['arn:aws:s3:::fulfillmentdataanalyticslambd-splitparquetresults-zzl62x5qp21a/denormalized_archive/*'],
+                                         extra_permissions=[Permission(resource=['arn:aws:s3:::<AWAY_TEAM_S3_BUCKET>/denormalized_archive/*'],
                                                                        action=['s3:Get*'])
                                                             ],
                                          lang=Lang.PYTHON,

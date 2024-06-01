@@ -112,6 +112,7 @@ def run_emr_bootstrap(job_name,
                             such as '.../output_map.json'.
     :param bootstrapper_path: The path to IntelliFlow RuntimePlatform.
     '''
+    import ast
 
     import boto3
 
@@ -139,6 +140,7 @@ def run_emr_bootstrap(job_name,
     from intelliflow.core.platform.development import RuntimePlatform
     from intelliflow.core.platform.definitions.aws.common import CommonParams as AWSCommonParams
     from intelliflow.core.platform.definitions.aws.glue import catalog as glue_catalog
+    from intelliflow.utils.spark import create_spark_schema
 
     bootstrapper_obj = s3.Object(code_bucket, bootstrapper_path)
     serialized_bootstrapper_str = bootstrapper_obj.get()['Body'].read().decode('utf-8')
@@ -230,11 +232,19 @@ def run_emr_bootstrap(job_name,
                                        "after the execution has started.".format(resource_path))
             if not new_df:
                 # native access via input materialized paths
+                schema_def = input.get("data_schema_def", None)
+                spark_schema_def = create_spark_schema(schema_def) if schema_def else None
                 try:
                     if input['data_format'] == 'parquet':
-                        new_df = spark.read.parquet(resource_path)
+                        if schema_def:
+                            new_df = spark.read.schema(spark_schema_def).parquet(resource_path)
+                        else:
+                            new_df = spark.read.parquet(resource_path)
                     else:
-                        new_df = spark.read.load(resource_path, format=input['data_format'], sep=input['delimiter'], inferSchema='true', header=input['data_header_exists'])
+                        if schema_def:
+                            new_df = spark.read.load(resource_path, format=input['data_format'], sep=input['delimiter'], schema=spark_schema_def, header=input['data_header_exists'])
+                        else:
+                            new_df = spark.read.load(resource_path, format=input['data_format'], sep=input['delimiter'], inferSchema='true', header=input['data_header_exists'])
                 # Path not found exception is considered Analysis Exception within Spark code. Please check the
                 # link below for reference.
                 # https://github.com/apache/spark/blob/1b609c7dcfc3a30aefff12a71aac5c1d6273b2c0/sql/catalyst/src/main/scala/org/apache/spark/sql/errors/QueryCompilationErrors.scala#L977
@@ -322,12 +332,17 @@ def run_emr_bootstrap(job_name,
         print('Client script could not set the output properly. Aborting execution...')
         raise ValueError("Client script could not set the 'output' or '{}' variable properly. Please assign the output dataframe to either of those variables.".format(output_param['alias']))
 
-    output.write\\
-        .format(output_param['data_format'])\\
-        .option("header", output_param['data_header_exists'])\\
-        .option("delimiter", output_param['delimiter'])\\
-        .mode("overwrite")\\
-        .save(output_param['resource_materialized_path'])
+    output = output.write\\
+             .format(output_param['data_format'])\\
+             .option("header", output_param['data_header_exists'])\\
+             .option("delimiter", output_param['delimiter'])\\
+             .mode("overwrite")
+             
+    if 'partition_by' in args:
+        partition_cols = ast.literal_eval(args['partition_by'])
+        output = output.partitionBy(partition_cols)
+    
+    output.save(output_param['resource_materialized_path'])
 
     # save schema
     try:

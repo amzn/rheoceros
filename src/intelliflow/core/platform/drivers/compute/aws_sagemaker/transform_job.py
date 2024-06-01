@@ -289,7 +289,6 @@ class AWSSagemakerTransformJobBatchCompute(AWSConstructMixin, BatchCompute):
         model_source_specs = model_signal.get_materialized_access_specs()
 
         if model_signal.resource_access_spec.source == SignalSourceType.INTERNAL:
-
             storage: Storage = self.get_platform().storage
             data_iterator = get_data_iterator(model_signal, storage)
 
@@ -496,7 +495,7 @@ class AWSSagemakerTransformJobBatchCompute(AWSConstructMixin, BatchCompute):
     @overrides
     def terminate_session(self, active_compute_record: "RoutingTable.ComputeRecord") -> None:
         """Compute is terminated. Irrespective of compute state, this will always be called. Add completion file."""
-        if active_compute_record.session_state.state_type == ComputeSessionStateType.COMPLETED:
+        if active_compute_record.session_state and active_compute_record.session_state.state_type == ComputeSessionStateType.COMPLETED:
             # first map materialized output into internal signal form
             output = self.get_platform().storage.map_materialized_signal(active_compute_record.materialized_output)
             # e.g /internal_data/{DATA_ID]/[PARTITION_1]/.../[PARTITION_N]

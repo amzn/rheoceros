@@ -2034,7 +2034,7 @@ Use-cases:
     - do trivial data-quality checks
   - custom downstream communication
     - push notification via AWS SNS when upstream data-node (e.g Spark execution) is complete
-
+    
 In order to capture any of those use-cases inside a callback impl for this compute target, a good understanding of the parameters of [IInlinedCompute](https://github.com/amzn/rheoceros/blob/main/src/intelliflow/core/platform/constructs.py#L1866) interface is required.
 
 > **Using "input_map" parameter:**

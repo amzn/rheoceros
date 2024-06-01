@@ -87,7 +87,7 @@ class Slot:
         code_abi: Optional[compute_defs.ABI],
         extra_params: Optional[Dict[str, Any]],
         output_signal_desc: Optional[Signal],
-        compute_permissions: List[Permission] = None,
+        compute_permissions: Optional[List[Permission]] = None,
         retry_count: int = 0,
     ) -> None:
         self.type = type

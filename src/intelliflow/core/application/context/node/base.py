@@ -495,7 +495,6 @@ class CompositeAlarmNode(Node, ABC):
 
         # overrides
         def match(self, node: "Node") -> bool:
-
             if isinstance(node, CompositeAlarmNode):
                 if self._exact_match:
                     return self._alarm_id == node.alarm_id

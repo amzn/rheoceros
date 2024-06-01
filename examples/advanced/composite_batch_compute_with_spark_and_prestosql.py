@@ -35,14 +35,14 @@ app = AWSApplication(app_name, region)
 eureka_offline_training_data = app.add_external_data(
     data_id="eureka_training_data",
     s3_dataset=S3("1111111111111",
-                  "model-training-data-bucket",
+                  "<model-training-data-bucket>",
                   "eureka_p3/v8_00/training-data",
                   StringVariant('NA', 'region'),
                   AnyDate('day', {'format': '%Y-%m-%d'})))
 
 # second S3 signal
 eureka_offline_all_data = app.marshal_external_data(
-    S3Dataset("111111111111","eureka-model-training-data", "eureka_p3/v8_00/all-data-prod","partition_day={}", dataset_format=DataFormat.CSV)
+    S3Dataset("111111111111","<TRAINING_DATA_BUCKET>", "eureka_p3/v8_00/all-data-prod","partition_day={}", dataset_format=DataFormat.CSV)
     , "eureka_training_all_data"
     , {
         'day': {

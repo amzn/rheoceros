@@ -37,6 +37,11 @@ SPECIAL_PARAMETERS_SUPPORTED_BY_GLUE: Set[str] = {
     "enable-metrics",
     "enable-continuous-cloudwatch-log",
     "enable-continuous-log-filter",
+    "enable-job-insights",
+    "executor-cores",  # The value should not exceed 2x the number of vCPUs on the worker type, which is 8 on G.1X, 16 on G.2X, 32 on G.4X and 64 on G.8X
+    "python-modules-installer-option",
+    "write-shuffle-files-to-s3",  # s3 based shuffle plugin, https://docs.aws.amazon.com/glue/latest/dg/monitor-spark-shuffle-manager.html
+    "write-shuffle-spills-to-s3",
     "continuous-log-logGroup",
     "enable-spark-ui",
     "conf",
@@ -124,6 +129,7 @@ class GlueVersion(str, Enum):
     VERSION_1_0 = "1.0"
     VERSION_2_0 = "2.0"
     VERSION_3_0 = "3.0"
+    VERSION_4_0 = "4.0"
 
 
 def glue_spark_version_map() -> Dict[GlueVersion, Version]:
@@ -135,14 +141,18 @@ def glue_spark_version_map() -> Dict[GlueVersion, Version]:
         GlueVersion.VERSION_1_0: version.parse("2.4.3"),
         GlueVersion.VERSION_2_0: version.parse("2.4.3"),
         GlueVersion.VERSION_3_0: version.parse("3.1.1"),
+        GlueVersion.VERSION_4_0: version.parse("3.3.0"),
     }
 
 
 @unique
 class GlueWorkerType(str, Enum):
     STANDARD = "Standard"
+    G_0_25x = "G.025X"
     G_1X = "G.1X"
     G_2X = "G.2X"
+    G_4X = "G.4X"
+    G_8X = "G.8X"
 
 
 def _create_job_params(
@@ -158,12 +168,16 @@ def _create_job_params(
     working_set_s3_location=None,
     default_args: Dict[str, Any] = None,
 ) -> Dict[str, Any]:
-
     default_arguments = {"--enable-metrics": "", "--job-language": job_language.value}
     if default_args:
         default_arguments.update(default_args)
     capacity_params = dict()
-    if glue_version in ["1.0", "2.0", "3.0"]:
+    if glue_version in [
+        GlueVersion.VERSION_1_0.value,
+        GlueVersion.VERSION_2_0.value,
+        GlueVersion.VERSION_3_0.value,
+        GlueVersion.VERSION_4_0.value,
+    ]:
         capacity_params.update({"WorkerType": GlueWorkerType.G_1X.value})
         if job_command_type == GlueJobCommandType.BATCH:
             capacity_params.update({"NumberOfWorkers": 100})
@@ -207,7 +221,6 @@ def create_glue_job(
     working_set_s3_location=None,
     default_args: Dict[str, Any] = None,
 ):
-
     job_params = _create_job_params(
         description,
         role,
@@ -261,7 +274,6 @@ def update_glue_job(
     working_set_s3_location=None,
     default_args: Dict[str, Any] = None,
 ):
-
     job_update_params = _create_job_params(
         description,
         role,
@@ -338,7 +350,7 @@ def evaluate_execution_params(
 
         if fail_on_misconfiguration and max_capacity and ("WorkerType" in org_params or "NumberOfWorkers" in org_params):
             raise ValueError(f"Do not set Max Capacity for an AWS Glue Job if using WorkerType and NumberOfWorkers.")
-    elif glue_version in ["2.0", "3.0"]:
+    elif glue_version in [GlueVersion.VERSION_2_0.value, GlueVersion.VERSION_3_0.value, GlueVersion.VERSION_4_0.value]:
         if fail_on_misconfiguration and ("WorkerType" not in org_params or "NumberOfWorkers" not in org_params):
             raise ValueError(f"AWS Glue Version {glue_version} jobs require 'WorkerType' and 'NumberOfWorkers' to be defined.")
     else:
@@ -479,11 +491,23 @@ def get_bundles(glue_version: str) -> List[Tuple[str, Path]]:
     from importlib.resources import contents, path
 
     bundles = []
-    if glue_version in ["1.0", "2.0", "3.0"]:
+    if glue_version in [
+        GlueVersion.VERSION_1_0.value,
+        GlueVersion.VERSION_2_0.value,
+        GlueVersion.VERSION_3_0.value,
+    ]:
         from .lib import v1_0 as bundle
 
         for resource in contents(bundle):
             with path(bundle, resource) as resource_path:
                 if Path(resource_path).suffix.lower() == ".jar":
                     bundles.append((resource, Path(resource_path)))
+    elif glue_version in [GlueVersion.VERSION_4_0]:
+        from ..emr.andes import spark_jars as bundle
+
+        for resource in contents(bundle):
+            with path(bundle, resource) as resource_path:
+                if Path(resource_path).suffix.lower() == ".jar":
+                    bundles.append((resource, Path(resource_path)))
+
     return bundles

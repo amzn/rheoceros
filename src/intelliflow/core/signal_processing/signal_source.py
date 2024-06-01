@@ -157,9 +157,10 @@ class SignalSource(CoreData):
 
 
 class SignalSourceAccessSpec:
-
     OWNER_CONTEXT_UUID: ClassVar[str] = "owner_context_uuid"
     IS_MAPPED_FROM_UPSTREAM: ClassVar[str] = "is_mapped_from_upstream"
+
+    IS_PROJECTION: ClassVar[str] = "__is_projection"
 
     def __init__(self, source: SignalSourceType, path_format: str, attrs: Dict[str, Any]) -> None:
         self._source = source
@@ -211,6 +212,10 @@ class SignalSourceAccessSpec:
 
     def set_as_mapped_from_upstream(self) -> None:
         self._attrs[SignalSourceAccessSpec.IS_MAPPED_FROM_UPSTREAM] = True
+
+    @property
+    def is_projection(self) -> bool:
+        return self._attrs.get(self.IS_PROJECTION, False)
 
     def __hash__(self) -> int:
         return hash((self._source, self._path_format))
@@ -463,11 +468,17 @@ DATASET_HEADER_DEFAULT_VALUE = True
 DATASET_COMPRESSION_KEY = "compression"
 DATASET_COMPRESSION_DEFAULT_VALUE = None
 
-
+# schema output
 DATASET_SCHEMA_FILE_KEY = "schema"
 DATASET_SCHEMA_FILE_DEFAULT_VALUE = None
 DATASET_SCHEMA_TYPE_KEY = "schema_type"
 DATASET_SCHEMA_TYPE_DEFAULT_VALUE = None
+
+# user provided schema data
+DATASET_SCHEMA_DEFINITION_KEY = "schema_def"
+DATASET_SCHEMA_DEFINITION_DEFAULT_VALUE = None
+SchemaField = Tuple[str, Union[str, List], bool]
+SchemaDefinition = List[SchemaField]
 
 
 @unique
@@ -539,6 +550,9 @@ class DatasetSignalSourceAccessSpec(SignalSourceAccessSpec):
         self._dataset_type = DatasetType(self.attrs[DATASET_TYPE_KEY]) if DATASET_TYPE_KEY in attrs else DEFAULT_DATASET_TYPE
         self._partition_keys = attrs.get(PARTITION_KEYS_KEY, [])
         self._primary_keys = attrs.get(PRIMARY_KEYS_KEY, [])
+        schema_def = self.data_schema_definition
+        if schema_def is not None:
+            self.validate_schema_definition(schema_def)
 
     # overrides
     def check_integrity(self, other: "SignalSourceAccessSpec") -> bool:
@@ -552,6 +566,9 @@ class DatasetSignalSourceAccessSpec(SignalSourceAccessSpec):
             or self.data_delimiter != other.data_delimiter
             or self.data_compression != other.data_compression
             or self.data_header_exists != other.data_header_exists
+            or self.data_schema_file != other.data_schema_file
+            or self.data_schema_type != other.data_schema_type
+            or self.data_schema_definition != other.data_schema_definition
             or self.partition_keys != other.partition_keys
             or self.primary_keys != other.primary_keys
         ):
@@ -603,6 +620,63 @@ class DatasetSignalSourceAccessSpec(SignalSourceAccessSpec):
     @property
     def data_schema_type(self) -> DatasetSchemaType:
         return self._attrs.get(DATASET_SCHEMA_TYPE_KEY, DATASET_SCHEMA_TYPE_DEFAULT_VALUE)
+
+    @property
+    def data_schema_definition(self) -> str:
+        return self._attrs.get(DATASET_SCHEMA_DEFINITION_KEY, DATASET_SCHEMA_DEFINITION_DEFAULT_VALUE)
+
+    @classmethod
+    def validate_schema_definition(cls, schema_def: SchemaDefinition) -> None:
+        if not isinstance(schema_def, list):
+            raise ValueError(f"Schema definition must be of type <list> not {type(schema_def)}!")
+
+        if not schema_def:
+            raise ValueError(
+                f"Schema definition cannot be an empty list! Either undefine it or set as 'None' if you don't want to specify it."
+            )
+
+        keys = set()
+        for schema_field in schema_def:
+            if not isinstance(schema_field, tuple):
+                raise ValueError(
+                    f"A schema field must be a tuple 'Tuple[name: str, type: Union[str, List], nullable: bool]' not {type(schema_field)}! "
+                    f"Define the following field as a tuple: {schema_field!r}. "
+                    f"Example: ('column_name', 'StringType', True)"
+                )
+
+            if len(schema_field) != 3:
+                raise ValueError(
+                    f"A schema field tuple 'Tuple[str, Union[str, List], nullable: bool]' must be of size 3, not {len(schema_field)}! "
+                    f"Fix the following field definition as a tuple of (name, type, nullable): {schema_field!r}"
+                )
+
+            name, data_type, nullable = schema_field
+            if not name or not isinstance(name, str):
+                raise ValueError(f"Schema field 'name' must be a valid string")
+
+            if data_type:
+                if isinstance(data_type, list):
+                    cls.validate_schema_definition(data_type)
+                elif not isinstance(data_type, str):
+                    raise ValueError(
+                        f"Schema field 'type' is invalid! It must be a valid string or an array of nested schema fields. "
+                        f"Fix the data 'type' of following field: {schema_field!r}"
+                    )
+            else:
+                raise ValueError(
+                    f"Schema field 'type' must be a valid string or an array of nested schema fields! "
+                    f"Fix the data 'type' of following field: {schema_field!r}"
+                )
+
+            if not isinstance(nullable, bool):
+                raise ValueError(
+                    f"Schema field 'nullable' must of type bool! " f"Fix the 'nullable' value of following field: {schema_field!r}"
+                )
+
+            keys.add(name)
+
+        if len(keys) != len(schema_def):
+            raise ValueError("There are duplicate field names in schema definition!")
 
     @property
     def partition_keys(self) -> List[str]:
@@ -864,7 +938,6 @@ class S3SignalSourceAccessSpec(DatasetSignalSourceAccessSpec):
 
 
 class GlueTableSignalSourceAccessSpec(DatasetSignalSourceAccessSpec):
-
     # resource name to be used to create a resource path at runtime, representing the resource that caused an
     # incoming event, if this information is missing. this is closely related with signal level integrity check protocol
     # which might rely on this to decide on processing.

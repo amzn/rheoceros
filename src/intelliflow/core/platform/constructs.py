@@ -697,7 +697,7 @@ class Storage(BaseConstruct, ABC):
         ...
 
     @abstractmethod
-    def delete(self, folders: Sequence[str], object_name: str) -> None:
+    def delete(self, folders: Sequence[str], object_name: Optional[str] = None) -> None:
         ...
 
     @abstractmethod
@@ -2270,6 +2270,7 @@ class ProcessorQueue(BaseConstruct, ABC):
 
 
 SIGNAL_TARGET_ROUTE_ID_KEY: str = "if_signal_target_route_id"
+SIGNAL_IS_BLOCKED_KEY: str = "if_signal_is_blocked"
 
 
 class ProcessingUnit(BaseConstruct, ABC):
@@ -2295,6 +2296,7 @@ class ProcessingUnit(BaseConstruct, ABC):
         target_route_id: Optional[RouteID] = None,
         is_async=True,
         filter=False,
+        is_blocked=False,
     ) -> Optional[List["RoutingTable.Response"]]:
         """Injects a new signal or raw event into the system.
 
@@ -2317,6 +2319,10 @@ class ProcessingUnit(BaseConstruct, ABC):
         specify a route and limit the execution scope.
         :param is_async: when 'use_activate_instance' is True, then this parameter can be used to control whether
         the remote call will be async or not.
+        :param filter: consume signal for filtering and then (if survives) redirecting into the core orchestration.
+        Optimization feature for cases where a routing table hit is not guaranteed.
+        :param is_blocked: changes the orchestration execution logic and updates pending execution link-nodes and marks
+        the dependent nodes on this signal as blocked till an unblocked version of it will be received.
         """
         ...
 
@@ -3066,6 +3072,7 @@ class RoutingTable(BaseConstruct, ABC):
         target_route_id: Optional[RouteID] = None,
         filter_only=False,
         routing_session: RoutingSession = RoutingSession(),
+        is_blocked: bool = False,
     ) -> "RoutingTable.Response":
         """RheocerOS routing core that relies on persistence/synchronization methods from
         RoutingTable impls.
@@ -3172,7 +3179,7 @@ class RoutingTable(BaseConstruct, ABC):
 
                 # the following operation is stateful (changes the internal state of a route)
                 # so TODO best way to rollback
-                route_response: Optional[Route.Response] = route_record.route.receive(incoming_signal, self.get_platform())
+                route_response: Optional[Route.Response] = route_record.route.receive(incoming_signal, self.get_platform(), is_blocked)
                 if route_response:
                     response.add_route(route_record.route)
 
@@ -3409,7 +3416,10 @@ class RoutingTable(BaseConstruct, ABC):
                     if route_record.can_trigger_execution_context(execution_context.id):
                         # probably the context had only INLINED compute slots and they've all succeeded.
                         # we can trigger downstream routes with materialized_output
-                        self.get_platform().processor_queue.send(materialized_output)
+                        # however if it is projection node (that handles dispatches to the Processor within its own compute)
+                        # we skip the projection compute as an input back into the system.
+                        if not materialized_output.resource_access_spec.is_projection:
+                            self.get_platform().processor_queue.send(materialized_output)
                         completion_hook = route.execution_hook.on_success
                         hook_type = RoutingHookInterface.Execution.IExecutionSuccessHook
                     else:
@@ -4154,6 +4164,10 @@ class RoutingTable(BaseConstruct, ABC):
         ...
 
     @abstractmethod
+    def clear_history(self) -> None:
+        ...
+
+    @abstractmethod
     def load_active_route_records(self) -> Iterator["RoutingTable.RouteRecord"]:
         ...
 
@@ -4214,8 +4228,25 @@ class RoutingTable(BaseConstruct, ABC):
                     return inactive_record
 
     def describe_compute_record(self, compute_record: "RoutingTable.ComputeRecord") -> Optional[Dict[str, Any]]:
-        if compute_record.slot.type.is_batch_compute():
+        if compute_record.slot.type.is_batch_compute() and compute_record.session_state:
             return self.get_platform().batch_compute.describe_compute_record(compute_record)
+        else:
+            # a BC that could not be started (no session_state) or inlined compute
+            execution_details = dict()
+            if compute_record.state:
+                execution_details.update({"details": compute_record.state.__dict__.copy()})
+
+            # Extract SLOT info
+            if compute_record.slot:
+                slot = dict()
+                slot["type"] = compute_record.slot.type
+                slot["lang"] = compute_record.slot.code_lang
+                slot["code"] = compute_record.slot.code
+                slot["code_abi"] = compute_record.slot.code_abi
+
+                execution_details.update({"slot": slot})
+
+            return execution_details
 
     def get_compute_record_logs(
         self,

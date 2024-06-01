@@ -453,7 +453,6 @@ class AWSSagemakerTrainingJobBatchCompute(AWSConstructMixin, BatchCompute):
         return f"arn:aws:sagemaker:{region}:{account_id}:training-job/{training_job_name.lower()}"
 
     def provide_runtime_permissions(self) -> List[ConstructPermission]:
-
         # If there is no <Route> detected (see hook_internal) for this driver,
         # then no need to provide extra permissions.
         # If they were added previously, they will be wiped out in the current activation.

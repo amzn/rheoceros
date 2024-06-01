@@ -13,7 +13,9 @@ from intelliflow.api_ext import HADOOP_SUCCESS_FILE, AWSApplication
 from intelliflow.core.application.application import Application
 from intelliflow.core.application.context.node.internal.nodes import InternalDataNode
 from intelliflow.core.application.core_application import ApplicationState
+from intelliflow.core.permission import Permission, PermissionContext
 from intelliflow.core.platform.constructs import RoutingTable
+from intelliflow.core.platform.definitions.common import ActivationParams
 from intelliflow.core.platform.definitions.compute import (
     ComputeResourceDesc,
     ComputeSessionDesc,
@@ -21,6 +23,7 @@ from intelliflow.core.platform.definitions.compute import (
     ComputeSuccessfulResponseType,
 )
 from intelliflow.core.platform.development import AWSConfiguration, HostPlatform
+from intelliflow.core.platform.drivers.processor.aws import AWSLambdaProcessorBasic
 from intelliflow.core.signal_processing.definitions.dimension_defs import Type
 from intelliflow.core.signal_processing.signal import *
 from intelliflow.mixins.aws.test import AWSTestBase
@@ -57,6 +60,71 @@ class TestAWSApplication(AWSTestBase):
 
         assert app.id == app3.id
         assert app.uuid != app3.uuid
+
+        self.patch_aws_stop()
+
+    def test_application_init_params(self):
+        """Test high-level configuration for AWS drivers"""
+        self.patch_aws_start()
+
+        app = Application(
+            "test_params",
+            HostPlatform(
+                AWSConfiguration.builder()
+                .with_default_credentials()
+                .with_region("us-west-2")
+                .with_param(AWSLambdaProcessorBasic.CORE_LAMBDA_CONCURRENCY_PARAM, 5)
+                .build()
+            ),  # change the region
+        )
+
+        assert app.platform.processor.desired_core_lambda_concurrency == 5
+        self.patch_aws_stop()
+
+    def test_application_init_params_for_permissions(self):
+        """Test high-level configuration for AWS Configuration"""
+        self.patch_aws_start()
+
+        app = Application(
+            "test_perms",
+            HostPlatform(
+                AWSConfiguration.builder()
+                .with_default_credentials()
+                .with_region("us-west-2")
+                .with_permissions(
+                    [
+                        Permission(resource=["BOTH"], action=["BOTH_ACTION"]),
+                        Permission(resource=["EXEC"], action=["EXEC_ACTION"], context=PermissionContext.RUNTIME),
+                        Permission(resource=["DEV"], action=["DEV_ACTION"], context=PermissionContext.DEVTIME),
+                    ]
+                )
+                .with_default_policies({"AWSS3ReadOnlyAccess"})
+                .with_trusted_entities(["AN_ENTITY_ARN"])
+                .build()
+            ),
+        )
+        assert app.platform.conf.provide_runtime_default_policies().issuperset({"AWSS3ReadOnlyAccess"})
+        assert "AN_ENTITY_ARN" in app.platform.conf.provide_runtime_trusted_entities()
+        # check runtime perms (that will go into exec role)
+        assert any(
+            const_perm.resource == ["BOTH"] and const_perm.action == ["BOTH_ACTION"]
+            for const_perm in app.platform.conf.provide_runtime_construct_permissions()
+        )
+        assert any(
+            const_perm.resource == ["EXEC"] and const_perm.action == ["EXEC_ACTION"]
+            for const_perm in app.platform.conf.provide_runtime_construct_permissions()
+        )
+        assert not any(const_perm.resource == ["DEV"] for const_perm in app.platform.conf.provide_runtime_construct_permissions())
+        # check devtime perms (that will go into dev role)
+        assert any(
+            const_perm.resource == ["BOTH"] and const_perm.action == ["BOTH_ACTION"]
+            for const_perm in app.platform.conf.provide_devtime_construct_permissions()
+        )
+        assert any(
+            const_perm.resource == ["DEV"] and const_perm.action == ["DEV_ACTION"]
+            for const_perm in app.platform.conf.provide_devtime_construct_permissions()
+        )
+        assert not any(const_perm.resource == ["EXEC"] for const_perm in app.platform.conf.provide_devtime_construct_permissions())
 
         self.patch_aws_stop()
 
@@ -560,5 +628,25 @@ class TestAWSApplication(AWSTestBase):
         # use a method that would do a traversal on the platform and underlying drivers post-reset.
         # e.g if a driver has not been instantiated successfully (or the app is in terminated state, then it will fail).
         assert app.get_platform_metrics(HostPlatform.MetricType.SYSTEM)
+
+        self.patch_aws_stop()
+
+    def test_application_remote_dev_env_support(self):
+        self.patch_aws_start()
+
+        app = AWSApplication("test_app_rde", self.region, **{ActivationParams.REMOTE_DEV_ENV_SUPPORT.value: False})
+
+        with pytest.raises(ValueError):
+            app.provision_remote_dev_env(dict())
+
+        app = Application(
+            "test_app_rde2",
+            HostPlatform(
+                AWSConfiguration.builder().with_default_credentials().with_remote_dev_env_support(False).with_region(self.region).build()
+            ),
+        )
+
+        with pytest.raises(ValueError):
+            app.provision_remote_dev_env(dict())
 
         self.patch_aws_stop()

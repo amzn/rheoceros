@@ -60,7 +60,7 @@ from intelliflow.utils.algorithm import chunk_iter
 from ...constructs import BatchCompute, ConstructInternalMetricDesc, ConstructParamsDict, ConstructPermission, ConstructSecurityConf
 from ...definitions.aws.common import AWS_COMMON_RETRYABLE_ERRORS, MAX_SLEEP_INTERVAL_PARAM
 from ...definitions.aws.common import CommonParams as AWSCommonParams
-from ...definitions.aws.common import exponential_retry
+from ...definitions.aws.common import exponential_retry, has_aws_managed_policy
 from ...definitions.aws.emr.client_wrapper import (
     EmrJobLanguage,
     EmrReleaseLabel,
@@ -124,7 +124,11 @@ class RuntimeConfig(Enum):
     GlueVersion_1_0 = "GlueVersion1.0"
     GlueVersion_2_0 = "GlueVersion2.0"
     GlueVersion_3_0 = "GlueVersion3.0"
+    GlueVersion_4_0 = "GlueVersion4.0"
     EMR_6_4_0 = "EMR_6_4_0"
+    EMR_6_6_0 = "EMR_6_6_0"
+    EMR_6_8_0 = "EMR_6_8_0"
+    EMR_6_10_0 = "EMR_6_10_0"
     AUTO = "AUTO"
 
     @classmethod
@@ -134,6 +138,7 @@ class RuntimeConfig(Enum):
             GlueVersion.VERSION_1_0: RuntimeConfig.GlueVersion_1_0,
             GlueVersion.VERSION_2_0: RuntimeConfig.GlueVersion_2_0,
             GlueVersion.VERSION_3_0: RuntimeConfig.GlueVersion_3_0,
+            GlueVersion.VERSION_4_0: RuntimeConfig.GlueVersion_4_0,
         }[glue_version]
 
 
@@ -166,8 +171,8 @@ class AWSEMRBatchCompute(AWSConstructMixin, BatchCompute):
 
     # https://docs.aws.amazon.com/emr/latest/APIReference/API_RunJobFlow.html#API_RunJobFlow_Errors
     CLIENT_RETRYABLE_EXCEPTION_LIST: Set[str] = {"InternalServerException", "InternalServerError"}
-    GLUE_DEFAULT_VERSION: ClassVar[GlueVersion] = GlueVersion.VERSION_2_0
-    DEFAULT_RUNTIME_CONFIG: ClassVar[RuntimeConfig] = RuntimeConfig.GlueVersion_2_0
+    GLUE_DEFAULT_VERSION: ClassVar[GlueVersion] = GlueVersion.VERSION_4_0
+    DEFAULT_RUNTIME_CONFIG: ClassVar[RuntimeConfig] = RuntimeConfig.GlueVersion_4_0
     DEFAULT_INSTANCE_CONFIG: ClassVar[InstanceConfig] = InstanceConfig(25)
     EMR_CLUSTER_SUBNET_ID: ClassVar[str] = "EmrClusterSubnetId"
 
@@ -179,7 +184,7 @@ class AWSEMRBatchCompute(AWSConstructMixin, BatchCompute):
                 Lang.PYTHON: {
                     ABI.GLUE_EMBEDDED: {
                         # also a RuntimeConfig, supported as an explicit param for compatibility with Glue driver
-                        "GlueVersion": {GlueVersion.AUTO.value: {}, "1.0": {}, "2.0": {}, "3.0": {}},
+                        "GlueVersion": {GlueVersion.AUTO.value: {}, "1.0": {}, "2.0": {}, "3.0": {}, "4.0": {}},
                         INSTANCE_CONFIG_KEY: {"*": {}},
                         # for other EMR specific runtime configurations
                         RUNTIME_CONFIG_KEY: {"*": {}},
@@ -189,7 +194,7 @@ class AWSEMRBatchCompute(AWSConstructMixin, BatchCompute):
                 # TODO: Scala support
                 # Lang.SCALA: {
                 #     ABI.GLUE_EMBEDDED: {
-                #         "GlueVersion": {GlueVersion.AUTO.value: {}, "1.0": {}, "2.0": {}, "3.0": {}},
+                #         "GlueVersion": {GlueVersion.AUTO.value: {}, "1.0": {}, "2.0": {}, "3.0": {}, "4.0": {}},
                 #         INSTANCE_CONFIG_KEY: {"*": {}},
                 #         RUNTIME_CONFIG_KEY: {"*": {}},
                 #         SPARK_CLI_ARGS: {"*": {}},
@@ -223,8 +228,28 @@ class AWSEMRBatchCompute(AWSConstructMixin, BatchCompute):
                         "boilerplate": EmrDefaultABIPython,
                         "applications": ["Hadoop", "Pig", "Hue", "Spark"],
                     },
+                    RuntimeConfig.GlueVersion_4_0: {
+                        "runtime_version": EmrReleaseLabel.resolve_from_glue_version(GlueVersion.VERSION_4_0),
+                        "boilerplate": EmrDefaultABIPython,
+                        "applications": ["Hadoop", "Pig", "Hue", "Spark"],
+                    },
                     RuntimeConfig.EMR_6_4_0: {
                         "runtime_version": EmrReleaseLabel.VERSION_6_4_0,
+                        "boilerplate": EmrDefaultABIPython,
+                        "applications": ["Hadoop", "Pig", "Hue", "Spark"],
+                    },
+                    RuntimeConfig.EMR_6_6_0: {
+                        "runtime_version": EmrReleaseLabel.VERSION_6_6_0,
+                        "boilerplate": EmrDefaultABIPython,
+                        "applications": ["Hadoop", "Pig", "Hue", "Spark"],
+                    },
+                    RuntimeConfig.EMR_6_8_0: {
+                        "runtime_version": EmrReleaseLabel.VERSION_6_8_0,
+                        "boilerplate": EmrDefaultABIPython,
+                        "applications": ["Hadoop", "Pig", "Hue", "Spark"],
+                    },
+                    RuntimeConfig.EMR_6_10_0: {
+                        "runtime_version": EmrReleaseLabel.VERSION_6_10_0,
                         "boilerplate": EmrDefaultABIPython,
                         "applications": ["Hadoop", "Pig", "Hue", "Spark"],
                     },
@@ -252,9 +277,29 @@ class AWSEMRBatchCompute(AWSConstructMixin, BatchCompute):
                         "boilerplate": EmrAllABIScala,
                         "applications": [],
                     },
+                    RuntimeConfig.GlueVersion_4_0: {
+                        "runtime_version": EmrReleaseLabel.resolve_from_glue_version(GlueVersion.VERSION_4_0),
+                        "boilerplate": EmrAllABIScala,
+                        "applications": [],
+                    },
                     RuntimeConfig.EMR_6_4_0: {
                         "runtime_version": EmrReleaseLabel.VERSION_6_4_0,
-                        "boilerplate": EmrDefaultABIPython,
+                        "boilerplate": EmrAllABIScala,
+                        "applications": ["Hadoop", "Pig", "Hue", "Spark"],
+                    },
+                    RuntimeConfig.EMR_6_6_0: {
+                        "runtime_version": EmrReleaseLabel.VERSION_6_6_0,
+                        "boilerplate": EmrAllABIScala,
+                        "applications": ["Hadoop", "Pig", "Hue", "Spark"],
+                    },
+                    RuntimeConfig.EMR_6_8_0: {
+                        "runtime_version": EmrReleaseLabel.VERSION_6_8_0,
+                        "boilerplate": EmrAllABIScala,
+                        "applications": ["Hadoop", "Pig", "Hue", "Spark"],
+                    },
+                    RuntimeConfig.EMR_6_10_0: {
+                        "runtime_version": EmrReleaseLabel.VERSION_6_10_0,
+                        "boilerplate": EmrAllABIScala,
                         "applications": ["Hadoop", "Pig", "Hue", "Spark"],
                     },
                 }
@@ -288,6 +333,14 @@ class AWSEMRBatchCompute(AWSConstructMixin, BatchCompute):
         self._iam = None
 
     def provide_output_attributes(self, inputs: List[Signal], slot: Slot, user_attrs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        # early validation for compute params that will be used at runtime
+        # TODO: before adding as a mainline feature, document 'partition_by' as a keyword in `args` dict: https://sim.amazon.com/issues/SVEN-438
+        if slot.extra_params and "partition_by" in slot.extra_params:
+            partition_cols = slot.extra_params["partition_by"]
+            is_valid_input = partition_cols and isinstance(partition_cols, list) and all(isinstance(item, str) for item in partition_cols)
+            if not is_valid_input:
+                raise ValueError("`partition_by` param must be a nonempty List[str]!")
+
         if user_attrs.get(DATA_TYPE_KEY, DataType.DATASET) != DataType.DATASET:
             raise ValueError(
                 f"{DATA_TYPE_KEY!r} must be defined as {DataType.DATASET} or left undefined for {self.__class__.__name__} output!"
@@ -601,7 +654,7 @@ class AWSEMRBatchCompute(AWSConstructMixin, BatchCompute):
         return ["elasticmapreduce.amazonaws.com", "ec2.amazonaws.com"]
 
     def provide_runtime_default_policies(self) -> List[str]:
-        return [
+        managed_policies = [
             # https://docs.aws.amazon.com/emr/latest/ManagementGuide/emr-managed-iam-policies.html
             "AmazonElasticMapReduceFullAccess",
             "service-role/AmazonElasticMapReduceRole",
@@ -609,8 +662,13 @@ class AWSEMRBatchCompute(AWSConstructMixin, BatchCompute):
             # "aws-service-role/AmazonEMRCleanupPolicy",
             "service-role/AmazonElasticMapReduceforAutoScalingRole",
             "service-role/AmazonElasticMapReduceEditorsRole",
-            f"arn:aws:iam::{self._account_id}:policy/CloudRanger/InfoSecHostMonitoringPolicy-DO-NOT-DELETE",
         ]
+
+        infosec_policy_arn: str = f"arn:aws:iam::{self._account_id}:policy/CloudRanger/InfoSecHostMonitoringPolicy-DO-NOT-DELETE"
+        if has_aws_managed_policy(infosec_policy_arn, self.session):
+            managed_policies.append(infosec_policy_arn)
+
+        return managed_policies
 
     def provide_runtime_permissions(self) -> List[ConstructPermission]:
         # allow exec-role (post-activation, cumulative list of all trusted entities [AWS services]) to do the following;
@@ -642,6 +700,17 @@ class AWSEMRBatchCompute(AWSConstructMixin, BatchCompute):
                                 f" a PyPI library name, BatchCompute driver {self.__class__.__name__!r} won't add it to"
                                 f" runtime permissions for exec role."
                             )
+
+                extra_jars = slot.extra_params.get(EXTRA_JARS, [])
+                for path in extra_jars:
+                    try:
+                        s3_spec = S3SignalSourceAccessSpec.from_url(account_id=None, url=path)
+                        external_library_resource_arns.add(f"arn:aws:s3:::{s3_spec.bucket}/{path[len(f's3://{s3_spec.bucket}/'):]}")
+                    except Exception:
+                        raise ValueError(
+                            f"External JAR path {path!r} attached to route {route.route_id!r} "
+                            f" via slot: {(slot.type, slot.code_lang)!r} is not an S3 path!"
+                        )
 
                 # TODO Move into <BatchCompute>
                 # TODO evalute moving is_batch_compute check even before the external library paths extraction.
@@ -801,7 +870,6 @@ class AWSEMRBatchCompute(AWSConstructMixin, BatchCompute):
         else:
             self._bucket = get_bucket(self._s3, self._bucket_name)
 
-
         self._common_bootstrap_actions = []
 
         self._common_bundle_s3_paths = []
@@ -860,6 +928,7 @@ class AWSEMRBatchCompute(AWSConstructMixin, BatchCompute):
         """Designed to be resilient against repetitive calls in case of retries in the high-level
         termination work-flow.
         """
+
         # 1- cancel all cluster started by IF
         unfinished_clusters = exponential_retry(
             list_emr_clusters,
@@ -1085,10 +1154,10 @@ class AWSEMRBatchCompute(AWSConstructMixin, BatchCompute):
         if RUNTIME_CONFIG_KEY in extra_params:
             runtime_config = extra_params[RUNTIME_CONFIG_KEY]
             if runtime_config in [RuntimeConfig.AUTO, RuntimeConfig.AUTO.value]:
-                return RuntimeConfig.GlueVersion_3_0  # old behaviour (FUTURE we can start using newest EMR version)
+                return RuntimeConfig.EMR_6_10_0
             return extra_params[RUNTIME_CONFIG_KEY]
         elif extra_params.get("GlueVersion", GlueVersion.AUTO.value) in [GlueVersion.AUTO, GlueVersion.AUTO.value]:
-            return RuntimeConfig.EMR_6_4_0
+            return RuntimeConfig.EMR_6_10_0
         return RuntimeConfig.from_glue_version(self._resolve_glue_version(extra_params, materialized_inputs))
 
     def _translate_instance_config(self, extra_params: Dict[str, Any]):

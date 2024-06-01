@@ -26,6 +26,10 @@ class HookBase:
             [self.FOLDER], key
         )
 
+    @classmethod
+    def clear(cls, app: "Application") -> None:
+        app.platform.storage.delete([cls.FOLDER])
+
 
 class GenericRoutingHookImpl(HookBase):
     """Can only be used to make sure that a hook has been dispatched or not"""

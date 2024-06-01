@@ -33,7 +33,6 @@ from intelliflow.core.signal_processing.signal_source import (
 
 
 class TestSignal:
-
     signal_internal_1 = Signal(
         SignalType.INTERNAL_PARTITION_CREATION,
         InternalDatasetSignalSourceAccessSpec("my_data_1", TestDimensionSpec.dimension_spec_single_dim, **{}),

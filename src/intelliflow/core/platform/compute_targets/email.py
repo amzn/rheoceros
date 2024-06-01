@@ -14,7 +14,11 @@ from intelliflow.core.platform.constructs import ConstructParamsDict, RoutingCom
 from intelliflow.core.platform.definitions.aws.common import AWS_COMMON_RETRYABLE_ERRORS
 from intelliflow.core.platform.definitions.aws.common import CommonParams as AWSCommonParams
 from intelliflow.core.platform.definitions.aws.common import exponential_retry, get_code_for_exception
-from intelliflow.core.platform.definitions.compute import ComputeInternalError, ComputeRetryableInternalError
+from intelliflow.core.platform.definitions.compute import (
+    ComputeInternalError,
+    ComputeRetryableInternalError,
+    ComputeRuntimeTemplateRenderer,
+)
 from intelliflow.core.serialization import dumps
 from intelliflow.core.signal_processing import Signal, Slot
 from intelliflow.core.signal_processing.slot import SlotType
@@ -56,7 +60,6 @@ class EmailRequestModel(CoreData):
         self.ConfigurationSetName = ConfigurationSetName
 
     def get_json_request(self):
-
         # Filters the keys of the dict which have None as value
         def filter_none(d):
             if isinstance(d, dict):
@@ -117,7 +120,6 @@ class EmailAction(RoutingComputeInterface.IInlinedCompute, RoutingHookInterface.
         *args,
         **params,
     ) -> Any:
-
         # establish params dict for inlined compute. 'params' as kwargs is to be compatible with IHook interface. so
         # it should be an empty dict for IInlinedCompute.
         # we don't provide params as kwargs in IInlinedCompute interface, so for backwards compatibility reasons
@@ -127,8 +129,20 @@ class EmailAction(RoutingComputeInterface.IInlinedCompute, RoutingHookInterface.
         inlined_compute_args = InlinedComputeParamExtractor(
             input_map_OR_routing_table, materialized_output_OR_route_record, *args, **params
         )
+        email_body = self.email.body
+        email_subject = self.email.subject
         if inlined_compute_args:
             _, _, params = inlined_compute_args
+            # runtime parametrization of desc (e.g variables mapping to input/output alias' and output dimensions)
+            # using the pattern ${VARIABLE} will be mapped to their runtime values.
+            renderer = ComputeRuntimeTemplateRenderer(
+                list(input_map_OR_routing_table.values()), materialized_output_OR_route_record, params
+            )
+            if email_body:
+                email_body = renderer.render(email_body)
+
+            if email_subject:
+                email_subject = renderer.render(email_subject)
 
         base_session = params[AWSCommonParams.BOTO_SESSION]
         client = base_session.client("ses", region_name=params[AWSCommonParams.REGION])
@@ -145,10 +159,8 @@ class EmailAction(RoutingComputeInterface.IInlinedCompute, RoutingHookInterface.
             ToAddresses=self.email.recipient_list, CcAddresses=self.email.cc_list, BccAddresses=self.email.bcc_list
         )
 
-        email_body = EmailBody(Text=BaseEmailData(Data=self.email.body + "\n\n" + node_info if self.email.body is not None else node_info))
-        subject = BaseEmailData(
-            Data=self.email.subject + " - " + subject_extension if self.email.subject is not None else subject_extension
-        )
+        email_body = EmailBody(Text=BaseEmailData(Data=email_body + "\n\n" + node_info if email_body is not None else node_info))
+        subject = BaseEmailData(Data=email_subject + " - " + subject_extension if email_subject is not None else subject_extension)
 
         email_msg = EmailMessage(Body=email_body, Subject=subject)
 

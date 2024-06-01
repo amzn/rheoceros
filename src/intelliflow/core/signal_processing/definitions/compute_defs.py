@@ -16,6 +16,8 @@ class Lang(int, Enum):
     AWS_SAGEMAKER_TRAINING_JOB = 7
     AWS_SAGEMAKER_TRANSFORM_JOB = 8
 
+    AWS_BATCH_JOB = 11
+
 
 @unique
 class ABI(int, Enum):

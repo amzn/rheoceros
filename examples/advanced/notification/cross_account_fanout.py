@@ -17,7 +17,7 @@ flow.init_basic_logging()
 forwarder_app = AWSApplication("data-forwarder", "us-east-1", access_id="AWS_ACCOUNT_2_ID", access_key="AWS_ACCOUNT_2_KEY")
 
 offline_all_data = forwarder_app.marshal_external_data(
-    S3Dataset("AWS_ACCOUNT_1", "model-training-data-test", "training-data", "{}", "{}",
+    S3Dataset("AWS_ACCOUNT_1", "<model-training-data-test>", "training-data", "{}", "{}",
               dataset_format=DataFormat.CSV)
         .link(
         SNS(topic_name="training_data_event_hub")
@@ -36,7 +36,7 @@ offline_all_data = forwarder_app.marshal_external_data(
 )
 
 offline_all_data_2 = forwarder_app.marshal_external_data(
-    S3Dataset("AWS_ACCOUNT_1", "model-training-data-test-2", "training-data", "{}", "{}",
+    S3Dataset("AWS_ACCOUNT_1", "<model-training-data-test-2>", "training-data", "{}", "{}",
               dataset_format=DataFormat.CSV)
         .link(
         # use the same topic for fan-out

@@ -23,13 +23,13 @@ app = AWSApplication("advanced-inputs", "us-east-1")
 eureka_offline_training_data = app.add_external_data(
     data_id="eureka_training_data",
     s3_dataset=S3("111222333444",
-                  "model-training-data-bucket", # bucket
+                  "<model-training-data-bucket>", # bucket
                   "cradle_eureka_p3/v8_00/training-data", # folder prefix till partitions
                   StringVariant('NA', 'region'),
                   AnyDate('day', {'format': '%Y-%m-%d'})))
 
 eureka_offline_all_data = app.marshal_external_data(
-    S3Dataset("111222333444","model-training-data-bucket", "cradle_eureka_p3/v8_00/all-data-prod","partition_day={}", dataset_format=DataFormat.CSV)
+    S3Dataset("111222333444","<model-training-data-bucket>", "cradle_eureka_p3/v8_00/all-data-prod","partition_day={}", dataset_format=DataFormat.CSV)
     , "eureka_training_all_data"
     , dimension_spec={
         'day': {

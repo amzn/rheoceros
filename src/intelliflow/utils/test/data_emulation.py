@@ -89,7 +89,6 @@ def _add_data_for_internal_signal(
     if subfolder is not None:
         folder = folder + InternalDatasetSignalSourceAccessSpec.path_delimiter() + subfolder
     if isinstance(data, str):
-
         # Will be UTF-8 encoded by the storage implementation
         storage.save(data, [folder], object_name)
     else:

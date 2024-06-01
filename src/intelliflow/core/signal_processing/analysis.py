@@ -41,7 +41,6 @@ class StatelessResourceChecker(SignalIntegrityChecker):
 
     @classmethod
     def get_required_resource_name(cls, materialized_access_spec: "SignalAccessSpec", protocol: "SignalIntegrityProtocol") -> str:
-
         if "file" in protocol.args:
             if isinstance(protocol.args["file"], str):
                 return protocol.args["file"]

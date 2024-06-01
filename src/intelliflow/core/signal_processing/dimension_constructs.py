@@ -316,7 +316,6 @@ class DimensionSpec:
     def _check_list_compatibility_recursive(
         cls, dim_spec: "DimensionSpec", nested_dim_list: List[Any], enable_breadth_check: bool = True
     ) -> bool:
-
         if not nested_dim_list and not dim_spec:
             return True
 
@@ -326,7 +325,9 @@ class DimensionSpec:
         if enable_breadth_check and len(dim_spec.get_root_dimensions()) != 1:
             return False
 
-        return cls._check_list_compatibility_recursive(next(iter(dim_spec.get_all_sub_dimensions())), nested_dim_list[1:])
+        return cls._check_list_compatibility_recursive(
+            next(iter(dim_spec.get_all_sub_dimensions())), nested_dim_list[1:], enable_breadth_check
+        )
 
     def _check_spec_compatibility(
         self, other_spec: "DimensionSpec", enable_breadth_check: bool = True, enable_type_check: bool = True
@@ -370,7 +371,7 @@ class DimensionSpec:
 
         # go through sub-dimensions using the same order on both sides.
         # if breadth check is not enabled, then skip checking other branches.
-        for ((src_dim, src_desc), (tgt_dim, tgt_desc)) in zip(source_spec.get_dimensions(), target_spec.get_dimensions()):
+        for (src_dim, src_desc), (tgt_dim, tgt_desc) in zip(source_spec.get_dimensions(), target_spec.get_dimensions()):
             if (not src_dim and tgt_dim) or (src_dim and not tgt_dim):
                 return False
 
@@ -406,7 +407,7 @@ class DimensionSpec:
             raise TypeError("Cannot transfer names between incompatible DimensionSpecs!")
 
         # go through sub-dimensions using the same order on both sides.
-        for ((src_dim, src_desc), (tgt_dim, tgt_desc)) in zip(source_spec.get_dimensions(), target_spec.get_dimensions()):
+        for (src_dim, src_desc), (tgt_dim, tgt_desc) in zip(source_spec.get_dimensions(), target_spec.get_dimensions()):
             if (not src_dim and tgt_dim) or (src_dim and not tgt_dim):
                 raise TypeError("Cannot transfer names between incompatible DimensionSpecs!")
 
@@ -762,7 +763,9 @@ class DimensionVariantMapper(DimensionVariantReader):
             if all([source_var.is_material_value() for source_var in source_variants_as_args]):
                 try:
                     self._mapped_values.append(self._func(*[source_var.raw_value for source_var in source_variants_as_args]))
-                except Exception as error:  # map errors in user mapper funcs as to RuntimeErrors! avoid error swallowing at high-evel orchestration code.
+                except (
+                    Exception
+                ) as error:  # map errors in user mapper funcs as to RuntimeErrors! avoid error swallowing at high-evel orchestration code.
                     raise RuntimeError(error)
             else:
                 # too early for mapping (not finalized/materialized), read the 'special' value from either
@@ -836,7 +839,6 @@ class DimensionVariantFactory:
 
     @classmethod
     def create_variant_range(cls, start: Any, stop: Any, step: int, params_dict: ParamsDictType) -> List[DimensionVariant]:
-
         start_variant = cls.create_variant(start, params_dict)
         stop_variant = cls.create_variant(stop, params_dict)
 
@@ -869,7 +871,6 @@ class DimensionVariantFactory:
 
     @classmethod
     def create_variant(cls, raw_variant: Any, params_dict: ParamsDictType) -> DimensionVariant:
-
         result_map: Dict[DimensionVariantResolverScore, List[DimensionVariantCreatorMethod]] = {}
         for resolver in cls._RESOLVERS:
             result: DimensionVariantResolver.Result = resolver.resolve(raw_variant)
@@ -1033,6 +1034,10 @@ class RelativeVariant(DimensionVariant, DimensionVariantResolver, DimensionVaria
     # overrides
     def is_material_value(self) -> bool:
         return False
+
+    @property
+    def relative_index(self) -> int:
+        return self._relative_index
 
     def __hash__(self) -> int:
         return Dimension.__hash__(self)
@@ -1847,7 +1852,6 @@ DimensionVariantFactory.register_creator(Type.DATETIME, DateVariant)
 
 
 class LongVariant(DimensionVariant, DimensionVariantResolver, DimensionVariantCreatorMethod):
-
     DIGITS_PARAM: ClassVar[str] = "digits"
 
     def __init__(self, value: Any, name: Optional[NameType] = None, params: Optional[Dict[str, Any]] = None) -> None:
@@ -2175,7 +2179,6 @@ class DimensionFilter(DimensionSpec):
     def _chain_recursive(
         cls, left_filter: "DimensionFilter", right_filter: "DimensionFilter", finalize: bool
     ) -> Optional["DimensionFilter"]:
-
         if not left_filter or not right_filter:
             return None
 

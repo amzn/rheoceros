@@ -12,3 +12,10 @@ class ActivationParams(str, Enum):
     # using pkg_resources terminology of workingset, which perfectly fits our general use
     # of this param (aws lambda zip, etc), while still being generic enough.
     RUNTIME_WORKING_SET_ZIP = "WORKING_SET_ZIP"
+
+    TRUSTED_ENTITIES = "TRUSTED_RUNTIME"
+    DEFAULT_POLICIES = "DEFAULT_POLICIES"
+    PERMISSIONS = "PERMISSIONS"
+
+    # TODO remove when notebook support is turned into an Extension
+    REMOTE_DEV_ENV_SUPPORT = "REMOTE_DEV_ENV_SUPPORT"

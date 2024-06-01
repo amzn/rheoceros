@@ -28,7 +28,6 @@ from intelliflow.core.signal_processing.dimension_constructs import (
 
 
 class TestDimensionFilter:
-
     dimension_filter_basic_str_1 = DimensionFilter.load_raw({"strvalue": {}})
     dimension_filter_basic_str_2 = DimensionFilter.load_raw({"": {}})
 
@@ -1137,9 +1136,9 @@ class TestDimensionFilter:
                 datetime(2020, 5, 6, 1, 3),
             ),
             (
-                {2022: {type: Type.DATETIME, "format": "%Y %H:%M"}},  # int -> datetime
-                "2022 00:00",
-                datetime(2022, datetime.now().month, datetime.now().day),
+                {2024: {type: Type.DATETIME, "format": "%Y %H:%M"}},  # int -> datetime
+                "2024 00:00",
+                datetime(2024, datetime.now().month, datetime.now().day),
             ),
             (
                 {

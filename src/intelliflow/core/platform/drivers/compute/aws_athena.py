@@ -192,6 +192,9 @@ class AWSAthenaBatchCompute(AWSConstructMixin, BatchCompute):
                 f"{DATA_TYPE_KEY!r} must be defined as {DataType.DATASET} or left undefined for {self.__class__.__name__} output!"
             )
 
+        if slot.extra_params and "partition_by" in slot.extra_params:
+            raise ValueError(f"'partition_by' is not support by driver {self.__class__.__name__!r}!")
+
         data_format_value = user_attrs.get(DATASET_FORMAT_KEY, user_attrs.get(DATA_FORMAT_KEY, None))
         # default to PARQUET
         data_format = DatasetSignalSourceFormat.PARQUET if data_format_value is None else DatasetSignalSourceFormat(data_format_value)
@@ -232,7 +235,6 @@ class AWSAthenaBatchCompute(AWSConstructMixin, BatchCompute):
         execution_ctx_id: str,
         retry_session_desc: Optional[ComputeSessionDesc] = None,
     ) -> ComputeResponse:
-
         if retry_session_desc:
             # 0- check which stage should be retried. if it has passed the prologue stage already,
             # then retry on the 2nd stage directly (OPTIMIZATION).
@@ -501,7 +503,9 @@ class AWSAthenaBatchCompute(AWSConstructMixin, BatchCompute):
         #    always try to do this since even after a retry on ctas_compute there might be some partial
         # data left over from previous attempt (so don't check session_desc or existence of resource_path in it).
         output_as_internal = self.get_platform().storage.map_materialized_signal(materialized_output)
-        partition_completely_wiped_out = exponential_retry(self.get_platform().storage.delete_internal, [], output_as_internal)
+        partition_completely_wiped_out = exponential_retry(
+            self.get_platform().storage.delete_internal, [], output_as_internal, entire_domain=False
+        )
         if not partition_completely_wiped_out:
             # return TRANSIENT error and let the orchestration retry in the next cycle.
             return ComputeFailedResponse(
@@ -757,7 +761,7 @@ class AWSAthenaBatchCompute(AWSConstructMixin, BatchCompute):
                     "params": {
                         "WorkerType": GlueWorkerType.G_1X.value,
                         "NumberOfWorkers": 20,  # heuristical: optimal # of instances to read 'schema' operation in Spark.
-                        "GlueVersion": "2.0",  # FUTURE analyze advantages of 3.0 over 2.0 as our athena prologue
+                        "GlueVersion": "4.0",
                     },
                 }
             }

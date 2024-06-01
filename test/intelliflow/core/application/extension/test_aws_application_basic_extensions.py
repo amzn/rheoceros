@@ -76,7 +76,7 @@ class TestAWSApplicationBasicExtensions(AWSTestBase):
         ddb_client = boto3.client("dynamodb", region_name=self.region)
         try:
             ddb_client.describe_table(TableName=provisioned_table_name)
-            assert True, "Extension table should not exist before the activation!"
+            assert False, "Extension table should not exist before the activation!"
         except ddb_client.exceptions.ResourceNotFoundException:
             # expected to be missing
             pass
@@ -89,6 +89,12 @@ class TestAWSApplicationBasicExtensions(AWSTestBase):
             assert response
         except ddb_client.exceptions.ResourceNotFoundException:
             assert True, "Extension table should exist post activation!"
+
+        try:
+            response = ddb_client.describe_time_to_live(TableName=provisioned_table_name)
+            assert response["TimeToLiveDescription"]["TimeToLiveStatus"] == "DISABLED"
+        except ddb_client.exceptions.ResourceNotFoundException:
+            pass
 
         # check update logic (e.g should call DDB update table)
         app.activate()
@@ -269,5 +275,64 @@ class TestAWSApplicationBasicExtensions(AWSTestBase):
         except ddb_client.exceptions.ResourceNotFoundException:
             # expected to be missing
             pass
+
+        self.patch_aws_stop()
+
+    def test_application_extensions_basic_dynamodb_table_with_ttl(self):
+        self.patch_aws_start()
+
+        extension_id: str = "dynamodb_ext_ttl"
+        ttl_attr = "creationTime"
+
+        my_table = DynamoDBTable(extension_id=extension_id, table_name="my_extension_table", ttl_attribute_name=ttl_attr)
+
+        app = AWSApplication("exts_ttl", self.region, PLATFORM_EXTENSIONS=[my_table])
+
+        # CompositeExtension should be there
+        assert app.platform.extensions
+        # map should not be empty
+        assert app.platform.extensions.extensions_map
+
+        assert app.platform.extensions[extension_id]
+        provisioned_table_name = app.platform.extensions[extension_id].table_name
+        assert provisioned_table_name == "my_extension_table"
+
+        app.activate()
+
+        import boto3
+
+        ddb_client = boto3.client("dynamodb", region_name=self.region)
+        # first check if the table exists
+        try:
+            response = ddb_client.describe_table(TableName=provisioned_table_name)
+            assert response
+        except ddb_client.exceptions.ResourceNotFoundException:
+            assert False, "Extension table should exist post activation!"
+
+        response = ddb_client.describe_time_to_live(TableName=provisioned_table_name)
+        assert response and response["TimeToLiveDescription"]["AttributeName"] == ttl_attr
+
+        # UPDATE TTL ATTR
+        ttl_attr = "creationTime2"
+        my_table = DynamoDBTable(extension_id=extension_id, table_name="my_extension_table", ttl_attribute_name=ttl_attr)
+        app = AWSApplication("exts_ttl", self.region, PLATFORM_EXTENSIONS=[my_table])
+        app.activate()
+
+        response = ddb_client.describe_time_to_live(TableName=provisioned_table_name)
+        assert (
+            response
+            and response["TimeToLiveDescription"]["AttributeName"] == ttl_attr
+            and response["TimeToLiveDescription"]["AttributeName"] == ttl_attr
+        )
+
+        # DISABLE TTL
+        my_table = DynamoDBTable(extension_id=extension_id, table_name="my_extension_table", ttl_attribute_name=None)
+        app = AWSApplication("exts_ttl", self.region, PLATFORM_EXTENSIONS=[my_table])
+        app.activate()
+
+        response = ddb_client.describe_time_to_live(TableName=provisioned_table_name)
+        assert response and response["TimeToLiveDescription"]["AttributeName"] == ttl_attr
+
+        app.terminate()
 
         self.patch_aws_stop()
