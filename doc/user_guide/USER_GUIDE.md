@@ -871,7 +871,7 @@ assert path, "not received events for NA partition yet"
 > app.attach()
 > app.activate()
 > ```
-> This will just end up refreshing your infrastructure in cloud, with not logical change in the current application topology (routing state, pending triggers, etc).
+> This will just end up refreshing your infrastructure in cloud, without logical change in the current application topology (routing state, pending triggers, etc).
 >
 > Let's give a more practical example to this use-case by going back to our example.
 > Assume that we are trying to extend the application was previously activated in a different development environment.
@@ -2034,6 +2034,150 @@ Use-cases:
     - do trivial data-quality checks
   - custom downstream communication
     - push notification via AWS SNS when upstream data-node (e.g Spark execution) is complete
+    
+In order to capture any of those use-cases inside a callback impl for this compute target, a good understanding of the parameters of [IInlinedCompute](https://github.com/amzn/rheoceros/blob/main/src/intelliflow/core/platform/constructs.py#L1866) interface is required.
+
+> **Using "input_map" parameter:**
+> 
+>  Keys of this dictionary are the alias' (if defined) or the node IDs of the "inputs" provided to an [internal data node](#internal-data-node).
+>  Values are of type [*Signal*](https://github.com/amzn/rheoceros/blob/main/src/intelliflow/core/signal_processing/signal.py#L206) which was introduced before in [signal propagation section](#flow-generation-signal-propagation-and-execution-control).
+> 
+>  Familiarity with this type would help to extract physical paths or dimension values from an input.
+> 
+>> *Extract physical path of the "tip" of an input signal*:
+>>
+>> Tip in this context is the first resource (e.g partition) in an input range (e.g most recent partition to incoming event for an input that represents 30 days of partitions on a dataset).
+>> 
+>> ```python
+>>  Signal::get_materialized_resource_paths() -> List[str]
+>> ```
+>> Use this method on Signal class to get the physical resource paths in order.
+>> 
+>> Example:
+>> ```python
+>>    def my_inlined_compute(input_map: Dict[str, Signal], materialized_output: Signal, params: ConstructParamsDict) -> Any:
+>>        first_input: Signal = input_map["first_input"]
+>>        # e.g  (assuming that first input is an internal data node of the same app and the "granularity" of its first dimension is DAY)
+>>        # s3://if-my-app-111222333444-us-east-1/internal_data/data_node1/2022-05-07
+>>        first_tip_path = first_input.get_materialized_resource_paths()[0]
+>>        # e.g 
+>>        # s3://if-my-app-111222333444-us-east-1/internal_data/data_node1/2022-05-06
+>>        first_next_path = first_input.get_materialized_resource_paths()[1]
+>> 
+>>        second_tip_path = input_map["second_input"].get_materialized_resource_paths()[0]
+>>     
+>>        # WRONG!
+>>        # This will FAIL with wrong index access because second input does not represent a range
+>>        second_tip_path = input_map["second_input"].get_materialized_resource_paths()[1]
+>> 
+>>    # use above callback impl in an internal data node
+>>    mon_node = app.create_data(id="monitoring_node",
+>>                               inputs={
+>>                                  "first_input": data_node1[: -7],  # read 7 partitions of data (day, hour, etc depending on "granularity")
+>>                                  "second_input": data_node2 
+>>                               },
+>>                               compute_targets=[
+>>                                   InlinedCompute( my_inlined_compute )
+>>                               ])
+>> ```
+>> If the node above is force-executed manually like this (emulating a runtime event ingestion with date dimension "2022-05-07"):
+>> 
+>> ```python
+>>  app.execute(mon_node["2022-05-07"])
+>> ```
+>> 
+>>  Then the extracted paths for the first input (within callback impl) would be like the following:
+>>
+>> ```python
+>> [
+>>    "s3://if-my-app-111222333444-us-east-1/internal_data/data_node1/2022-05-07",
+>>    "s3://if-my-app-111222333444-us-east-1/internal_data/data_node1/2022-05-06"
+>>    "s3://if-my-app-111222333444-us-east-1/internal_data/data_node1/2022-05-05"
+>>    "s3://if-my-app-111222333444-us-east-1/internal_data/data_node1/2022-05-04"
+>>    "s3://if-my-app-111222333444-us-east-1/internal_data/data_node1/2022-05-03"
+>>    "s3://if-my-app-111222333444-us-east-1/internal_data/data_node1/2022-05-03"
+>>    "s3://if-my-app-111222333444-us-east-1/internal_data/data_node1/2022-05-02"
+>> ]
+>> ```
+>> 
+>> assuming that the first input is also an internal data node, its node ID is "data_node1", app name is "my-app".
+> 
+>
+>> *Extract dimension values of an input signal*:
+>> 
+>> At runtime, you might want to know execution-time dimension values for each input to build your own custom logic (apart from RheocerOS' routing, execution control).
+>> So on any of the input signals, the following patterns can be used to retrieve runtime dimension values dynamically:
+>>
+>> Option 1: access the dimension filter directly to extract the dimension value as a string:
+>> ```
+>> <input signal>.domain_spec.dimension_filter.find_dimension_by_name(dim_name: str) -> str
+>> ```
+>> 
+>> Example:
+>> ```python
+>>  alarm_input: Signal = input_map["availability_alarm"]
+>>  alarm_state: str = alarm_input.domain_spec.dimension_filter.find_dimension_by_name(AlarmDimension.STATE_TRANSITION).value
+>> 
+>>  time: str = alarm_input.domain_spec.dimension_filter.find_dimension_by_name(AlarmDimension.TIME).value
+>>  alarm_time: datetime = datetime.strptime(time, "%Y-%m-%d %H:%M:%S")
+>> ```
+>> 
+>> Option 2: get the dimensions map at once using the pattern below
+>> 
+>> ```python
+>> <input_signal>.domain_spec.dimension_filter_spec.get_flattened_dimension_map() -> Dict[str, DimensionVariant]
+>> ```
+>> 
+>> Example:
+>> ```python
+>>  alarm_input: Signal = input_map["availability_alarm"]
+>>  alarm_dimensions_map = alarm_input.domain_spec.dimension_filter_spec.get_flattened_dimension_map()
+>> 
+>>  alarm_state: str = alarm_dimensions_map[AlarmDimension.STATE_TRANSITION].value
+>>  time: str = alarm_dimensions_map[AlarmDimension.TIME].value
+>> ```
+
+> **Using "materialized_output" parameter:**
+> 
+> This input is also of type [*Signal*](https://github.com/amzn/rheoceros/blob/main/src/intelliflow/core/signal_processing/signal.py#L206) which was introduced before in [signal propagation section](#flow-generation-signal-propagation-and-execution-control).
+> 
+> So the extraction of prospective "output path" for an ongoing execution follows the same arguments from above (given for the first parameter "input_map").
+> 
+> Again, use ```Signal::get_materialized_resource_paths()``` method on the second parameter for output to get its path.
+> But the first element from the returned list should be used because logically an output signal can never represent a range of resource (each execution in RheocerOS is bound to the generation of a unique resource, hence output path).
+> 
+>> Example:
+>> ```python
+>>    def my_inlined_compute(input_map: Dict[str, Signal], materialized_output: Signal, params: ConstructParamsDict) -> Any:
+>>        # extract the output path at runtime
+>>        output_path = materialized_output.get_materialized_resource_paths()[0]
+>> 
+>>    # use above callback impl in an internal data node
+>>    mon_node = app.create_data(id="monitoring_node",
+>>                               inputs={
+>>                                  "first_input": data_node1[: -7],  # read 7 partitions of data (day, hour, etc depending on "granularity")
+>>                                  "second_input": data_node2 
+>>                               },
+>>                               compute_targets=[
+>>                                   InlinedCompute( my_inlined_compute )
+>>                               ])
+>> ```
+>> If the node above is force-executed manually like this (emulating a runtime event ingestion with date dimension "2022-05-07"):
+>>
+>> ```python
+>>  app.execute(mon_node["2022-05-07"])
+>> ```
+>>
+>>  Then the extracted paths for the output (within callback impl) would be like the following:
+>>
+>> ```python
+>> [
+>>    "s3://if-my-app-111222333444-us-east-1/internal_data/monitoring_node/2022-05-07",
+>> ]
+>> ```
+>> 
+>> Please note that the "output" is implicitly adapting the "dimension spec" of the first input and having a DATETIME based dimension with the same attributes (such as "granularity"). This default behavior is explained for "output dimension spec" under ["flow generation, signal propagation"](#flow-generation-signal-propagation-and-execution-control).
+
 
 > **"params" dictionary:**
 > 
