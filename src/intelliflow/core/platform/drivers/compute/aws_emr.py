@@ -25,6 +25,7 @@ from intelliflow.core.platform.definitions.aws.emr.script.batch.common import (
     EMR_CONFIGURATIONS,
     EMR_INSTANCES_SPECS,
     EXTRA_JARS,
+    IGNORED_BUNDLE_MODULES_PARAM,
     INPUT_MAP_PARAM,
     INSTANCE_CONFIG_KEY,
     JOB_NAME_PARAM,
@@ -366,6 +367,14 @@ class AWSEMRBatchCompute(AWSConstructMixin, BatchCompute):
             f" by BatchCompute driver: {self.__class__.__name__}"
         )
 
+    # overrides
+    def get_max_wait_time_for_next_retry_in_secs(self) -> int:
+        """Owerwrite the maximum interval used by the default retry strategy in
+        BatchCompute::can_retry
+        """
+        # retry with increasing probability as wait time gets close to this
+        return 100 * 60
+
     def dev_init(self, platform: "DevelopmentPlatform") -> None:
         super().dev_init(platform)
 
@@ -474,6 +483,8 @@ class AWSEMRBatchCompute(AWSConstructMixin, BatchCompute):
         spark_cli_args: List[str] = extra_params.get(SPARK_CLI_ARGS, [])
         extra_params.pop(SPARK_CLI_ARGS, None)
 
+        ignored_bundle_modules = code_metadata.ignored_bundle_modules if code_metadata.ignored_bundle_modules else []
+
         emr_cli_args = self._build_emr_cli_arg(
             self.unique_context_id,
             boilerplate_path,
@@ -485,6 +496,7 @@ class AWSEMRBatchCompute(AWSConstructMixin, BatchCompute):
             f"s3://{self._bucket_name}/{self._intelliflow_python_workingset_key}",
             extra_params,
             execution_ctx_id,
+            ignored_bundle_modules,
         )
         module_logger.info(f"Job run id: {unique_compute_id} is using spark cli args: {emr_cli_args!r}")
 
@@ -554,6 +566,7 @@ class AWSEMRBatchCompute(AWSConstructMixin, BatchCompute):
         working_set_key: str,
         extra_params_key: Dict[str, Any],
         execution_ctx_id: str,
+        ignored_bundle_modules: List[str],
     ) -> List[str]:
         emr_cli_arg = [
             "spark-submit",
@@ -582,6 +595,7 @@ class AWSEMRBatchCompute(AWSConstructMixin, BatchCompute):
                 f"--{WORKING_SET_OBJECT_PARAM}": working_set_key,
                 f"--{EXECUTION_ID}": execution_ctx_id,
                 f"--{USER_EXTRA_PARAMS_PARAM}": json.dumps(user_params_keys),
+                f"--{IGNORED_BUNDLE_MODULES_PARAM}": json.dumps(ignored_bundle_modules),
             }
         )
         for k, v in boilerplate_cli_arg.items():

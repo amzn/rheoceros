@@ -271,7 +271,7 @@ class TestAWSApplicationAlarmingMetrics(AWSTestBase):
 
         internal_spark_error_metric3 = app.create_metric(
             id="my_custom_spark_error_metric",
-            sub_dimensions={"marketplace_id": "3"}
+            sub_dimensions={"marketplace_id": "3"},
             # dimension_filter is not specified, so during emission
             # NAME dimension should be specified explicitly
         )
@@ -286,7 +286,7 @@ class TestAWSApplicationAlarmingMetrics(AWSTestBase):
         # }
         internal_spark_metric_ALL = app.create_metric(
             id="my_custom_spark_cumulative",
-            sub_dimensions={"my_custom_dim": "ALL"}
+            sub_dimensions={"my_custom_dim": "ALL"},
             # dimension_filter is not specified, so during emission
             # NAME dimension should be specified explicitly
         )

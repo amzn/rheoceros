@@ -57,12 +57,14 @@ def get_completed_session_state(
     session_desc: ComputeSessionDesc, active_compute_record: "RoutingTable.ComputeRecord"
 ) -> ComputeSessionState:
     return ComputeSessionState(
-        ComputeSessionDesc(
-            f"job_{active_compute_record.materialized_output.get_materialized_resource_paths()[0]}",
-            ComputeResourceDesc("job_name", "job_arn"),
-        )
-        if not session_desc
-        else session_desc,
+        (
+            ComputeSessionDesc(
+                f"job_{active_compute_record.materialized_output.get_materialized_resource_paths()[0]}",
+                ComputeResourceDesc("job_name", "job_arn"),
+            )
+            if not session_desc
+            else session_desc
+        ),
         # COMPLETED !!!
         ComputeSessionStateType.COMPLETED,
         [ComputeExecutionDetails("<start_time>", "<end_time>", dict())],
@@ -73,12 +75,14 @@ def get_processing_session_state(
     session_desc: ComputeSessionDesc, active_compute_record: "RoutingTable.ComputeRecord"
 ) -> ComputeSessionState:
     return ComputeSessionState(
-        ComputeSessionDesc(
-            f"job_{active_compute_record.materialized_output.get_materialized_resource_paths()[0]}",
-            ComputeResourceDesc("job_name", "job_arn"),
-        )
-        if not session_desc
-        else session_desc,
+        (
+            ComputeSessionDesc(
+                f"job_{active_compute_record.materialized_output.get_materialized_resource_paths()[0]}",
+                ComputeResourceDesc("job_name", "job_arn"),
+            )
+            if not session_desc
+            else session_desc
+        ),
         ComputeSessionStateType.PROCESSING,
         [ComputeExecutionDetails("<start_time>", "<end_time>", dict())],
     )

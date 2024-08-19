@@ -1335,7 +1335,7 @@ output=DEXML_DUCSI.limit(100).join(d_ad_orders_na.limit(100), ['customer_id']).l
 
         d_ad_orders_na = app.glue_table(
             "dex_ml_catalog",
-            "d_ad_orders_na"
+            "d_ad_orders_na",
             # this spec will be auto-generated using info from Glue catalog
             # {
             #    'order_day': {

@@ -62,8 +62,8 @@ def get_batch_job_run_failure_type(job_run) -> ComputeFailedSessionStateType:
             return ComputeFailedSessionStateType.APP_INTERNAL
     else:
         logger.critical(
-            f"AWS Batch introduced a new state type {run_state} for training jobs!"
-            f" Marking training job failure type as {ComputeFailedSessionStateType.UNKNOWN}. "
+            f"AWS Batch introduced a new state type {run_state} for jobs!"
+            f" Marking failure type as {ComputeFailedSessionStateType.UNKNOWN}. "
             f" Please upgrade framework to a newer version."
         )
         return ComputeFailedSessionStateType.UNKNOWN

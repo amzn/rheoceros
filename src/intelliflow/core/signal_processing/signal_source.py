@@ -480,6 +480,9 @@ DATASET_SCHEMA_DEFINITION_DEFAULT_VALUE = None
 SchemaField = Tuple[str, Union[str, List], bool]
 SchemaDefinition = List[SchemaField]
 
+DATA_PARTITIONS_ACCESSIBLE: ClassVar[str] = "partitions_accessible"
+DATA_PARTITIONS_ACCESSIBLE_DEFAULT_VALUE = True
+
 
 @unique
 class DatasetSchemaType(str, Enum):
@@ -518,6 +521,10 @@ DATASET_FORMAT_KEY = "dataset_format"
 DATA_FORMAT_KEY = "data_format"
 # TODO use parquet as default (similar to what Spark does?)
 DEFAULT_DATASET_FORMAT = DatasetSignalSourceFormat.CSV
+
+
+DATASET_FOLDER_KEY = "data_folder"
+DATASET_FOLDER_DEFAULT_VALUE = None
 
 
 @unique
@@ -565,10 +572,12 @@ class DatasetSignalSourceAccessSpec(SignalSourceAccessSpec):
             or self.dataset_type != other.dataset_type
             or self.data_delimiter != other.data_delimiter
             or self.data_compression != other.data_compression
+            or self.data_folder != other.data_folder
             or self.data_header_exists != other.data_header_exists
             or self.data_schema_file != other.data_schema_file
             or self.data_schema_type != other.data_schema_type
             or self.data_schema_definition != other.data_schema_definition
+            or self.data_partitions_accessible != other.data_partitions_accessible
             or self.partition_keys != other.partition_keys
             or self.primary_keys != other.primary_keys
         ):
@@ -614,6 +623,10 @@ class DatasetSignalSourceAccessSpec(SignalSourceAccessSpec):
         return self._attrs.get(DATASET_COMPRESSION_KEY, DATASET_COMPRESSION_DEFAULT_VALUE)
 
     @property
+    def data_folder(self) -> Optional[str]:
+        return self._attrs.get(DATASET_FOLDER_KEY, DATASET_FOLDER_DEFAULT_VALUE)
+
+    @property
     def data_schema_file(self) -> str:
         return self._attrs.get(DATASET_SCHEMA_FILE_KEY, DATASET_SCHEMA_FILE_DEFAULT_VALUE)
 
@@ -624,6 +637,14 @@ class DatasetSignalSourceAccessSpec(SignalSourceAccessSpec):
     @property
     def data_schema_definition(self) -> str:
         return self._attrs.get(DATASET_SCHEMA_DEFINITION_KEY, DATASET_SCHEMA_DEFINITION_DEFAULT_VALUE)
+
+    @property
+    def data_partitions_accessible(self) -> bool:
+        return self._attrs.get(DATA_PARTITIONS_ACCESSIBLE, DATA_PARTITIONS_ACCESSIBLE_DEFAULT_VALUE)
+
+    @data_partitions_accessible.setter
+    def data_partitions_accessible(self, val: bool) -> None:
+        self._attrs[DATA_PARTITIONS_ACCESSIBLE] = val
 
     @classmethod
     def validate_schema_definition(cls, schema_def: SchemaDefinition) -> None:
@@ -738,6 +759,9 @@ class DatasetSignalSourceAccessSpec(SignalSourceAccessSpec):
 INTERNAL_DATA_ROUTE_ID_KEY = "_internal_data_route_id"
 INTERNAL_SLOT_TYPES_KEY = "_internal_data_slot_types"
 
+INTERNAL_DATA_OVERWRITE_KEY = "overwrite"
+INTERNAL_DATA_OVERWRITE_DEFAULT_VALUE = True
+
 
 class InternalDatasetSignalSourceAccessSpec(DatasetSignalSourceAccessSpec):
     FOLDER: ClassVar[str] = "internal_data"
@@ -780,7 +804,7 @@ class InternalDatasetSignalSourceAccessSpec(DatasetSignalSourceAccessSpec):
         if not super().check_integrity(other):
             return False
 
-        if not isinstance(other, InternalDatasetSignalSourceAccessSpec):
+        if not isinstance(other, InternalDatasetSignalSourceAccessSpec) or self.overwrites != other.overwrites:
             return False
 
         return True
@@ -804,6 +828,10 @@ class InternalDatasetSignalSourceAccessSpec(DatasetSignalSourceAccessSpec):
     @slot_types.setter
     def slot_types(self, val: List["SlotType"]) -> None:
         self._attrs[INTERNAL_SLOT_TYPES_KEY] = val
+
+    @property
+    def overwrites(self) -> bool:
+        return self._attrs.get(INTERNAL_DATA_OVERWRITE_KEY, INTERNAL_DATA_OVERWRITE_DEFAULT_VALUE)
 
     @property
     def folder(self) -> str:
@@ -833,16 +861,13 @@ class InternalDatasetSignalSourceAccessSpec(DatasetSignalSourceAccessSpec):
 
 class S3SignalSourceAccessSpec(DatasetSignalSourceAccessSpec):
     @overload
-    def __init__(cls, account_id: str, bucket: str, other_spec: SignalSourceAccessSpec) -> None:
-        ...
+    def __init__(cls, account_id: str, bucket: str, other_spec: SignalSourceAccessSpec) -> None: ...
 
     @overload
-    def __init__(cls, account_id: str, bucket: str, folder: str, dimension_spec: DimensionSpec, **kwargs: Dict[str, Any]) -> None:
-        ...
+    def __init__(cls, account_id: str, bucket: str, folder: str, dimension_spec: DimensionSpec, **kwargs: Dict[str, Any]) -> None: ...
 
     @overload
-    def __init__(cls, account_id: str, bucket: str, folder: str, *partition_key: Sequence[str], **kwargs: Dict[str, Any]) -> None:
-        ...
+    def __init__(cls, account_id: str, bucket: str, folder: str, *partition_key: Sequence[str], **kwargs: Dict[str, Any]) -> None: ...
 
     def __init__(
         self,

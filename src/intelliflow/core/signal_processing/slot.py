@@ -46,6 +46,8 @@ class SlotCodeMetadata(CoreData):
         target_method: Optional[str] = None,
         # ex: s3 paths, etc
         external_library_paths: Optional[List[str]] = None,
+        # ex: boto3, s3transfer
+        ignored_bundle_modules: Optional[List[str]] = None,
     ) -> None:
         self.code_type = code_type
         self.target_entity = target_entity
@@ -56,6 +58,12 @@ class SlotCodeMetadata(CoreData):
             # make __eq__ happy
             self.external_library_paths = list(external_library_paths)
             self.external_library_paths.sort()
+
+        self.ignored_bundle_modules = ignored_bundle_modules
+        if self.ignored_bundle_modules:
+            # make __eq__ happy
+            self.ignored_bundle_modules = list(ignored_bundle_modules)
+            self.ignored_bundle_modules.sort()
 
 
 class SlotCode(str):

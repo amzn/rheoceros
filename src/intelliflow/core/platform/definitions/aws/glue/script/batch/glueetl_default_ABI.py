@@ -9,6 +9,7 @@ User code gets set as "client" code.
 Then Glue based constructs are supposed to get the final state of this script and send it
 to Glue during job creation.
 """
+
 from typing import ClassVar, Optional, Set
 
 from intelliflow.core.platform.definitions.aws.glue.script.batch.common import (
@@ -198,6 +199,10 @@ def load_input_df(input, sc, aws_region):
                                    "Either there is a problem with range_check mechanism or the partition has been deleted "
                                    "after the execution has started.".format(resource_path))
         if not new_df:
+            # append data sub folder if it is defined by the user
+            data_folder = input.get("data_folder", None)
+            if data_folder:
+                resource_path = resource_path.rstrip("/")+ "/" + data_folder
             # native access via input materialized paths
             schema_def = input.get("data_schema_def", None)
             spark_schema_def = create_spark_schema(schema_def) if schema_def else None

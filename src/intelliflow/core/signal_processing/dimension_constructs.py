@@ -294,12 +294,10 @@ class DimensionSpec:
         return None
 
     @overload
-    def check_compatibility(self, dim_hierarchy: List[Any], enable_breadth_check: bool = True) -> bool:
-        ...
+    def check_compatibility(self, dim_hierarchy: List[Any], enable_breadth_check: bool = True) -> bool: ...
 
     @overload
-    def check_compatibility(self, dim_spec: "DimensionSpec", enable_breadth_check: bool = True, enable_type_check: bool = True) -> bool:
-        ...
+    def check_compatibility(self, dim_spec: "DimensionSpec", enable_breadth_check: bool = True, enable_type_check: bool = True) -> bool: ...
 
     def check_compatibility(
         self, arg1: Union["DimensionSpec", List[Any]], enable_breadth_check: bool = True, enable_type_check: bool = True
@@ -2089,12 +2087,10 @@ class DimensionFilter(DimensionSpec):
         return self.chain(value_filter, True)
 
     @overload
-    def chain(self, other_filter: "DimensionFilter", finalize: bool = False) -> Optional["DimensionFilter"]:
-        ...
+    def chain(self, other_filter: "DimensionFilter", finalize: bool = False) -> Optional["DimensionFilter"]: ...
 
     @overload
-    def chain(self, other_filter: RawDimensionFilterInput, finalize: bool = False) -> Optional["DimensionFilter"]:
-        ...
+    def chain(self, other_filter: RawDimensionFilterInput, finalize: bool = False) -> Optional["DimensionFilter"]: ...
 
     def chain(
         self, other_filter_or_raw: Union["DimensionFilter", RawDimensionFilterInput], finalize: bool = False
@@ -2449,15 +2445,13 @@ class DimensionFilter(DimensionSpec):
     @overload
     def load_raw(
         cls, raw_value_list: List[RawVariantType], cast: DimensionSpec = None, error_out: bool = False
-    ) -> Optional["DimensionFilter"]:
-        ...
+    ) -> Optional["DimensionFilter"]: ...
 
     @classmethod
     @overload
     def load_raw(
         cls, raw_value_dict: Dict[RawVariantType, Any], cast: DimensionSpec = None, error_out: bool = False
-    ) -> Optional["DimensionFilter"]:
-        ...
+    ) -> Optional["DimensionFilter"]: ...
 
     @classmethod
     def load_raw(

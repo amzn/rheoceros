@@ -316,8 +316,7 @@ class BaseConstruct(Serializable, ABC):
         pass
 
     @abstractmethod
-    def provide_runtime_default_policies(self) -> List[str]:
-        ...
+    def provide_runtime_default_policies(self) -> List[str]: ...
 
     @abstractmethod
     def provide_runtime_permissions(self) -> List[ConstructPermission]:
@@ -587,48 +586,38 @@ class BaseConstruct(Serializable, ABC):
         self._pending_security_conf = security_conf
 
     @abstractmethod
-    def _process_external(self, new_signals: Set[Signal], current_signals: Set[Signal]) -> None:
-        ...
+    def _process_external(self, new_signals: Set[Signal], current_signals: Set[Signal]) -> None: ...
 
     @abstractmethod
-    def _process_internal(self, new_routes: Set[Route], current_routes: Set[Route]) -> None:
-        ...
+    def _process_internal(self, new_routes: Set[Route], current_routes: Set[Route]) -> None: ...
 
     @abstractmethod
-    def _process_internal_signals(self, new_signals: Set[Signal], current_signals: Set[Signal]) -> None:
-        ...
+    def _process_internal_signals(self, new_signals: Set[Signal], current_signals: Set[Signal]) -> None: ...
 
     @abstractmethod
     def _process_construct_connections(
         self, new_construct_conns: Set["_PendingConnRequest"], current_construct_conns: Set["_PendingConnRequest"]
-    ) -> None:
-        ...
+    ) -> None: ...
 
     @abstractmethod
-    def _process_security_conf(self, new_security_conf: ConstructSecurityConf, current_security_conf: ConstructSecurityConf) -> None:
-        ...
+    def _process_security_conf(self, new_security_conf: ConstructSecurityConf, current_security_conf: ConstructSecurityConf) -> None: ...
 
     @abstractmethod
-    def _revert_external(self, signals: Set[Signal], prev_signals: Set[Signal]) -> None:
-        ...
+    def _revert_external(self, signals: Set[Signal], prev_signals: Set[Signal]) -> None: ...
 
     @abstractmethod
-    def _revert_internal(self, routes: Set[Route], prev_routes: Set[Route]) -> None:
-        ...
+    def _revert_internal(self, routes: Set[Route], prev_routes: Set[Route]) -> None: ...
 
     @abstractmethod
-    def _revert_internal_signals(self, signals: Set[Signal], prev_signals: Set[Signal]) -> None:
-        ...
+    def _revert_internal_signals(self, signals: Set[Signal], prev_signals: Set[Signal]) -> None: ...
 
     @abstractmethod
     def _revert_construct_connections(
         self, construct_conns: Set["_PendingConnRequest"], prev_construct_conns: Set["_PendingConnRequest"]
-    ) -> None:
-        ...
+    ) -> None: ...
 
     @abstractmethod
-    def _revert_security_conf(selfs, security_conf: ConstructSecurityConf, prev_security_conf: ConstructSecurityConf) -> None:
-        ...
+    def _revert_security_conf(selfs, security_conf: ConstructSecurityConf, prev_security_conf: ConstructSecurityConf) -> None: ...
 
     def activation_completed(self) -> None:
         # now we can safely adapt the new state. whole app got into new configuration consistently.
@@ -659,50 +648,40 @@ class Storage(BaseConstruct, ABC):
         return self.get_storage_resource_path()
 
     @abstractmethod
-    def get_event_channel_type(self) -> str:
-        ...
+    def get_event_channel_type(self) -> str: ...
 
     @abstractmethod
-    def get_event_channel_resource_path(self) -> str:
-        ...
+    def get_event_channel_resource_path(self) -> str: ...
 
     @abstractmethod
-    def subscribe_downstream_resource(self, downstream_platform: "DevelopmentPlatform", resource_type: str, resource_path: str):
-        ...
+    def subscribe_downstream_resource(self, downstream_platform: "DevelopmentPlatform", resource_type: str, resource_path: str): ...
 
     @abstractmethod
-    def unsubscribe_downstream_resource(self, downstream_platform: "DevelopmentPlatform", resource_type: str, resource_path: str):
-        ...
+    def unsubscribe_downstream_resource(self, downstream_platform: "DevelopmentPlatform", resource_type: str, resource_path: str): ...
 
     @abstractmethod
-    def get_object_uri(self, folders: Sequence[str], object_name: str) -> str:
-        ...
+    def get_object_uri(self, folders: Sequence[str], object_name: str) -> str: ...
 
     @abstractmethod
-    def check_object(self, folders: Sequence[str], object_name: str) -> bool:
-        ...
+    def check_object(self, folders: Sequence[str], object_name: str) -> bool: ...
 
     def load(self, folders: Sequence[str], object_name: str) -> str:
         return self.load_object(folders, object_name).decode("utf-8")
 
     @abstractmethod
-    def load_object(self, folders: Sequence[str], object_name: str) -> bytes:
-        ...
+    def load_object(self, folders: Sequence[str], object_name: str) -> bytes: ...
 
     def save(self, data: str, folders: Sequence[str], object_name: str) -> None:
         self.save_object(data.encode("utf-8"), folders, object_name)
 
     @abstractmethod
-    def save_object(self, data: bytes, folders: Sequence[str], object_name: str) -> None:
-        ...
+    def save_object(self, data: bytes, folders: Sequence[str], object_name: str) -> None: ...
 
     @abstractmethod
-    def delete(self, folders: Sequence[str], object_name: Optional[str] = None) -> None:
-        ...
+    def delete(self, folders: Sequence[str], object_name: Optional[str] = None) -> None: ...
 
     @abstractmethod
-    def check_folder(self, prefix_or_folders: Union[str, Sequence[str]]) -> bool:
-        ...
+    def check_folder(self, prefix_or_folders: Union[str, Sequence[str]]) -> bool: ...
 
     @abstractmethod
     def load_folder(self, prefix_or_folders: Union[str, Sequence[str]], limit: int = None) -> Iterator[Tuple[str, bytes]]:
@@ -735,8 +714,7 @@ class Storage(BaseConstruct, ABC):
         ...
 
     @abstractmethod
-    def is_internal(self, source_type: SignalSourceType, resource_path: str) -> bool:
-        ...
+    def is_internal(self, source_type: SignalSourceType, resource_path: str) -> bool: ...
 
     def map_materialized_signal(self, materialized_signal) -> Optional[Signal]:
         """Converts a materialized signal to its internal representation if it is an Internal signal actually.
@@ -750,8 +728,7 @@ class Storage(BaseConstruct, ABC):
             return materialized_signal.create_from_spec(internal_spec, SignalType.INTERNAL_PARTITION_CREATION)
 
     @abstractmethod
-    def map_incoming_event(self, source_type: SignalSourceType, resource_path: str) -> Optional[SignalSourceAccessSpec]:
-        ...
+    def map_incoming_event(self, source_type: SignalSourceType, resource_path: str) -> Optional[SignalSourceAccessSpec]: ...
 
     @abstractmethod
     def map_internal_data_access_spec(self, data_access_spec: SignalSourceAccessSpec) -> SignalSourceAccessSpec:
@@ -1531,22 +1508,18 @@ class Diagnostics(BaseConstruct, ABC):
 
     # dashboard editing functions used before activation
     @abstractmethod
-    def create_dashboard(self, **kwargs) -> Dict[str, Any]:
-        ...
+    def create_dashboard(self, **kwargs) -> Dict[str, Any]: ...
 
     @abstractmethod
-    def add_text_widget(self, current_data: Dict[str, Any], markdown: str, **kwargs) -> None:
-        ...
+    def add_text_widget(self, current_data: Dict[str, Any], markdown: str, **kwargs) -> None: ...
 
     @abstractmethod
-    def add_alarm_status_widget(self, current_data: Dict[str, Any], title: str, alarms: List[Signal], **kwargs) -> None:
-        ...
+    def add_alarm_status_widget(self, current_data: Dict[str, Any], title: str, alarms: List[Signal], **kwargs) -> None: ...
 
     @abstractmethod
     def add_metric_widget(
         self, current_data: Dict[str, Any], metric_signals_or_alarm: List[Signal], title: Optional[str] = None, **kwargs
-    ) -> None:
-        ...
+    ) -> None: ...
 
     def hook_dashboards(self, dashboards: Dict[str, Any]) -> None:
         self._pending_dashboards = dashboards
@@ -1561,12 +1534,10 @@ class Diagnostics(BaseConstruct, ABC):
         self._revert_dashboards(self._pending_dashboards, self._processed_dashboards)
 
     @abstractmethod
-    def _revert_dashboards(selfs, dashboards: Dict[str, Any], prev_dashboards: Dict[str, Any]) -> None:
-        ...
+    def _revert_dashboards(selfs, dashboards: Dict[str, Any], prev_dashboards: Dict[str, Any]) -> None: ...
 
     @abstractmethod
-    def _process_dashboards(self, new_dashboards: Dict[str, Any], current_dashboards: Dict[str, Any]) -> None:
-        ...
+    def _process_dashboards(self, new_dashboards: Dict[str, Any], current_dashboards: Dict[str, Any]) -> None: ...
 
     def activation_completed(self) -> None:
         super().activation_completed()
@@ -1707,24 +1678,19 @@ class Diagnostics(BaseConstruct, ABC):
         metric_signal: Signal,
         value: Union[float, MetricStatisticData, List[Union[float, MetricValueCountPairData]]],
         timestamp: Optional[datetime] = None,
-    ) -> None:
-        ...
+    ) -> None: ...
 
     @abstractmethod
-    def get_event_channel_type(self) -> str:
-        ...
+    def get_event_channel_type(self) -> str: ...
 
     @abstractmethod
-    def get_event_channel_resource_path(self) -> str:
-        ...
+    def get_event_channel_resource_path(self) -> str: ...
 
     @abstractmethod
-    def subscribe_downstream_resource(self, downstream_platform: "DevelopmentPlatform", resource_type: str, resource_path: str):
-        ...
+    def subscribe_downstream_resource(self, downstream_platform: "DevelopmentPlatform", resource_type: str, resource_path: str): ...
 
     @abstractmethod
-    def unsubscribe_downstream_resource(self, downstream_platform: "DevelopmentPlatform", resource_type: str, resource_path: str):
-        ...
+    def unsubscribe_downstream_resource(self, downstream_platform: "DevelopmentPlatform", resource_type: str, resource_path: str): ...
 
     # overrides
     def _process_internal_signals(self, new_signals: Set[Signal], current_signals: Set[Signal]) -> None:
@@ -1740,8 +1706,7 @@ class Diagnostics(BaseConstruct, ABC):
     @abstractmethod
     def _process_internal_alarms(
         self, new_alarms: Set[Signal], current_alarms: Set[Signal], resource_paths_to_be_deleted: Set[str]
-    ) -> None:
-        ...
+    ) -> None: ...
 
     # overrides
     def _process_external(self, new_signals: Set[Signal], current_signals: Set[Signal]) -> None:
@@ -1766,12 +1731,10 @@ class Diagnostics(BaseConstruct, ABC):
         )
 
     @abstractmethod
-    def _process_raw_external_alarms(self, new_signals: Set[Signal], current_signals: Set[Signal]) -> None:
-        ...
+    def _process_raw_external_alarms(self, new_signals: Set[Signal], current_signals: Set[Signal]) -> None: ...
 
     @abstractmethod
-    def is_internal(self, source_type: SignalSourceType, resource_path: str) -> bool:
-        ...
+    def is_internal(self, source_type: SignalSourceType, resource_path: str) -> bool: ...
 
     def map_materialized_signal(self, materialized_signal) -> Optional[Signal]:
         """Converts a materialized signal to its internal representation if it is an Internal signal actually.
@@ -1782,8 +1745,7 @@ class Diagnostics(BaseConstruct, ABC):
             return materialized_signal.create_from_spec(internal_spec)
 
     @abstractmethod
-    def map_incoming_event(self, source_type: SignalSourceType, resource_path: str) -> Optional[SignalSourceAccessSpec]:
-        ...
+    def map_incoming_event(self, source_type: SignalSourceType, resource_path: str) -> Optional[SignalSourceAccessSpec]: ...
 
     @abstractmethod
     def map_external_access_spec(self, access_spec: Optional[SignalSourceAccessSpec] = None) -> Optional[SignalSourceAccessSpec]:
@@ -1813,8 +1775,7 @@ class Diagnostics(BaseConstruct, ABC):
         ...
 
     @abstractmethod
-    def get_unique_internal_alarm_name(self, alarm_name: str) -> str:
-        ...
+    def get_unique_internal_alarm_name(self, alarm_name: str) -> str: ...
 
 
 class Extension(BaseConstruct, ABC):
@@ -1840,8 +1801,7 @@ class Extension(BaseConstruct, ABC):
     @abstractmethod
     def provide_devtime_permissions_ext(
         cls, extension_desc: "Extension.Descriptor", params: ConstructParamsDict
-    ) -> List[ConstructPermission]:
-        ...
+    ) -> List[ConstructPermission]: ...
 
     # overrides
     def _provide_route_metrics(self, route: Route) -> List[ConstructInternalMetricDesc]:
@@ -1885,8 +1845,7 @@ class Extension(BaseConstruct, ABC):
 
         @classmethod
         @abstractmethod
-        def provide_extension_type(cls) -> Type["Extension"]:
-            ...
+        def provide_extension_type(cls) -> Type["Extension"]: ...
 
 
 class CompositeExtension(BaseConstruct):
@@ -2371,8 +2330,7 @@ class RoutingComputeInterface:
     # class IInlinedCompute(ABC):
     class IInlinedCompute:
         @abstractmethod
-        def __call__(self, input_map: Dict[str, Signal], materialized_output: Signal, params: ConstructParamsDict) -> Any:
-            ...
+        def __call__(self, input_map: Dict[str, Signal], materialized_output: Signal, params: ConstructParamsDict) -> Any: ...
 
 
 class RoutingHookInterface:
@@ -2383,8 +2341,7 @@ class RoutingHookInterface:
 
     class IHook:
         @abstractmethod
-        def __call__(self, routing_table: "RoutingTable", route_record: "RoutingTable.RouteRecord", *args, **params) -> None:
-            ...
+        def __call__(self, routing_table: "RoutingTable", route_record: "RoutingTable.RouteRecord", *args, **params) -> None: ...
 
     class Execution:
         class IExecutionBeginHook:
@@ -2396,8 +2353,7 @@ class RoutingHookInterface:
                 execution_context: "Route.ExecutionContext",
                 current_timestamp_in_utc: int,
                 **params,
-            ) -> None:
-                ...
+            ) -> None: ...
 
         class IExecutionSkippedHook:
             @abstractmethod
@@ -2408,8 +2364,7 @@ class RoutingHookInterface:
                 execution_context: "Route.ExecutionContext",
                 current_timestamp_in_utc: int,
                 **params,
-            ) -> None:
-                ...
+            ) -> None: ...
 
         class IComputeSuccessHook:
             @abstractmethod
@@ -2420,8 +2375,7 @@ class RoutingHookInterface:
                 compute_record: "RoutingTable.ComputeRecord",
                 current_timestamp_in_utc: int,
                 **params,
-            ) -> None:
-                ...
+            ) -> None: ...
 
         class IComputeFailureHook:
             @abstractmethod
@@ -2432,8 +2386,7 @@ class RoutingHookInterface:
                 compute_record: "RoutingTable.ComputeRecord",
                 current_timestamp_in_utc: int,
                 **params,
-            ) -> None:
-                ...
+            ) -> None: ...
 
         class IComputeRetryHook:
             @abstractmethod
@@ -2444,8 +2397,7 @@ class RoutingHookInterface:
                 compute_record: "RoutingTable.ComputeRecord",
                 current_timestamp_in_utc: int,
                 **params,
-            ) -> None:
-                ...
+            ) -> None: ...
 
         class IExecutionSuccessHook:
             @abstractmethod
@@ -2458,8 +2410,7 @@ class RoutingHookInterface:
                 materialized_output: Signal,
                 current_timestamp_in_utc: int,
                 **params,
-            ) -> None:
-                ...
+            ) -> None: ...
 
         class IExecutionFailureHook:
             @abstractmethod
@@ -2472,8 +2423,7 @@ class RoutingHookInterface:
                 materialized_output: Signal,
                 current_timestamp_in_utc: int,
                 **params,
-            ) -> None:
-                ...
+            ) -> None: ...
 
         class IExecutionCheckpointHook:
             @abstractmethod
@@ -2486,8 +2436,7 @@ class RoutingHookInterface:
                 checkpoint_in_secs: int,
                 current_timestamp_in_utc: int,
                 **params,
-            ) -> None:
-                ...
+            ) -> None: ...
 
     class PendingNode:
         class IPendingNodeCreationHook:
@@ -2499,8 +2448,7 @@ class RoutingHookInterface:
                 pending_node: "RuntimeLinkNode",
                 current_timestamp_in_utc: int,
                 **params,
-            ):
-                ...
+            ): ...
 
         class IPendingNodeExpirationHook:
             @abstractmethod
@@ -2511,8 +2459,7 @@ class RoutingHookInterface:
                 pending_node: "RuntimeLinkNode",
                 current_timestamp_in_utc: int,
                 **params,
-            ):
-                ...
+            ): ...
 
         class IPendingCheckpointHook:
             @abstractmethod
@@ -2524,8 +2471,7 @@ class RoutingHookInterface:
                 checkpoint_in_secs: int,
                 current_timestamp_in_utc: int,
                 **params,
-            ):
-                ...
+            ): ...
 
 
 class RoutingTable(BaseConstruct, ABC):
@@ -4152,36 +4098,29 @@ class RoutingTable(BaseConstruct, ABC):
         ...
 
     @abstractmethod
-    def _delete(self, routes: Set[Route]) -> None:
-        ...
+    def _delete(self, routes: Set[Route]) -> None: ...
 
     @abstractmethod
-    def _clear_all(self) -> None:
-        ...
+    def _clear_all(self) -> None: ...
 
     @abstractmethod
-    def _clear_active_routes(self) -> None:
-        ...
+    def _clear_active_routes(self) -> None: ...
 
     @abstractmethod
-    def clear_history(self) -> None:
-        ...
+    def clear_history(self) -> None: ...
 
     @abstractmethod
-    def load_active_route_records(self) -> Iterator["RoutingTable.RouteRecord"]:
-        ...
+    def load_active_route_records(self) -> Iterator["RoutingTable.RouteRecord"]: ...
 
     @abstractmethod
     def load_active_compute_records(
         self, route_id: Optional[RouteID] = None, ascending: bool = False
-    ) -> Iterator["RoutingTable.ComputeRecord"]:
-        ...
+    ) -> Iterator["RoutingTable.ComputeRecord"]: ...
 
     @abstractmethod
     def load_pending_nodes(
         self, route_id: Optional[RouteID] = None, ascending: bool = False
-    ) -> Union[Iterator[Tuple[RouteID, "RuntimeLinkNode"]], Iterator["RuntimeLinkNode"]]:
-        ...
+    ) -> Union[Iterator[Tuple[RouteID, "RuntimeLinkNode"]], Iterator["RuntimeLinkNode"]]: ...
 
     @abstractmethod
     def load_inactive_compute_records(

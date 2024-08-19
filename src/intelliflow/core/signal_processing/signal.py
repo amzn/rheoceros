@@ -104,7 +104,7 @@ class SignalType(Enum):
     def is_data_dependent(self) -> bool:
         return self in [
             SignalType.INTERNAL_PARTITION_CREATION,
-            SignalType.LOCAL_FOLDER_CREATION
+            SignalType.LOCAL_FOLDER_CREATION,
             # ex: SignalType.INTERNAL_MODEL_CREATION
         ]
 
@@ -328,8 +328,7 @@ class Signal(Serializable["Signal"]):
 
     @overload
     @classmethod
-    def ground(cls, alias: str, dimension_spec: Optional[DimensionSpec] = None) -> "Signal":
-        ...
+    def ground(cls, alias: str, dimension_spec: Optional[DimensionSpec] = None) -> "Signal": ...
 
     @classmethod
     def ground(cls, alias_or_other_signal: "Signal", dimension_spec: Optional[DimensionSpec] = None) -> "Signal":
@@ -464,16 +463,13 @@ class Signal(Serializable["Signal"]):
         return None
 
     @overload
-    def chain(self, other: "Signal", new_alias: str = None) -> Optional["Signal"]:
-        ...
+    def chain(self, other: "Signal", new_alias: str = None) -> Optional["Signal"]: ...
 
     @overload
-    def chain(self, other: DimensionFilter, new_alias: str = None) -> Optional["Signal"]:
-        ...
+    def chain(self, other: DimensionFilter, new_alias: str = None) -> Optional["Signal"]: ...
 
     @overload
-    def chain(self, other: RawDimensionFilterInput, new_alias: str = None) -> Optional["Signal"]:
-        ...
+    def chain(self, other: RawDimensionFilterInput, new_alias: str = None) -> Optional["Signal"]: ...
 
     def chain(self, other: Union["Signal", Union[DimensionFilter, RawDimensionFilterInput]], new_alias: str = None) -> Optional["Signal"]:
         other_filter = other.domain_spec.dimension_filter_spec if isinstance(other, Signal) else other
@@ -484,12 +480,10 @@ class Signal(Serializable["Signal"]):
         return None
 
     @overload
-    def filter(self, new_filter: RawDimensionFilterInput, new_alias: str = None, transfer_spec: bool = False) -> "Signal":
-        ...
+    def filter(self, new_filter: RawDimensionFilterInput, new_alias: str = None, transfer_spec: bool = False) -> "Signal": ...
 
     @overload
-    def filter(self, new_filter: DimensionFilter, new_alias: str = None, transfer_spec: bool = False) -> "Signal":
-        ...
+    def filter(self, new_filter: DimensionFilter, new_alias: str = None, transfer_spec: bool = False) -> "Signal": ...
 
     def filter(
         self, new_filter: Union[DimensionFilter, RawDimensionFilterInput], new_alias: str = None, transfer_spec: bool = False
@@ -660,8 +654,7 @@ class Signal(Serializable["Signal"]):
 
 class SignalProvider:
     @abstractmethod
-    def get_signal(self, alias: str = None) -> Signal:
-        ...
+    def get_signal(self, alias: str = None) -> Signal: ...
 
 
 class SignalDimensionTuple:

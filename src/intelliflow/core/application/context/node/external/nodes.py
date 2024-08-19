@@ -58,16 +58,14 @@ class ExternalDataNode(DataNode, ABC):
 
         @classmethod
         @abstractmethod
-        def requires_dimension_spec(cls) -> bool:
-            ...
+        def requires_dimension_spec(cls) -> bool: ...
 
         @classmethod
         def provide_default_dimension_spec(cls) -> DimensionSpec:
             return None
 
         @abstractmethod
-        def provide_default_id(self) -> str:
-            ...
+        def provide_default_id(self) -> str: ...
 
         def set_platform(self, platform: HostPlatform) -> None:
             self._set_platform(platform)

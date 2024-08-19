@@ -26,8 +26,7 @@ class ComputeDescriptor(ABC):
         return None
 
     @abstractmethod
-    def create_slot(self, output_signal: Signal) -> Slot:
-        ...
+    def create_slot(self, output_signal: Signal) -> Slot: ...
 
     @abstractmethod
     def activation_completed(self, platform: "HostPlatform") -> None:

@@ -160,9 +160,11 @@ class SnifferHookBase:
     ):
         self._routing_table.get_platform().storage.save(
             data,
-            [self.HOOK_DATA_FOLDER, data_id] + partitions + [self.PENDING_NODES_SUB_FOLDER, str(timestamp), pending_node_id] + []
-            if checkpoint_offset_in_secs is None
-            else [self.CHECKPOINT_SUB_FOLDER, checkpoint_offset_in_secs],
+            (
+                [self.HOOK_DATA_FOLDER, data_id] + partitions + [self.PENDING_NODES_SUB_FOLDER, str(timestamp), pending_node_id] + []
+                if checkpoint_offset_in_secs is None
+                else [self.CHECKPOINT_SUB_FOLDER, checkpoint_offset_in_secs]
+            ),
             self.__class__.__name__,
         )
 
@@ -361,9 +363,11 @@ def ExecutionSniffer(max_execution_checkpoint_in_hours: Optional[int] = None) ->
             RouteCheckpoint(checkpoint_in_secs=c_in_hours * 60 * 60, slot=OnExecutionCheckpoint())
             for c_in_hours in range(
                 0,
-                cls.DEFAULT_EXECUTION_CHECKPOINT_MAX_IN_HOURS
-                if max_execution_checkpoint_in_hours is None
-                else max_execution_checkpoint_in_hours,
+                (
+                    cls.DEFAULT_EXECUTION_CHECKPOINT_MAX_IN_HOURS
+                    if max_execution_checkpoint_in_hours is None
+                    else max_execution_checkpoint_in_hours
+                ),
             )
         ],
     )

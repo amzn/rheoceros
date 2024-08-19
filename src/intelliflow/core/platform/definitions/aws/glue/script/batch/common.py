@@ -6,6 +6,7 @@
 This *can* be provided to Glue for further client code convenience. But this should not be
 mandatory.
 """
+
 from intelliflow.core.platform.definitions.compute import BasicBatchDataInputMap, BasicBatchDataOutput
 
 JOB_NAME_PARAM: str = "JOB_NAME"

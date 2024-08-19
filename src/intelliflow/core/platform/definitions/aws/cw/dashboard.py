@@ -159,7 +159,7 @@ def create_metric_widget(
     properties = {
         "title": title,
         "legend": {"position": legend_pos.value},
-        "liveData": False
+        "liveData": False,
         # Timezone format is + or - followed by four digits. The first two digits indicate the number of hours ahead or
         # behind of UTC, and the final two digits are the number of minutes. The default is +0000.
         # "timezone": "+0130"

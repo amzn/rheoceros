@@ -8,6 +8,7 @@ They generally constitute other AWS resources to control request-buffering, de-d
 related aspects. Request-buffering would be required to abstract other Platform components (aka the Processor) from
 the internal details
 """
+
 import json
 import logging
 import uuid
@@ -686,7 +687,6 @@ class AWSGlueBatchComputeBasic(AWSConstructMixin, BatchCompute):
             # TODO dev-role should have the right to do BucketNotification on external signals
             # this would require post-MVP design change on how dev-role is used and when it is updated.
             # probably during the activation again (switching to the admin credentails if authorization is given).
-
             # log retrieval
             ConstructPermission(
                 [
@@ -1154,15 +1154,15 @@ class AWSGlueBatchComputeBasic(AWSConstructMixin, BatchCompute):
                 details = dict()
                 details["JobId"] = final_execution_details.get("Id", None)
                 details["JobName"] = final_execution_details.get("JobName", None)
-                details[
-                    "JobURL"
-                ] = f"https://{self.region}.console.aws.amazon.com/gluestudio/home?region={self.region}#/editor/job/{details['JobName']}/details"
-                details[
-                    "JobRunURL"
-                ] = f"https://{self.region}.console.aws.amazon.com/gluestudio/home?region={self.region}#/job/{details['JobName']}/run/{details['JobId']}"
-                details[
-                    "JobLogURL"
-                ] = f"https://{self.region}.console.aws.amazon.com/cloudwatch/home?region={self.region}#logsV2:log-groups/log-group/$252Faws-glue$252Fjobs$252Foutput/log-events/{details['JobId']}"
+                details["JobURL"] = (
+                    f"https://{self.region}.console.aws.amazon.com/gluestudio/home?region={self.region}#/editor/job/{details['JobName']}/details"
+                )
+                details["JobRunURL"] = (
+                    f"https://{self.region}.console.aws.amazon.com/gluestudio/home?region={self.region}#/job/{details['JobName']}/run/{details['JobId']}"
+                )
+                details["JobLogURL"] = (
+                    f"https://{self.region}.console.aws.amazon.com/cloudwatch/home?region={self.region}#logsV2:log-groups/log-group/$252Faws-glue$252Fjobs$252Foutput/log-events/{details['JobId']}"
+                )
                 details["StartedOn"] = final_execution_details.get("StartedOn", None)
                 details["CompletedOn"] = final_execution_details.get("CompletedOn", None)
                 details["JobRunState"] = final_execution_details.get("JobRunState", None)

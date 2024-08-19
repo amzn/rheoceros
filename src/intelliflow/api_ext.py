@@ -5,6 +5,7 @@
 
 For finer granular control, more flexibility core API should be used.
 """
+
 import copy
 import json
 import logging
@@ -296,6 +297,48 @@ class AWSBatchJob(InternalDataNode.BatchComputeDescriptor):
         super().__init__("", Lang.AWS_BATCH_JOB, ABI.NONE, extra_permissions, retry_count, **kwargs)
 
 
+class AWSSSFNStateMachine(InternalDataNode.BatchComputeDescriptor):
+    def __init__(
+        self, definition: Union[str, Dict], extra_permissions: List[Permission] = None, retry_count: int = 0, **other_api_params
+    ) -> None:
+        """Creates or updates a framework managed AWS SFN State Machine using the API from
+        https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/stepfunctions/client/create_state_machine.html
+
+        - do not define `name` as the resource is managed by the framework per node
+        - use of `publish` is not allowed as the new version is always auto-published during
+        application activation
+        - if `roleArn` is not defined, exec role of the application will be used automatically
+
+        Since create API is the common interface for both initial creation and update, framework takes care of corner
+        cases such as a change in `type` (which would normally not be possible) by resetting the resource and recreating
+        it if needed.
+
+        @param definition: Only "required" (bare minimum) parameter to create an AWS SFN state-machine compute with its definition in Amazon States language.
+            Refer
+            https://docs.aws.amazon.com/step-functions/latest/dg/concepts-states.html
+
+        As an input to state-machine executions, framework will provide `inputs` and `output` maps within the input JSON that can be used via JSONPath in the
+        definition. e.g `$.output.dimension_map.region`, ``
+
+        @param extra_permissions: For `Task`s relying on invocations to resources not managed by this workflow, please define permissions
+        accordingly in `extra_permissions` so that the runtime exec role will have them in its policy.
+        @param retry_count: High-level retry logic (on top of any retry strategy used within the state-machine) applied
+        by the framework against transient issues communicating with AWS SFN APIs or transient execution errors.
+        @param other_api_params: For all the other parameters from
+        https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/stepfunctions/client/create_state_machine.html
+        """
+        if not definition:
+            raise ValueError("AWS SFN state-machine must have 'definition' parameter defined!")
+
+        other_api_params.update({"definition": definition})
+
+        super().__init__("", Lang.AWS_SFN_STATE_MACHINE, ABI.NONE, extra_permissions, retry_count, **other_api_params)
+
+
+AWSStateMachine = AWSSSFNStateMachine
+StateMachine = AWSSSFNStateMachine
+
+
 class ApplicationExt(Application):
     @classmethod
     def _create_spec(cls, variants: List[DimensionVariant]) -> DimensionSpec:
@@ -537,12 +580,12 @@ class AWSApplication(ApplicationExt):
             remote_app_name, AWSConfiguration.builder().with_account_id(aws_acc_id).with_region(region).build()
         )
 
-    def authorize_downstream(self, remote_app_name, aws_acc_id: str, region: str) -> None:
+    def authorize_downstream(self, remote_app_name, aws_acc_id: str, region: str, **params: Dict[str, Any]) -> None:
         """Authorize another RheocerOS application so that it will be able to do
         'import_upstream' for this application and be able to use/connect to the artifacts
         (such as data, model, etc) seamlessly."""
         self.export_to_downstream_application(
-            remote_app_name, AWSConfiguration.builder().with_account_id(aws_acc_id).with_region(region).build()
+            remote_app_name, AWSConfiguration.builder().with_account_id(aws_acc_id).with_region(region).build(), **params
         )
 
     def glue_table(
@@ -1116,7 +1159,9 @@ class EscapeExistingJobParams(dict):
         return "{" + key + "}"
 
 
-def python_module(module_path: str, external_library_paths: Optional[List[str]] = None, **kwargs) -> str:
+def python_module(
+    module_path: str, external_library_paths: Optional[List[str]] = None, ignored_bundle_modules: Optional[List[str]] = None, **kwargs
+) -> str:
     import inspect
     import importlib
 
@@ -1131,8 +1176,13 @@ def python_module(module_path: str, external_library_paths: Optional[List[str]] 
     params = {key: repr(value) for key, value in kwargs.items()}
     code = module_src if not params else module_src.format_map(EscapeExistingJobParams(params))
 
-    if external_library_paths:
-        code = SlotCode(code, SlotCodeMetadata(SlotCodeType.EMBEDDED_SCRIPT, external_library_paths=external_library_paths))
+    if external_library_paths or ignored_bundle_modules:
+        code = SlotCode(
+            code,
+            SlotCodeMetadata(
+                SlotCodeType.EMBEDDED_SCRIPT, external_library_paths=external_library_paths, ignored_bundle_modules=ignored_bundle_modules
+            ),
+        )
 
     return code
 

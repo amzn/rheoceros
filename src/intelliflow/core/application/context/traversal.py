@@ -6,5 +6,4 @@ from abc import ABC, abstractmethod
 
 class ContextVisitor(ABC):
     @abstractmethod
-    def visit(self, node: "Node") -> None:
-        ...
+    def visit(self, node: "Node") -> None: ...
