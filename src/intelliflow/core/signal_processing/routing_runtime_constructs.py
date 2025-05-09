@@ -782,7 +782,7 @@ class RouteExecutionHook(CoreData):
         # hooks for custom checkpoints across the execution timeline
         self.checkpoints = checkpoints
 
-    def callbacks(self) -> Tuple[Slot]:
+    def callbacks(self) -> Tuple[Slot, ...]:
         callbacks = (
             self.on_exec_begin,
             self.on_exec_skipped,
@@ -882,7 +882,7 @@ class RoutePendingNodeHook(CoreData):
         self.on_expiration = on_expiration
         self.checkpoints = checkpoints
 
-    def callbacks(self) -> Tuple[Slot]:
+    def callbacks(self) -> Tuple[Slot, ...]:
         callbacks = (self.on_pending_node_created, self.on_expiration)
         if self.checkpoints:
             callbacks = callbacks + tuple([checkpoint.slot for checkpoint in self.checkpoints])
