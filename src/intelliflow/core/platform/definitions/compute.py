@@ -40,6 +40,7 @@ class ComputeFailedResponseType(str, Enum):
     STOPPED = "STOPPED"  # IntelliFlow assumes that a stopped execution is a failed one
     FORCE_STOPPED = "FORCE_STOPPED"
     APP_INTERNAL = "APP_INTERNAL"  # app session/workload logic failed internally
+    METADATA_ACTION = "METADATA_ACTION"  # one of metadata actions failed normally successful execution
     COMPUTE_INTERNAL = "COMPUTE_INTERNAL"  # compute impl failed internally (no comm/transient issues but smthg else)
     NOT_FOUND = "NOT_FOUND"  # orchestration and compute backend state inconsistency
     UNKNOWN = "UNKNOWN"
@@ -279,6 +280,9 @@ class BasicBatchDataInputMap(CoreData):
                     "path_format": signal.resource_access_spec.path_format,
                     "data_format": signal.resource_access_spec.data_format.value,
                     "data_type": (signal.resource_access_spec.data_type.value if signal.resource_access_spec.data_type else None),
+                    "data_persistence": (
+                        signal.resource_access_spec.data_persistence.value if signal.resource_access_spec.data_persistence else None
+                    ),
                     "dataset_type": (signal.resource_access_spec.dataset_type.value if signal.resource_access_spec.dataset_type else None),
                     "data_compression": signal.resource_access_spec.data_compression,
                     "data_folder": signal.resource_access_spec.data_folder,
@@ -306,6 +310,7 @@ class BasicBatchDataInputMap(CoreData):
                     "serialized_signal": signal.serialize(),
                     "range_check_required": signal.range_check_required,
                     "nearest_the_tip_in_range": signal.nearest_the_tip_in_range,
+                    "is_reference": signal.is_reference,
                 }
                 for signal in self.input_signals
                 if signal.type.is_data()
@@ -338,9 +343,9 @@ class BasicBatchDataInputMap(CoreData):
         return json.dumps(self.create(), default=repr)
 
 
-def create_output_dimension_map(materialized_output: Signal) -> Dict[str, Any]:
+def create_output_dimension_map(materialized_output: Signal, raw_value: bool = False) -> Dict[str, Any]:
     return {
-        dimension.name: dimension.transform().value
+        dimension.name: (dimension.transform().value if not raw_value else dimension.transform().raw_value)
         for dimension in materialized_output.domain_spec.dimension_filter_spec.get_flattened_dimension_map().values()
     }
 
@@ -358,8 +363,9 @@ def create_pending_output_dimension_map(
 
 
 class BasicBatchDataOutput(CoreData):
-    def __init__(self, output: Signal) -> None:
+    def __init__(self, output: Signal, route: Optional["Route"] = None) -> None:
         self.output = output
+        self.route = route
 
     def create(self) -> Dict[str, Any]:
         completion_indicator_paths = self.output.get_materialized_resources()
@@ -369,6 +375,10 @@ class BasicBatchDataOutput(CoreData):
             "resource_type": self.output.resource_access_spec.source.value,
             "completion_indicator_materialized_path": completion_indicator_paths[0] if completion_indicator_paths else None,
             "data_format": self.output.resource_access_spec.data_format.value,
+            "data_type": (self.output.resource_access_spec.data_type.value if self.output.resource_access_spec.data_type else None),
+            "data_persistence": (
+                self.output.resource_access_spec.data_persistence.value if self.output.resource_access_spec.data_persistence else None
+            ),
             "data_header_exists": self.output.resource_access_spec.data_header_exists,
             "data_schema_file": self.output.resource_access_spec.data_schema_file,
             "data_schema_type": (
@@ -379,6 +389,7 @@ class BasicBatchDataOutput(CoreData):
             "if_signal_type": self.output.type.value,
             "serialized_signal": self.output.serialize(),
             "dimension_map": create_output_dimension_map(self.output),
+            "has_metadata_actions": (self.route.has_execution_metadata_actions() if self.route else False),
         }
 
     def dumps(self) -> str:
@@ -430,3 +441,32 @@ class ComputeRuntimeTemplateRenderer:
 
     def render(self, template: str) -> str:
         return self.PARAMETRIZATION_PATTERN.sub(self._replacement, template)
+
+
+def validate_compute_runtime_identifiers(
+    inputs: List[Signal],
+    output: Optional[Signal] = None,
+    extra_reserved_keywords: Optional[List[str]] = None,
+) -> None:
+    from keyword import iskeyword
+
+    for input in inputs:
+        if input.alias:
+            if not input.alias.isidentifier():
+                raise ValueError(f"Input alias {input.alias!r} is not a valid Python identifier!")
+
+            if iskeyword(input.alias):
+                raise ValueError(f"Input alias {input.alias!r} is a reserved Python identifier/keyword!")
+
+            if extra_reserved_keywords and (input.alias in extra_reserved_keywords):
+                raise ValueError(f"Input alias {input.alias!r} cannot be any of the reserved keywords: {extra_reserved_keywords}!")
+
+    if output and output.alias:
+        if not output.alias.isidentifier():
+            raise ValueError(f"Node ID {output.alias!r} is not a valid Python identifier!")
+
+        if iskeyword(output.alias):
+            raise ValueError(f"Node ID {output.alias!r} is a reserved Python identifier/keyword!")
+
+        if extra_reserved_keywords and (output.alias in extra_reserved_keywords):
+            raise ValueError(f"Node ID {output.alias!r} cannot be any of the reserved keywords: {extra_reserved_keywords}!")

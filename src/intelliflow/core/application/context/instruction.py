@@ -2,11 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Provide building blocks for future disassembly feature for applications.
-    Instructions don't have any direct impact on how Applications are activated
-    or how they are run in runtime. A pure dev-time concept.
+ Instructions don't have any direct impact on how Applications are activated
+ or how they are run in runtime. A pure dev-time concept.
 
-   - Instruction
-   - InstructionChain
+- Instruction
+- InstructionChain
 """
 
 from typing import Any, Dict, List, NewType, Optional, Union

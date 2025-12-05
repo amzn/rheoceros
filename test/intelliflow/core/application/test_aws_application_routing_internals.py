@@ -266,8 +266,8 @@ class TestAWSApplicationRoutingInternals(AWSTestBase):
         # trigger the first half of partitions by injecting the second input for them
         for i in range(int(experiment_partition_count / 2)):
             app.process(dummy_input_signal2[datetime(2022, 1, 1) + timedelta(days=i)])
-        # self.resume_event_propagation()
 
+        time.sleep(orchestration_cycle_time_in_secs)
         # 1/2 -> pending, 1/2 -> active compute
         route_record = app.get_active_route(node1)
         assert len(route_record.route.pending_nodes) == experiment_partition_count / 2
@@ -290,6 +290,7 @@ class TestAWSApplicationRoutingInternals(AWSTestBase):
         for i in range(int(experiment_partition_count / 2)):
             app.process(dummy_input_signal2[datetime(2022, 1, 1) + timedelta(int(experiment_partition_count / 2)) + timedelta(days=i)])
 
+        time.sleep(orchestration_cycle_time_in_secs)
         # at this point we should have active computes on all partitions
         route_record = app.get_active_route(node1)
         assert not route_record.route.pending_nodes
@@ -447,5 +448,66 @@ class TestAWSApplicationRoutingInternals(AWSTestBase):
             )
             == 0
         )
+
+        self.patch_aws_stop()
+
+    def test_application_route_internals_during_activation(self):
+        self.patch_aws_start()
+
+        app_name = "test-route-act"
+        app = AWSApplication(app_name, self.region)
+
+        dummy_input_signal1 = app.add_timer("timer1", "rate(1 day)")
+
+        dummy_input_signal2 = app.add_timer("timer2", "rate(1 day)")
+
+        node1 = app.create_data("test_node1", inputs=[dummy_input_signal1, dummy_input_signal2], compute_targets=[NOOPCompute])
+
+        node2 = app.create_data("test_node2", inputs=[dummy_input_signal1, node1], compute_targets=[NOOPCompute])
+
+        app.activate()
+
+        # inject input1 to create a pending node
+        app.process(dummy_input_signal1["2023-08-22"], target_route_id=node1)
+
+        route_record: RoutingTable.RouteRecord = app.get_active_route(node1)
+        assert len(route_record.route.pending_nodes) == 1
+
+        app.process(dummy_input_signal1["2023-08-23"], target_route_id=node2)
+        app.process(node1["2023-08-23"], is_blocked=True)
+        route_record: RoutingTable.RouteRecord = app.get_active_route(node2)
+        assert len(route_record.route.pending_nodes) == 1
+
+        # now change the execution related parameters of the nodes and test the pending execution state as part of
+        # changeset management during activation
+        app.attach()
+
+        # this should unblock this node
+        node1 = app.patch_data(node1, inputs=[dummy_input_signal1])
+
+        # this would normally unblock but node1 is in "blocked" state so still must stay as pending
+        app.patch_data(node2, inputs=[dummy_input_signal1, node1], output_dimension_spec={}, output_dim_links=[])
+
+        # this must keep the pending executions state and because of the changes in inputs:
+        # - unblock the execution on the first node because its second input that was blocking the execution is removed
+        # - retain the pending execution on the second node because its remaining input is still marked as "blocked".
+        app.activate()
+
+        # let node1 execute. pending node -> active compute transition is not allowed during activation and in this test
+        # orchestration cycle is not on so this will provide the needed "next cycle" here
+        app.update_active_routes_status()
+
+        route_record: RoutingTable.RouteRecord = app.get_active_route(node1)
+        assert len(route_record.route.pending_nodes) == 0
+
+        route_record = app.get_active_route(node2)
+        assert len(route_record.route.pending_nodes) == 1
+
+        # unblock the execution
+        app.process(node1["2023-08-23"], target_route_id=node2, is_blocked=False)
+
+        # it must have executed
+        route_record = app.get_active_route(node2)
+        assert len(route_record.route.pending_nodes) == 0
 
         self.patch_aws_stop()

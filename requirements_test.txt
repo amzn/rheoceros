@@ -8,18 +8,18 @@
 # against cloud. This is the case till a much smarter deployment (activation) time venv / dependency management is
 # supported in the framework.
 
-boto3~=1.26.57
-botocore~=1.29.58
+boto3~=1.41.1
+botocore~=1.41.1
 setuptools>=70.0.0
-python-dateutil~=2.8.2
-dill~=0.3.4
-packaging~=21.3
-requests~=2.25.1
-responses~=0.10.6
-shortuuid~=1.0.11
-overrides~=7.4.0
-validators~=0.20.0
-pytest~=7.0.1
-mock~=4.0.3
-moto~=3.1.1
+python-dateutil~=2.9.0
+dill~=0.4.0
+packaging~=25.0
+requests~=2.32.4
+responses~=0.23.3
+shortuuid~=1.0.13
+overrides~=3.1.0
+validators~=0.11.0
+pytest~=6.2.5
+mock~=3.0.5
+moto~=3.1.19
 pytest-xdist~=2.5.0

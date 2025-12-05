@@ -9,7 +9,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from intelliflow.api import DataFormat, S3Dataset
-from intelliflow.api_ext import HADOOP_SUCCESS_FILE, AWSApplication
+from intelliflow.api_ext import EMR, HADOOP_SUCCESS_FILE, AWSApplication, Glue
 from intelliflow.core.application.application import Application
 from intelliflow.core.application.context.node.internal.nodes import InternalDataNode
 from intelliflow.core.application.core_application import ApplicationState
@@ -200,7 +200,7 @@ class TestAWSApplication(AWSTestBase):
             inputs=[external_data],
             input_dim_links=[],
             output_dimension_spec={},
-            output_dim_links={},
+            output_dim_links=[],
             compute_targets=[InternalDataNode.InlinedComputeDescriptor(lambda input_map, output, params: print("oh hello"))],
         )
 
@@ -354,7 +354,7 @@ class TestAWSApplication(AWSTestBase):
             inputs=[external_data],
             input_dim_links=[],
             output_dimension_spec={},
-            output_dim_links={},
+            output_dim_links=[],
             compute_targets=[InternalDataNode.InlinedComputeDescriptor(example_inline_compute_code)],
         )
         app.save_dev_state()
@@ -443,7 +443,7 @@ class TestAWSApplication(AWSTestBase):
             inputs=[external_data],
             input_dim_links=[],
             output_dimension_spec={},
-            output_dim_links={},
+            output_dim_links=[],
             compute_targets=[NOOPCompute],
         )
         app.activate()
@@ -578,6 +578,70 @@ class TestAWSApplication(AWSTestBase):
             },
             HADOOP_SUCCESS_FILE,
         )
+
+        self.patch_aws_stop()
+
+    def test_application_input_indentifier_validation(self):
+        self.patch_aws_start()
+
+        app = AWSApplication(
+            "test_in_valid",
+            HostPlatform(AWSConfiguration.builder().with_default_credentials().with_region(self.region).build()),
+        )
+
+        bad_identifier: str = " Qu'est-ce que c'est?"
+        ext_input_with_bad_default_alias = app.marshal_external_data(
+            S3Dataset("111222333444", "bucke", "prefix", "{}", dataset_format=DataFormat.CSV),
+            bad_identifier,
+            {"region": {"type": Type.STRING}},
+            {
+                "NA": {},
+            },
+        )
+
+        # should be ok as chosen compute here target does not impose any restrictions on input/output identifiers
+        app.create_data(id="data_node", inputs=[ext_input_with_bad_default_alias], compute_targets=[NOOPCompute])
+
+        # but Batch Compute drivers should reject it due to potential runtime error post-activation
+        with pytest.raises(ValueError):
+            app.create_data(
+                id="data_node_glue", inputs=[ext_input_with_bad_default_alias], compute_targets=[Glue(code="does not matter now")]
+            )
+
+        # show that an alias as a proper Python identifier would be fine
+        glue_node = app.create_data(
+            id="data_node_glue",
+            inputs={"valid_input_alias": ext_input_with_bad_default_alias},
+            compute_targets=[Glue(code="does not matter now")],
+        )
+
+        with pytest.raises(ValueError):
+            app.create_data(
+                id="data_node_EMR", inputs=[ext_input_with_bad_default_alias], compute_targets=[EMR(code="does not matter now")]
+            )
+
+        emr_node = app.create_data(
+            id="data_node_EMR",
+            inputs={"valid_input_alias": ext_input_with_bad_default_alias},
+            compute_targets=[EMR(code="does not matter now")],
+        )
+
+        # show that a reserved keyword will be rejected
+        emr_node2 = app.create_data(
+            id="spark", inputs={"valid_input_alias": ext_input_with_bad_default_alias}, compute_targets=[EMR(code="does not matter now")]
+        )
+
+        with pytest.raises(ValueError):
+            app.create_data(
+                id="reject", inputs=[emr_node2], compute_targets=[EMR(code="does not matter now")]  # defualt alias will be "spark"
+            )
+
+        with pytest.raises(ValueError):
+            app.create_data(
+                id="reject",
+                inputs={"glue": emr_node2},  # glue is a reserved keyword for Glue driver
+                compute_targets=[Glue(code="does not matter now")],
+            )
 
         self.patch_aws_stop()
 

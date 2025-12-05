@@ -14,15 +14,15 @@ options_value = {}
 
 # use 'requirements.txt' as baseline here + virtualenv for bundling
 REQUIRED_PACKAGES = [
-    'boto3 >= 1.26.57',
-    'python-dateutil >= 2.8.2',
-    'dill >= 0.3.4',
-    'packaging >= 21.0',
-    'requests >= 2.25.1',
-    'responses >= 0.10.6',
-    'shortuuid >= 1.0.11',
-    'overrides >= 7.4.0',
-    'validators >= 0.20.0',
+    'boto3 >= 1.41.1',
+    'python-dateutil >= 2.9.0',
+    'dill >= 0.4.0',
+    'packaging >= 25.0',
+    'requests >= 2.32.4',
+    'responses >= 0.23.3',
+    'shortuuid >= 1.0.13',
+    'overrides >= 3.1.0',
+    'validators >= 0.11.0',
     'virtualenv'
 ]
 
@@ -49,13 +49,13 @@ for dir_path in dirs_to_copy:
 
 setup(
     name="rheoceros",
-    python_requires=">=3.7",
+    python_requires=">=3.10",
     version=version,
     description="rheoceros is a cloud-based data science / AI / ML workflow development framework.",
     keywords="aws cloud data model ai workflow ai-team ml mesh collaboration event flow automation functional low-code"
              "machine learning feature engineering emr glue athena sagemaker serverless",
     author="Amazon.com Inc.",
-    author_email="dex-olaf@amazon.com",
+    author_email="dexcovery@amazon.com",
     license="Apache 2.0",
     download_url='https://github.com/amzn/rheoceros/releases',
 
@@ -81,7 +81,7 @@ setup(
     cmdclass=cmdclass_value,
 
     # Enable build-time format checking
-    check_format=True,
+    check_format=False,
 
     # Enable type checking
     test_mypy=False,

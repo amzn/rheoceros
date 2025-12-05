@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import List
+from typing import List, Optional
 
 from intelliflow.core.permission import Permission
 from intelliflow.core.platform.compute_targets.slack import Slack
@@ -37,6 +37,7 @@ from .core.platform.definitions.aws.common import IF_DEV_ROLE_FORMAT
 from .core.platform.development import AWSConfiguration, HostPlatform, LocalConfiguration
 from .core.platform.drivers.extension.aws.basic.ddb_table import AWSDDBTableExtension
 from .core.platform.endpoint import DevEndpoint
+from .core.signal_processing import Signal
 from .core.signal_processing.definitions.dimension_defs import NameType as DimensionNameType
 from .core.signal_processing.definitions.dimension_defs import Type as DimensionType
 from .core.signal_processing.definitions.metric_alarm_defs import (
@@ -88,9 +89,39 @@ IExecutionSuccessHook = RoutingHookInterface.Execution.IExecutionSuccessHook
 IExecutionFailureHook = RoutingHookInterface.Execution.IExecutionFailureHook
 IExecutionCheckpointHook = RoutingHookInterface.Execution.IExecutionCheckpointHook
 
+IExecutionMetadataCondition = RoutingHookInterface.Execution.IExecutionMetadataCondition
+IExecutionMetadataHook = RoutingHookInterface.Execution.IExecutionMetadataHook
+
 IPendingNodeCreationHook = RoutingHookInterface.PendingNode.IPendingNodeCreationHook
 IPendingNodeExpirationHook = RoutingHookInterface.PendingNode.IPendingNodeExpirationHook
 IPendingCheckpointHook = RoutingHookInterface.PendingNode.IPendingCheckpointHook
+
+IRetentionCondition = RoutingHookInterface.Retention.IRetentionCondition
+IRetentionRIPHook = RoutingHookInterface.Retention.IRetentionRIPHook
+IRetentionRefreshHook = RoutingHookInterface.Retention.IRetentionRefreshHook
+
+
+class FailedMetadataAction(IExecutionMetadataHook):
+    def __init__(self, message: Optional[str] = None):
+        self._message = message
+
+    def __call__(
+        self,
+        routing_table: "RoutingTable",
+        route_record: "RoutingTable.RouteRecord",
+        execution_context_id: str,
+        materialized_inputs: List[Signal],
+        materialized_output: Signal,
+        current_timestamp_in_utc: int,
+        **params,
+    ) -> None:
+        from .core.platform.definitions.compute import ComputeRuntimeTemplateRenderer
+
+        renderer = ComputeRuntimeTemplateRenderer(materialized_inputs, materialized_output, params)
+        message: str = self._message if self._message else ""
+        if message:
+            message = renderer.render(message)
+        raise RuntimeError(f"{self.__class__.__name__!r}: {message!r}")
 
 
 class BatchCompute(InternalDataNode.BatchComputeDescriptor):
@@ -103,7 +134,7 @@ class BatchCompute(InternalDataNode.BatchComputeDescriptor):
         abi: ABI = ABI.GLUE_EMBEDDED,
         extra_permissions: List[Permission] = None,
         retry_count: int = 0,
-        **kwargs
+        **kwargs,
     ) -> None:
         super().__init__(code, lang, abi, extra_permissions, retry_count, **kwargs)
 

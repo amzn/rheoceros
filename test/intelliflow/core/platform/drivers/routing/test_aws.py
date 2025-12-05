@@ -32,15 +32,18 @@ class TestAWSRoutingTableDriver(AWSTestBase, DriverTestUtils):
         self.params[CommonParams.ACCOUNT_ID] = self.account_id
 
     def get_driver_and_platform(self):
+        mock_platform = HostPlatform(
+            AWSConfiguration.builder()
+            .with_default_credentials(as_admin=True)
+            .with_region("us-east-1")
+            .with_routing_table(AWSDDBRoutingTable)
+            .build()
+        )
+        # Prevent intermittent test failures due to platform state loading during context_id assignment
+        mock_platform.should_load_constructs = lambda: False
         return (
             AWSDDBRoutingTable(self.params),
-            HostPlatform(
-                AWSConfiguration.builder()
-                .with_default_credentials(as_admin=True)
-                .with_region("us-east-1")
-                .with_routing_table(AWSDDBRoutingTable)
-                .build()
-            ),
+            mock_platform,
         )
 
     def setup_test_route_record(self, mock_routing_table, mock_route=None, deactivation_timestamp=None, compute_resp=None):

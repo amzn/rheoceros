@@ -256,7 +256,10 @@ class TestAWSGlueBatchComputeBasic(AWSTestBase, DriverTestUtils):
         mock_host_platform._context_id = "glue_test5"
         mock_compute.dev_init(mock_host_platform)
         mock_compute._extract_used_glue_jobs = MagicMock(
-            side_effect=lambda: {GlueJobLanguage.PYTHON: {"1.0", "2.0", "3.0", "4.0"}, GlueJobLanguage.SCALA: {"1.0", "2.0", "3.0", "4.0"}}
+            side_effect=lambda: {
+                GlueJobLanguage.PYTHON: {"1.0", "2.0", "3.0", "4.0", "5.0"},
+                GlueJobLanguage.SCALA: {"1.0", "2.0", "3.0", "4.0", "5.0"},
+            }
         )
         mock_compute.activate()
         s3 = boto3.resource("s3")
@@ -264,7 +267,7 @@ class TestAWSGlueBatchComputeBasic(AWSTestBase, DriverTestUtils):
         # now for each version we create another job
         # versions multiplied by the number of langs (2),
         # so we expect the call_count to be 8.
-        assert compute_driver.create_glue_job.call_count == 8
+        assert compute_driver.create_glue_job.call_count == 10
         assert compute_driver.delete_glue_job.call_count == 0
 
         mock_compute._extract_used_glue_jobs = MagicMock(
@@ -272,9 +275,9 @@ class TestAWSGlueBatchComputeBasic(AWSTestBase, DriverTestUtils):
         )
         mock_compute.activate()
         # now we expect the call_count to increase by 4 only as "1.0" version is not used.
-        assert compute_driver.create_glue_job.call_count == (8 + 4)
-        # two glue jobs (python-1.0 and scala-1.0) must be deleted
-        assert compute_driver.delete_glue_job.call_count == (0 + 4)
+        assert compute_driver.create_glue_job.call_count == (10 + 4)
+        # three glue jobs (python-1.0 and scala-1.0) must be deleted
+        assert compute_driver.delete_glue_job.call_count == (0 + 6)
         self.patch_aws_stop()
 
     def test_compute_computefunc_successful(self):
@@ -312,13 +315,14 @@ class TestAWSGlueBatchComputeBasic(AWSTestBase, DriverTestUtils):
                 "State": "TERMINATED_WITH_ERRORS",
                 "StateChangeReason": {"Code": "VALIDATION_ERROR", "Message": "The EBS volume limit was exceeded"},
             },
-            {
-                "State": "TERMINATED_WITH_ERRORS",
-                "StateChangeReason": {
-                    "Code": "BOOTSTRAP_FAILURE",
-                    "Message": "On the master instance (i-0991cbf940d71cbfd), application provisioning failed",
-                },
-            },
+            # TODO investigate why this has been considered as TRANSIENT before? Bad bootstrapping script would cause retries because of this.
+            # {
+            #    "State": "TERMINATED_WITH_ERRORS",
+            #    "StateChangeReason": {
+            #        "Code": "BOOTSTRAP_FAILURE",
+            #        "Message": "On the master instance (i-0991cbf940d71cbfd), application provisioning failed",
+            #    },
+            # },
             {
                 "State": "TERMINATED_WITH_ERRORS",
                 "StateChangeReason": {

@@ -130,7 +130,7 @@ class MarshalerNode(Node, SignalProvider):
                                   self._output_signal,
                                   self._output_dim_matrix,
                                   self._slots(),
-                                  self._auto_backfilling_enabled))
+                                  self._output_retention))
         """
         pass
 

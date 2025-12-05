@@ -36,6 +36,7 @@ class TestSignalLinkNode:
     signal_link_node_2 = SignalLinkNode([TestSignal.signal_internal_1, TestSignal.signal_s3_1.clone("test_signal_from_S3")])
     signal_link_node_2_without_link = copy.deepcopy(signal_link_node_2)
     signal_link_node_2_with_non_trivial_link = copy.deepcopy(signal_link_node_2)
+    signal_link_node_2_with_non_trivial_link_with_diff_constant = copy.deepcopy(signal_link_node_2)
     signal_link_node_2.add_link(
         SignalDimensionLink(
             signal_dimension_tuple(TestSignal.signal_internal_1, "dim_1_1"),
@@ -47,6 +48,14 @@ class TestSignalLinkNode:
         SignalDimensionLink(
             signal_dimension_tuple(TestSignal.signal_internal_1, "dim_1_1"),
             lambda dim_1_1: dim_1_1 + 1,
+            signal_dimension_tuple(TestSignal.signal_s3_1, "dim_1_1"),
+        )
+    )
+
+    signal_link_node_2_with_non_trivial_link_with_diff_constant.add_link(
+        SignalDimensionLink(
+            signal_dimension_tuple(TestSignal.signal_internal_1, "dim_1_1"),
+            lambda dim_1_1: dim_1_1 + 2,  # 1 -> 2 to see if link integrity check will detect this
             signal_dimension_tuple(TestSignal.signal_s3_1, "dim_1_1"),
         )
     )
@@ -162,6 +171,10 @@ class TestSignalLinkNode:
 
         # check the effect of dimension link matrix
         assert not self.signal_link_node_2.check_integrity(self.signal_link_node_2_without_link)
+
+        assert not self.signal_link_node_2_with_non_trivial_link.check_integrity(
+            self.signal_link_node_2_with_non_trivial_link_with_diff_constant
+        )
 
     def test_signal_link_node_add_link(self):
         signal_link_node_2_cloned = copy.deepcopy(self.signal_link_node_2)

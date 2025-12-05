@@ -1,4 +1,4 @@
-from typing import overload, List, Union, Any
+from typing import Any, List, Union, overload
 
 from intelliflow.core.signal_processing.analysis import INTEGRITY_CHECKER_MAP
 from intelliflow.core.signal_processing.signal import Signal

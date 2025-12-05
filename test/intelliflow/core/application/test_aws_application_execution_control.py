@@ -79,7 +79,7 @@ class TestAWSApplicationExecutionControl(AWSTestBase):
             compute_targets=[
                 Glue(
                     code="output=DEXML_DUCSI.limit(100)",
-                    GlueVersion="4.0",
+                    GlueVersion="5.0",
                 )
             ],
             output_dimension_spec={
@@ -434,12 +434,17 @@ class TestAWSApplicationExecutionControl(AWSTestBase):
         app.platform.batch_compute.get_session_state = MagicMock(side_effect=get_session_state)
 
         def next_cycle():
-            time.sleep(15)  # delay to let poll happen first
+            time.sleep(18)  # delay to let poll happen first
             # app.process(self._next_processor_cycle_event(app))
             app.platform.routing_table.check_active_routes()
 
         processor_thread = threading.Thread(target=next_cycle, args=())
         processor_thread.start()
+
+        # check if poll can detect active record and return immediately if wanted (without final path)
+        materialized_path, records = app.poll(repeat_ducsi[1]["2020-12-25"], wait=False)
+        assert materialized_path is None
+        assert records
 
         materialized_path, _ = app.poll(repeat_ducsi[1]["2020-12-25"])
         assert materialized_path.endswith("internal_data/REPEAT_DUCSI/1/2020-12-25")
@@ -748,7 +753,7 @@ class TestAWSApplicationExecutionControl(AWSTestBase):
         app.platform.batch_compute.get_session_state = MagicMock(side_effect=get_session_state)
 
         output_path = app.execute(target[1]["2020-12-28"])
-        # s3://if-andes_downstream-123456789012-us-east-1/internal_data/REPEAT_DUCSI/1/2020-12-28
+        # s3://IF-andes_downstream-123456789012-us-east-1/internal_data/REPEAT_DUCSI/1/2020-12-28
         assert output_path.endswith("internal_data/REPEAT_DUCSI/1/2020-12-28")
 
         self.patch_aws_stop()
@@ -792,7 +797,7 @@ class TestAWSApplicationExecutionControl(AWSTestBase):
         app.platform.batch_compute.get_session_state = MagicMock(side_effect=get_session_state)
 
         output_path = app.execute(target2, [ducsi_data[1]["2020-06-21"], repeat_ducsi[1]["2020-06-21"]])
-        # s3://if-andes_downstream-123456789012-us-east-1/internal_data/REPEAT_DUCSI2/1/2020-06-21 00:00:00
+        # s3://IF-andes_downstream-123456789012-us-east-1/internal_data/REPEAT_DUCSI2/1/2020-06-21 00:00:00
         assert output_path.endswith("internal_data/REPEAT_DUCSI2/1/2020-06-21 00:00:00")
 
         # BAD INPUTS
@@ -897,7 +902,7 @@ class TestAWSApplicationExecutionControl(AWSTestBase):
         self.patch_aws_stop()
 
     def test_application_execute_with_complex_input_node(self):
-        from datetime import timedelta, datetime
+        from datetime import datetime, timedelta
 
         self.patch_aws_start(glue_catalog_has_all_tables=True)
 

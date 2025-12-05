@@ -1402,12 +1402,10 @@ class TestDimensionFilter:
     @pytest.mark.parametrize(
         "raw_filter",
         [
-            (
-                {
-                    # "-03" interpreted as timezone, then DateVariant yields UNMATCH
-                    "2020-05-06 01-03": {}
-                }
-            )
+            {
+                # "-03" interpreted as timezone, then DateVariant yields UNMATCH
+                "2020-05-06 01-03": {}
+            }
         ],
     )
     def test_dimension_filter_rejected_datevariant_auto_resolved_into_string(self, raw_filter):
@@ -1418,11 +1416,9 @@ class TestDimensionFilter:
     @pytest.mark.parametrize(
         "raw_filter",
         [
-            (
-                {  # tentatively resolved into both StringVariant and DateVariant. If type is not specified, StringVariant wins.
-                    "Foo2020-05-06": {}
-                }
-            )
+            {  # tentatively resolved into both StringVariant and DateVariant. If type is not specified, StringVariant wins.
+                "Foo2020-05-06": {}
+            }
         ],
     )
     def test_dimension_filter_tentative_auto_resolved_into_string(self, raw_filter):

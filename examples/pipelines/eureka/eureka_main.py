@@ -133,7 +133,6 @@ training_features_1 = app.create_data('order_completed_count_amt', # data_id
                                           GlueVersion="1.0"
                                       )
                                  ],
-                                 auto_backfilling_enabled=False
                                  )
 
 app.activate()

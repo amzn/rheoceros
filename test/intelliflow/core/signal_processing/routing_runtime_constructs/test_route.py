@@ -25,9 +25,9 @@ def _create_hook(code: str = "pass") -> Slot:
 class TestRoute:
     @classmethod
     def _route_1_basic(cls):
-        from test.intelliflow.core.signal_processing.test_slot import TestSlot
         from test.intelliflow.core.signal_processing.signal.test_signal import TestSignal
         from test.intelliflow.core.signal_processing.signal.test_signal_link_node import TestSignalLinkNode
+        from test.intelliflow.core.signal_processing.test_slot import TestSlot
 
         signal_link_node = copy.deepcopy(TestSignalLinkNode.signal_link_node_1)
 
@@ -60,9 +60,9 @@ class TestRoute:
 
     @classmethod
     def _route_2_two_inputs_linked(cls):
-        from test.intelliflow.core.signal_processing.test_slot import TestSlot
         from test.intelliflow.core.signal_processing.signal.test_signal import TestSignal
         from test.intelliflow.core.signal_processing.signal.test_signal_link_node import TestSignalLinkNode
+        from test.intelliflow.core.signal_processing.test_slot import TestSlot
 
         signal_link_node = copy.deepcopy(TestSignalLinkNode.signal_link_node_2)
 
@@ -92,9 +92,9 @@ class TestRoute:
 
     @classmethod
     def _route_3_three_inputs_unlinked(cls):
-        from test.intelliflow.core.signal_processing.test_slot import TestSlot
         from test.intelliflow.core.signal_processing.signal.test_signal import TestSignal
         from test.intelliflow.core.signal_processing.signal.test_signal_link_node import TestSignalLinkNode
+        from test.intelliflow.core.signal_processing.test_slot import TestSlot
 
         signal_link_node = copy.deepcopy(TestSignalLinkNode.signal_link_node_3_complex)
         # create sample expected output
@@ -141,9 +141,9 @@ class TestRoute:
 
     @classmethod
     def _route_3_three_inputs_linked(cls):
-        from test.intelliflow.core.signal_processing.test_slot import TestSlot
         from test.intelliflow.core.signal_processing.signal.test_signal import TestSignal
         from test.intelliflow.core.signal_processing.signal.test_signal_link_node import TestSignalLinkNode
+        from test.intelliflow.core.signal_processing.test_slot import TestSlot
 
         signal_link_node = copy.deepcopy(TestSignalLinkNode.signal_link_node_3_complex)
 
@@ -367,10 +367,34 @@ class TestRoute:
         assert route.check_integrity(new_route)
 
     @pytest.mark.parametrize(
-        "execution_hook_1, pending_node_ttl_1, pending_hook_1, execution_hook_2, pending_node_ttl_2, pending_hook_2, result",
+        "output_retention_1, execution_hook_1, pending_node_ttl_1, pending_hook_1, output_retention_2, execution_hook_2, pending_node_ttl_2, pending_hook_2, result",
         [
-            (None, 30 * 24 * 60 * 60, None, None, 24 * 60 * 60, None, False),
+            (None, None, 30 * 24 * 60 * 60, None, None, None, 24 * 60 * 60, None, False),
+            (None, None, 24 * 60 * 60, None, None, None, 24 * 60 * 60, None, True),
             (
+                RouteRetention(refresh_period_in_secs=30),
+                None,
+                24 * 60 * 60,
+                None,
+                RouteRetention(refresh_period_in_secs=None),
+                None,
+                24 * 60 * 60,
+                None,
+                False,
+            ),
+            (
+                RouteRetention(refresh_period_in_secs=30),
+                None,
+                24 * 60 * 60,
+                None,
+                RouteRetention(refresh_period_in_secs=30),
+                None,
+                24 * 60 * 60,
+                None,
+                True,
+            ),
+            (
+                None,
                 RouteExecutionHook(
                     on_exec_begin=_create_hook(),
                     on_exec_skipped=_create_hook(),
@@ -386,6 +410,7 @@ class TestRoute:
                     on_expiration=_create_hook(),
                     checkpoints=[RouteCheckpoint(checkpoint_in_secs=1, slot=_create_hook()), RouteCheckpoint(2, _create_hook())],
                 ),
+                None,
                 RouteExecutionHook(
                     on_exec_begin=_create_hook(),
                     on_exec_skipped=_create_hook(),
@@ -405,26 +430,32 @@ class TestRoute:
                 True,
             ),
             (
+                None,
                 RouteExecutionHook(on_exec_begin=_create_hook()),
                 30 * 24 * 60 * 60,
                 RoutePendingNodeHook(),
+                None,
                 RouteExecutionHook(on_exec_begin=_create_hook()),
                 30 * 24 * 60 * 60,
                 RoutePendingNodeHook(),
                 True,
             ),
             (
+                None,
                 RouteExecutionHook(on_exec_begin=_create_hook("print('diff')")),
                 30 * 24 * 60 * 60,
                 RoutePendingNodeHook(),
+                None,
                 RouteExecutionHook(on_exec_begin=_create_hook()),
                 30 * 24 * 60 * 60,
                 RoutePendingNodeHook(),
                 False,
             ),
-            (None, None, None, None, None, None, True),
+            (None, None, None, None, None, None, None, None, True),
             (
+                None,
                 RouteExecutionHook(on_exec_begin=None, on_exec_skipped=None),
+                None,
                 None,
                 None,
                 RouteExecutionHook(on_exec_begin=None, on_exec_skipped=_create_hook()),
@@ -433,7 +464,9 @@ class TestRoute:
                 False,
             ),
             (
+                None,
                 RouteExecutionHook(on_exec_begin=None, on_exec_skipped=_create_hook()),
+                None,
                 None,
                 None,
                 RouteExecutionHook(on_exec_begin=None, on_exec_skipped=None),
@@ -442,6 +475,7 @@ class TestRoute:
                 False,
             ),
             (
+                None,
                 RouteExecutionHook(
                     on_exec_begin=None,
                     on_exec_skipped=None,
@@ -453,6 +487,7 @@ class TestRoute:
                 ),
                 None,
                 RoutePendingNodeHook(),
+                None,
                 RouteExecutionHook(
                     on_exec_begin=None,
                     on_exec_skipped=None,
@@ -468,11 +503,13 @@ class TestRoute:
                 False,
             ),
             (
+                None,
                 RouteExecutionHook(),
                 None,
                 RoutePendingNodeHook(
                     on_pending_node_created=_create_hook(), on_expiration=None, checkpoints=[RouteCheckpoint(2, _create_hook())]
                 ),
+                None,
                 RouteExecutionHook(),
                 None,
                 RoutePendingNodeHook(
@@ -486,7 +523,9 @@ class TestRoute:
             (
                 None,
                 None,
+                None,
                 RoutePendingNodeHook(on_pending_node_created=None, on_expiration=None, checkpoints=[RouteCheckpoint(1, _create_hook())]),
+                None,
                 None,
                 None,
                 RoutePendingNodeHook(
@@ -500,7 +539,16 @@ class TestRoute:
         ],
     )
     def test_route_check_auxiliary_integrity(
-        self, execution_hook_1, pending_node_ttl_1, pending_hook_1, execution_hook_2, pending_node_ttl_2, pending_hook_2, result
+        self,
+        output_retention_1,
+        execution_hook_1,
+        pending_node_ttl_1,
+        pending_hook_1,
+        output_retention_2,
+        execution_hook_2,
+        pending_node_ttl_2,
+        pending_hook_2,
+        result,
     ):
         route = self._route_1_basic()
         assert (
@@ -510,7 +558,7 @@ class TestRoute:
                 route.output,
                 route._output_dim_matrix,
                 route.slots,
-                False,
+                output_retention_1,
                 execution_hook_1,
                 pending_node_ttl_1,
                 pending_hook_1,
@@ -521,7 +569,7 @@ class TestRoute:
                     route.output,
                     route._output_dim_matrix,
                     route.slots,
-                    False,
+                    output_retention_2,
                     execution_hook_2,
                     pending_node_ttl_2,
                     pending_hook_2,

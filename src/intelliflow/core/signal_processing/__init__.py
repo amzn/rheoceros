@@ -11,6 +11,6 @@ __all__ = [
     "DimensionFilter",
 ]
 
-from .dimension_constructs import DimensionSpec, DimensionFilter
+from .dimension_constructs import DimensionFilter, DimensionSpec
 from .signal import Signal, SignalDomainSpec
 from .slot import Slot

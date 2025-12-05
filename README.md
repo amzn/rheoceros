@@ -402,7 +402,7 @@ repeat_d_ad_orders_na_scala_complex = app.create_data(id="REPEAT_AD_ORDERS_IN_SC
                                                                     // other variables are also available (spark, inputs, inputTable, execParams)
                                                                     TrendFeatureWorker.main(args)
                                                                    """
-                                                                   , external_library_paths=["s3://<YOUR_S3_FILE_PATH>"]
+                                                                   , external_library_paths=["s3://test-dexml-blade-beta/lib/DexmlBladeGlue-super.jar"]
                                                                    ),
                                                       lang=Lang.SCALA,
                                                       GlueVersion="2.0",

@@ -167,10 +167,23 @@ INTELLIFLOW_GLUE_DEV_ENDPOINT_LIVY_APP_DIR = "/mnt/yarn/usercache/livy"
 
 # TODO move to 'runtime' module
 IS_ON_SAGEMAKER_NOTEBOOK_INSTANCE: bool = False
+IS_ON_AWS_LAMBDA: bool = False
 IS_ON_GLUE_DEV_ENDPOINT: bool = False
 
 _sagemaker_pkg_root = Path(get_sagemaker_notebook_instance_pkg_root(PYTHON_VERSION_MAJOR, PYTHON_VERSION_MINOR))
 _livy_app_root = Path(INTELLIFLOW_GLUE_DEV_ENDPOINT_LIVY_APP_DIR)
+
+# https://docs.aws.amazon.com/lambda/latest/dg/configuration-envvars.html#configuration-envvars-runtime
+if os.environ.get("AWS_LAMBDA_FUNCTION_NAME") is not None:
+    IS_ON_AWS_LAMBDA = True
+
+# LAMBDA TEST manually set to True to diagnose bootstrapping issues on AWS Lambda
+TEST_AWS_LAMBDA_DEPLOYMENT = False
+if TEST_AWS_LAMBDA_DEPLOYMENT:
+    IS_ON_AWS_LAMBDA = True
+    if importlib.util.find_spec("amzlogging") is not None:
+        IS_ON_AMZN_BRAZIL = True
+# END LAMBDA TEST
 
 try:
     if _sagemaker_pkg_root.exists():
@@ -178,7 +191,7 @@ try:
 except PermissionError as pe:
     IS_ON_SAGEMAKER_NOTEBOOK_INSTANCE = False
 
-if not IS_ON_SAGEMAKER_NOTEBOOK_INSTANCE:
+if not IS_ON_SAGEMAKER_NOTEBOOK_INSTANCE and not IS_ON_AWS_LAMBDA:
     try:
         if _livy_app_root.exists():
             IS_ON_GLUE_DEV_ENDPOINT = True
@@ -260,8 +273,39 @@ def _zipdir(path, zip_stream, include_resources, archive_prefix=None, extra_fold
     return zipped_set
 
 
+def _find_app_root_dir(path: Path) -> Path:
+    """traverse up till app root is found, return input path if not found"""
+    search_dir = path
+    while True:
+        # refer "packaging.python.org" for more details on "pyproject.toml"
+        # treat it as 1st class indicator for app Python project root, in other cases be paranoid.
+        # 'pyproject.toml' also gives us a better chance to cover projects that don't use setuptools.
+        if (
+            (search_dir / "pyproject.toml").exists()
+            or ((search_dir / "requirements.txt").exists() and ((search_dir / "setup.py").exists() or (search_dir / "setup.cfg").exists()))
+            or (
+                IS_ON_AMZN_BRAZIL
+                and (search_dir / "Config").exists()
+                and ((search_dir / "setup.py").exists() or (search_dir / "setup.cfg").exists())
+            )
+        ):
+            logger.critical(f"{DeploymentConfiguration.APP_ROOT} is automatically detected as '{search_dir}'.")
+            return search_dir
+        search_dir = search_dir.parent
+        if search_dir == Path(search_dir.root):
+            break
+    return path
+
+
 def _get_app_root_dir() -> Path:
-    if IS_ON_SAGEMAKER_NOTEBOOK_INSTANCE:
+    if IS_ON_AWS_LAMBDA:
+        lambda_task_root = os.environ.get("LAMBDA_TASK_ROOT", None)
+        if lambda_task_root:
+            return Path(lambda_task_root)
+        else:
+            # local testing support (to diagnose bootstrapping / deployment issues on dev-envs)
+            return _find_app_root_dir(Path.cwd())
+    elif IS_ON_SAGEMAKER_NOTEBOOK_INSTANCE:
         # belongs to wherever the notebook file is located at.
         # currently not used in an activation/deployment for SageMaker case but
         # implementing this for the sake of consistency and in case of future support
@@ -280,26 +324,15 @@ def _get_app_root_dir() -> Path:
             return app_root_dir
         app_root_dir = Path.cwd()
         # traverse up till app root is found
-        search_dir = app_root_dir
-        while True:
-            # refer "packaging.python.org" for more details on "pyproject.toml"
-            # treat it as 1st class indicator for app Python project root, in other cases be paranoid.
-            # 'pyproject.toml' also gives us a better chance to cover projects that don't use setuptools.
-            if (search_dir / "pyproject.toml").exists() or (
-                (search_dir / "requirements.txt").exists() and ((search_dir / "setup.py").exists() or (search_dir / "setup.cfg").exists())
-            ):
-                logger.critical(f"{DeploymentConfiguration.APP_ROOT} is automatically detected as '{search_dir}'.")
-                return search_dir
-            search_dir = search_dir.parent
-            if search_dir == Path(search_dir.root):
-                break
-        logger.warning(
-            f"{DeploymentConfiguration.APP_ROOT} could not be detected in the folder hierarchy! "
-            f"Will use process root {app_root_dir} instead. If you receive 'module not found' errors "
-            f"at runtime, please consider setting deployment parameters via 'set_deployment_conf' method or"
-            f"set {DeploymentConfiguration.APP_ROOT} as an environment variable explicitly."
-        )
-        return app_root_dir
+        search_dir = _find_app_root_dir(app_root_dir)
+        if search_dir == app_root_dir:
+            logger.warning(
+                f"{DeploymentConfiguration.APP_ROOT} could not be detected in the folder hierarchy! "
+                f"Will use process root {app_root_dir} instead. If you receive 'module not found' errors "
+                f"at runtime, please consider setting deployment parameters via 'set_deployment_conf' method or"
+                f"set {DeploymentConfiguration.APP_ROOT} as an environment variable explicitly."
+            )
+        return search_dir
 
 
 def _get_app_src_dir() -> Optional[str]:
@@ -329,7 +362,11 @@ def _get_app_src_dir() -> Optional[str]:
 
 def get_dependency_path():
     dependency_path = None
-    if IS_ON_SAGEMAKER_NOTEBOOK_INSTANCE:
+
+    if IS_ON_AWS_LAMBDA and Path("/var/task").exists():
+        # https://docs.aws.amazon.com/lambda/latest/dg/python-package.html#python-package-searchpath
+        dependency_path = "/var/task"
+    elif IS_ON_SAGEMAKER_NOTEBOOK_INSTANCE:
         dependency_path = str(_sagemaker_pkg_root)
     else:
         app_root_dir = _get_app_root_dir()
@@ -410,7 +447,10 @@ def get_working_set_as_zip_stream(
 def _get_working_set_as_zip_stream(
     include_resources=False, use_embedded_bundle=False, dependencies_path=None, source_path=None, extra_folders_to_avoid: Set[str] = None
 ):
-    from importlib.resources import read_binary, contents, path
+    from importlib.resources import contents, read_binary
+
+    from intelliflow.utils.compat import path
+
     from . import bundle
 
     buffer = io.BytesIO()
@@ -419,7 +459,7 @@ def _get_working_set_as_zip_stream(
     force_bundle = False
 
     app_name = _get_app_root_dir().name
-    if not (IS_ON_SAGEMAKER_NOTEBOOK_INSTANCE or IS_ON_GLUE_DEV_ENDPOINT):
+    if not (IS_ON_AWS_LAMBDA or IS_ON_SAGEMAKER_NOTEBOOK_INSTANCE or IS_ON_GLUE_DEV_ENDPOINT):
         # convenience (best-effort) support for IDEs: PyCharm uses python path lib modification among dependent packages.
         # not-critical for productionization scenarios or notebook support.
         if app_name != FRAMEWORK_PACKAGE_NAME:
@@ -458,7 +498,7 @@ def _get_working_set_as_zip_stream(
         if dependencies:
             zipped_set = _zipdir(dependencies, zip_stream, include_resources, extra_folders_to_avoid=extra_folders_to_avoid)
 
-            if not (IS_ON_SAGEMAKER_NOTEBOOK_INSTANCE or IS_ON_GLUE_DEV_ENDPOINT):
+            if not (IS_ON_AWS_LAMBDA or IS_ON_SAGEMAKER_NOTEBOOK_INSTANCE or IS_ON_GLUE_DEV_ENDPOINT):
                 if app_name != FRAMEWORK_PACKAGE_NAME and "intelliflow/__init__.py" not in zipped_set:
                     # convenience feature to pull intelliflow core into the working set
                     # when it is in the path as a sister project (i.e PyCharm).

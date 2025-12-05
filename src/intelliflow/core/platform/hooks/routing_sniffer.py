@@ -364,7 +364,7 @@ def ExecutionSniffer(max_execution_checkpoint_in_hours: Optional[int] = None) ->
             for c_in_hours in range(
                 0,
                 (
-                    cls.DEFAULT_EXECUTION_CHECKPOINT_MAX_IN_HOURS
+                    DEFAULT_EXECUTION_CHECKPOINT_MAX_IN_HOURS
                     if max_execution_checkpoint_in_hours is None
                     else max_execution_checkpoint_in_hours
                 ),

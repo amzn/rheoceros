@@ -151,9 +151,9 @@ class _SignalRangeAnalyzer(_SignalAnalyzer):
                             completed_paths.add(path)
 
                 elif signal.resource_access_spec.source == SignalSourceType.S3:
-                    from intelliflow.core.platform.development import RuntimePlatform
                     from intelliflow.core.platform.definitions.aws.s3.bucket_wrapper import get_bucket
                     from intelliflow.core.platform.definitions.aws.s3.object_wrapper import list_objects, object_exists
+                    from intelliflow.core.platform.development import RuntimePlatform
 
                     if isinstance(platform, RuntimePlatform):
                         # at runtime we can comfortably use our own session since execution setup must be done
@@ -190,10 +190,10 @@ class _SignalRangeAnalyzer(_SignalAnalyzer):
                         if object_exists(s3, bucket, prefix, critical_path=True):
                             completed_paths.add(path)
                     else:
-                        if prefix.endswith("*"):  # e.g 's3://bucket/folder/part*'
-                            prefix = prefix[:-1]  # expected state here is like 's3://bucket/folder/part'
+                        if prefix.endswith("*"):  # e.g 's3://BUCKET/folder/part*'
+                            prefix = prefix[:-1]  # expected state here is like 's3://BUCKET/folder/part'
 
-                        if "*" in prefix:  # e.g s3://bucket/folder/*/part*
+                        if "*" in prefix:  # e.g s3://BUCKET/folder/*/part*
                             raise ValueError(
                                 f"'*' in S3 paths cannot be supported by {cls.__name__!r} when it is not "
                                 f"used at the end of the path. Signal: {signal.unique_key()!r}, Path: {path!r}"
@@ -295,15 +295,6 @@ class RuntimeLinkNode(SignalLinkNode):
         # At runtime, high-level Route module maintains a dynamic list of runtime nodes based on traffic
         # (history of events received so far).
         return self._node_id == other.node_id
-
-    def auto_complete_ranges(self) -> List[Signal]:
-        # TODO post MVP
-        # for each ready_signal
-        # use SignalSpectralAnalyzer::analyze to do a spectrum, filtered domain, range check.
-        #
-        # persist the results and use them in subsequent calls to this function, so that it wont return
-        # duplicate feedback / reaction back to the Route.
-        return []
 
     def is_ready(self, check_ranges: Optional[bool] = False, platform: Optional["Platform"] = None, fail_fast: bool = True) -> bool:
         if len(self._signals) != len(self._ready_signals):
@@ -752,6 +743,116 @@ class RouteCheckpoint(CoreData):
         return True
 
 
+RouteMetadata = Dict[str, Any]
+
+
+IRouteMetadataCondition = Callable[[RouteMetadata], bool]
+
+
+class RouteMetadataAction(CoreData):
+    def __init__(self, condition: IRouteMetadataCondition, slot: Slot) -> None:
+        self.condition = condition
+        self.slot = slot
+
+    def describe_condition(self) -> str:
+        try:
+            from dill.source import getsource
+
+            return getsource(self.condition)
+        except:
+            return self.condition.__code__.co_code
+
+    def check_integrity(self, other: "RouteMetadataAction") -> bool:
+        if not other:
+            return False
+
+        if self.condition.__code__.co_code != other.condition.__code__.co_code:
+            return False
+
+        if self.condition.__code__.co_consts != other.condition.__code__.co_consts:
+            return False
+
+        if not self.slot.check_integrity(other.slot):
+            return False
+
+        return True
+
+
+IRouteRetentionCondition = Callable[[Dict[str, Any]], bool]
+
+
+class RouteRetention(CoreData):
+    def __init__(
+        self,
+        condition: Optional[IRouteRetentionCondition] = None,
+        refresh_period_in_secs: Optional[int] = None,
+        rip_hook: Optional[Slot] = None,
+        refresh_hook: Optional[Slot] = None,
+    ) -> None:
+        self.condition = condition
+        self.refresh_period_in_secs = refresh_period_in_secs
+        self.rip_slot = rip_hook
+        self.refresh_slot = refresh_hook
+
+    def describe_condition(self) -> str:
+        try:
+            from dill.source import getsource
+
+            return getsource(self.condition)
+        except:
+            return self.condition.__code__.co_code
+
+    def check_integrity(self, other: "RouteRetention") -> bool:
+        if not other:
+            return False
+
+        if (
+            (self.condition and not other.condition)
+            or (not self.condition and other.condition)
+            or (
+                self.condition
+                and other.condition
+                and (
+                    self.condition.__code__.co_code != other.condition.__code__.co_code
+                    or self.condition.__code__.co_consts != other.condition.__code__.co_consts
+                )
+            )
+        ):
+            return False
+
+        if self.rip_slot or other.rip_slot:
+            if (not self.rip_slot and other.rip_slot) or not self.rip_slot.check_integrity(other.rip_slot):
+                return False
+
+        if self.refresh_period_in_secs != other.refresh_period_in_secs:
+            return False
+
+        if self.refresh_slot or other.refresh_slot:
+            if (not self.refresh_slot and other.refresh_slot) or not self.refresh_slot.check_integrity(other.refresh_slot):
+                return False
+
+        return True
+
+    def callbacks(self) -> Tuple[Slot]:
+        callbacks = (self.rip_slot, self.refresh_slot)
+        return callbacks
+
+    def chain(self, *other: "RouteRetention") -> "RouteRetention":
+        retention = [self]
+        retention.extend(other)
+
+        return RouteRetention(
+            condition=self.condition,
+            refresh_period_in_secs=self.refresh_period_in_secs,
+            rip_hook=_ChainedHookCallback("rip_hook", *retention),
+            refresh_hook=_ChainedHookCallback("refresh_hook", *retention),
+        )
+
+    @staticmethod
+    def aggregate(*hooks: "RouteRetention") -> "RouteRetention":
+        return _aggregate_hooks(*hooks)
+
+
 class RouteExecutionHook(CoreData):
     def __init__(
         self,
@@ -768,6 +869,8 @@ class RouteExecutionHook(CoreData):
         on_failure: Optional[Slot] = None,
         # hooks for custom checkpoints across the execution timeline
         checkpoints: Optional[List[RouteCheckpoint]] = None,
+        # hooks for user provided conditional actions on execution output metadata
+        metadata_actions: Optional[List[RouteMetadataAction]] = None,
     ) -> None:
         self.on_exec_begin = on_exec_begin
         self.on_exec_skipped = on_exec_skipped
@@ -781,6 +884,12 @@ class RouteExecutionHook(CoreData):
         self.on_failure = on_failure
         # hooks for custom checkpoints across the execution timeline
         self.checkpoints = checkpoints
+        self.metadata_actions = metadata_actions
+
+    # FUTURE remove. backwards compatibility.
+    @property
+    def get_metadata_actions(self) -> Optional[List[RouteMetadataAction]]:
+        return getattr(self, "metadata_actions", None)
 
     def callbacks(self) -> Tuple[Slot]:
         callbacks = (
@@ -794,6 +903,8 @@ class RouteExecutionHook(CoreData):
         )
         if self.checkpoints:
             callbacks = callbacks + tuple([checkpoint.slot for checkpoint in self.checkpoints])
+        if self.get_metadata_actions:
+            callbacks = callbacks + tuple([metadata_action.slot for metadata_action in self.get_metadata_actions])
         return callbacks
 
     def check_integrity(self, other: "RouteExecutionHook") -> bool:
@@ -842,16 +953,33 @@ class RouteExecutionHook(CoreData):
                 if not checkpoint.check_integrity(other.checkpoints[i]):
                     return False
 
+        if (self.get_metadata_actions is None and other.get_metadata_actions) or (
+            self.get_metadata_actions and other.get_metadata_actions is None
+        ):
+            return False
+        elif self.get_metadata_actions and other.get_metadata_actions:
+            if len(self.get_metadata_actions) != len(other.get_metadata_actions):
+                return False
+
+            for i, metadata_action in enumerate(self.get_metadata_actions):
+                if not metadata_action.check_integrity(other.get_metadata_actions[i]):
+                    return False
+
         return True
 
     def chain(self, *other: "RouteExecutionHook") -> "RouteExecutionHook":
         checkpoints = []
+        metadata_actions = []
         execution_hook = [self]
         execution_hook.extend(other)
         for hook in execution_hook:
             if hook.checkpoints:
                 for c in hook.checkpoints:
                     checkpoints.append(c)
+
+            if hook.get_metadata_actions:
+                for m in hook.get_metadata_actions:
+                    metadata_actions.append(m)
 
         return RouteExecutionHook(
             on_exec_begin=_ChainedHookCallback("on_exec_begin", *execution_hook),
@@ -862,6 +990,7 @@ class RouteExecutionHook(CoreData):
             on_success=_ChainedHookCallback("on_success", *execution_hook),
             on_failure=_ChainedHookCallback("on_failure", *execution_hook),
             checkpoints=checkpoints,
+            metadata_actions=metadata_actions,
         )
 
     @staticmethod
@@ -947,7 +1076,7 @@ def _aggregate_hooks(*hooks):
 
 
 class _ChainedHookCallback(Callable, ComputeDescriptor, Slot):
-    def __init__(self, callback: str, *hook: Union[RouteExecutionHook, RoutePendingNodeHook]):
+    def __init__(self, callback: str, *hook: Union[RouteExecutionHook, RoutePendingNodeHook, RouteRetention]):
         self._hooks = list(hook)
         self._callback = callback
         permissions = []
@@ -1071,7 +1200,7 @@ class Route(Serializable):
         output: Signal,
         output_dim_matrix: DimensionLinkMatrix,
         slots: Sequence[Slot],
-        auto_range_completion=False,
+        output_retention: RouteRetention = None,
         execution_hook: RouteExecutionHook = None,
         pending_node_ttl_in_secs: int = None,
         pending_node_hook: RoutePendingNodeHook = None,
@@ -1084,8 +1213,7 @@ class Route(Serializable):
         self._execution_hook = execution_hook if execution_hook else RouteExecutionHook()
         self._pending_node_hook = pending_node_hook if pending_node_hook else RoutePendingNodeHook()
         self._pending_node_ttl_in_secs = pending_node_ttl_in_secs
-        # TODO / FUTURE auto range check and responding with reactions will effect RuntimeLinkNode impl as well.
-        self._auto_range_completion = auto_range_completion
+        self._output_retention = output_retention
         self._pending_nodes: Set[RuntimeLinkNode] = set()
 
         if self._execution_hook:
@@ -1100,6 +1228,9 @@ class Route(Serializable):
 
     def has_execution_checkpoints(self) -> bool:
         return bool(self.execution_hook and self.execution_hook.checkpoints)
+
+    def has_execution_metadata_actions(self) -> bool:
+        return bool(self.execution_hook and self.execution_hook.get_metadata_actions)
 
     def has_pending_node_checkpoints(self) -> bool:
         return bool(self.pending_node_hook and self.pending_node_hook.checkpoints)
@@ -1173,6 +1304,14 @@ class Route(Serializable):
         self._pending_node_hook = value
 
     @property
+    def output_retention(self) -> RouteRetention:
+        return getattr(self, "_output_retention", RouteRetention())
+
+    @output_retention.setter
+    def output_retention(self, value) -> None:
+        self._output_retention = value
+
+    @property
     def pending_node_ttl_in_secs(self) -> int:
         return getattr(self, "_pending_node_ttl_in_secs", None)
 
@@ -1238,6 +1377,11 @@ class Route(Serializable):
         if (not self.pending_node_hook and other.pending_node_hook) or not self.pending_node_hook.check_integrity(other.pending_node_hook):
             return False
 
+        if (self.output_retention or other.output_retention) and (
+            (not self.output_retention and other.output_retention) or not self.output_retention.check_integrity(other.output_retention)
+        ):
+            return False
+
         if self.pending_node_ttl_in_secs != other.pending_node_ttl_in_secs:
             return False
 
@@ -1246,9 +1390,12 @@ class Route(Serializable):
     def transfer_auxiliary_data(self, other: "Route") -> None:
         self.execution_hook = other.execution_hook
         self.pending_node_hook = other.pending_node_hook
+        self.output_retention = other.output_retention
         self.pending_node_ttl_in_secs = other.pending_node_ttl_in_secs
 
-    def receive(self, incoming_signal: Signal, platform: Optional["Platform"] = None, is_blocked: bool = False) -> Optional[Response]:
+    def receive(
+        self, incoming_signal: Signal, platform: Optional["Platform"] = None, is_blocked: bool = False, defer_response: bool = False
+    ) -> Optional[Response]:
         if not self._link_node.can_receive(incoming_signal):
             return None
 
@@ -1280,21 +1427,17 @@ class Route(Serializable):
         new_reactions: List[Signal] = []
         new_executions: List[Route.ExecutionContext] = []
         completed_nodes: Set[RuntimeLinkNode] = set()
-        for pending_node in self._pending_nodes:
-            if pending_node.is_ready(check_ranges=True, platform=platform):
-                new_nodes.discard(pending_node)  # it might have been just added, remove from 'new' pending list.
-                output: Signal = pending_node.materialize_output(self._output, self._output_dim_matrix)
-                #  We are not checking if output is ready.
-                #  Currently we think that routing module should be agnostic from this.
-                #  This is different than range_completion for which this module is the only place
-                #  to resolve missing dimension ranges and react accordingly in a stateless manner.
-                completed_nodes.add(pending_node)
-                new_executions.append(Route.ExecutionContext(pending_node, output, self._slots))
-            elif self._auto_range_completion:
-                # TODO if range_completion is enabled and incoming signal is not already a reaction
-                # then initiate a range completion process as a series of feedback Signals back to the main
-                # dispatcher loop.
-                new_reactions.extend(pending_node.auto_complete_ranges())
+        if not defer_response:
+            for pending_node in self._pending_nodes:
+                if pending_node.is_ready(check_ranges=True, platform=platform):
+                    new_nodes.discard(pending_node)  # it might have been just added, remove from 'new' pending list.
+                    output: Signal = pending_node.materialize_output(self._output, self._output_dim_matrix)
+                    #  We are not checking if output is ready.
+                    #  Currently we think that routing module should be agnostic from this.
+                    #  This is different than range_completion for which this module is the only place
+                    #  to resolve missing dimension ranges and react accordingly in a stateless manner.
+                    completed_nodes.add(pending_node)
+                    new_executions.append(Route.ExecutionContext(pending_node, output, self._slots))
 
         self._pending_nodes = self._pending_nodes - completed_nodes
 

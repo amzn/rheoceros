@@ -51,8 +51,8 @@ class AWSDDBTableExtension(AWSConstructMixin, Extension):
                 self._table_name = extra_boto_args["TableName"]
 
             billing_mode_in_kwargs = extra_boto_args.get("BillingMode", None)
-            if billing_mode_in_kwargs and billing_mode_in_kwargs != self._billing_mode.value:
-                raise ValueError(f"{self.__class__.__name__}: BillingMode must be {self._billing_mode.value!r}!")
+            if billing_mode_in_kwargs and billing_mode_in_kwargs not in iter(BillingMode):
+                raise ValueError(f"{self.__class__.__name__}: BillingMode must be one of {list(iter(BillingMode))}!")
 
         @property
         def table_name(self) -> str:
@@ -78,7 +78,10 @@ class AWSDDBTableExtension(AWSConstructMixin, Extension):
         # because we allow 'table_name' to be specified by user, so when it changes we expect this extension to be invalidated
         # by `CompositeExtension::_deserialized_init`
         def __eq__(self, other):
-            return type(self) == type(other) and self.table_name == other.table_name
+            return type(self) == type(other) and (
+                (not self.table_name and not other.table_name and self.extension_id == other._extension_id)
+                or ((self.table_name or other.table_name) and self.table_name == other.table_name)
+            )
 
         def __hash__(self) -> int:
             return hash(self.__class__) + hash(self.table_name)

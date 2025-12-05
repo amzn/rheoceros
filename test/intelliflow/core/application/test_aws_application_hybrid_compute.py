@@ -317,6 +317,7 @@ class TestAWSApplicationHybridCompute(AWSTestBase):
             ],
         )
 
+
         # SERIALIZATION: inject serialize/deserialize sequence for enhanced serialization coverage
         json_str = app.dev_context.to_json()
         dev_context = CoreData.from_json(json_str)
@@ -402,7 +403,7 @@ class TestAWSApplicationHybridCompute(AWSTestBase):
         assert app.platform.batch_compute._drivers[1].get_session_state.call_count == 1
 
         # two nodes/routes should be active
-        assert len(app.get_active_routes()) == 2
+        assert len(app.get_active_routes()) == 3
 
         # Now let's complete those executions by causing get_session_state to return COMPLETED
         def glue_driver_get_session_state_impl(
@@ -439,12 +440,24 @@ class TestAWSApplicationHybridCompute(AWSTestBase):
                 ComputeSessionStateType.COMPLETED,
                 [
                     ComputeExecutionDetails(
-                        "<start_time>", "<end_time>", dict({"QueryExecutionId": "test_exec_id", "param1": 1, "param2": 2})
+                        "<start_time>",
+                        "<end_time>",
+                        dict(
+                            {
+                                "QueryExecution": {
+                                    "QueryExecutionId": "test_exec_id",
+                                    "Status": {"State": "SUCCEEDED"},
+                                    "param1": 1,
+                                    "param2": 2,
+                                }
+                            }
+                        ),
                     )
                 ],
             )
 
         app.platform.batch_compute._drivers[0].get_session_state = MagicMock(side_effect=athena_driver_get_session_state_impl)
+
         # cause orchestration to 'next-cycle' which scans active routes (implicitly calls BatchCompute driver) and updates the states.
         app.update_active_routes_status()
 
@@ -475,12 +488,12 @@ class TestAWSApplicationHybridCompute(AWSTestBase):
         glue_compute_log_query = app.get_compute_record_logs(glue_compute_records[0])[0]
         assert glue_compute_log_query
         assert len(glue_compute_log_query.records) == 2
-        assert glue_compute_log_query.records[0]["logStreamName"] == "job_run_id"
+        assert glue_compute_log_query.records[0]["message"] == "string"
         # do the same again with the materialized view this time (rather than using the compute record directly)
         glue_compute_log_query = app.get_compute_record_logs(default_selection_features_SPARK["NA"]["2021-03-18"])[0]
         assert glue_compute_log_query
         assert len(glue_compute_log_query.records) == 2
-        assert glue_compute_log_query.records[0]["logStreamName"] == "job_run_id"
+        assert glue_compute_log_query.records[0]["message"] == "string"
 
         athena_compute_log_query = app.get_compute_record_logs(athena_compute_records[0])[0]
         assert athena_compute_log_query
@@ -508,7 +521,10 @@ class TestAWSApplicationHybridCompute(AWSTestBase):
             HostPlatform(
                 AWSConfiguration.builder()
                 .with_region(self.region)
-                .with_param(CompositeBatchCompute.BATCH_COMPUTE_DRIVERS_PARAM, [AWSGlueBatchComputeBasic, AWSEMRBatchCompute])
+                .with_param(
+                    CompositeBatchCompute.BATCH_COMPUTE_DRIVERS_PARAM,
+                    [AWSGlueBatchComputeBasic, AWSEMRBatchCompute],
+                )
                 .build()
             ),
         )

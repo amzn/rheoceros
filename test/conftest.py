@@ -3,6 +3,9 @@
 
 import platform
 import sys
+from unittest.mock import patch
+
+import pytest
 
 MAC_EXCLUDED_PACKAGES = []
 
@@ -12,3 +15,10 @@ MAC_EXCLUDED_PACKAGES = []
 def pytest_configure(config):
     if platform.system() == "Darwin":
         sys.path = [p for p in sys.path if not any([package_name in p for package_name in MAC_EXCLUDED_PACKAGES])]
+
+
+@pytest.fixture
+def mock_AndesNativeClient():
+    with patch("intelliflow.core.signal_processing.routing_runtime_constructs.AndesNativeClient") as myclass_mocked:
+        # myclass_mocked.return_value.is_partition_present.return_value = True
+        yield myclass_mocked

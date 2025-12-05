@@ -19,7 +19,7 @@ from intelliflow.core.platform.definitions.compute import (
 from intelliflow.core.signal_processing import Slot
 from intelliflow.core.signal_processing.signal import *
 from intelliflow.mixins.aws.test import AWSTestBase
-from intelliflow.utils.test.data_emulation import add_test_data
+from intelliflow.utils.test.data_emulation import add_test_data, check_test_data
 from intelliflow.utils.test.inlined_compute import FailureCompute, NOOPCompute
 
 
@@ -56,6 +56,13 @@ class TestAWSApplicationExecutionDependencyTree(AWSTestBase):
         path, _ = app.poll(test_node)
         assert path
 
+        # CLEANUP
+        add_test_data(app, test_node, "_SUCCESS", "")
+        assert check_test_data(app, test_node, "_SUCCESS"), "Could not create artificial completion file!"
+        app.execute(test_node, wait=True, recursive=False, update_dependency_tree=True, executor_mode=Application.ExecutorMode.CLEANUP)
+        assert not check_test_data(app, test_node, "_SUCCESS"), "Could not clean up node!"
+        #
+
         self.patch_aws_stop()
 
     def test_application_execute_dtree_sync_single_node(self):
@@ -73,6 +80,13 @@ class TestAWSApplicationExecutionDependencyTree(AWSTestBase):
         # check successful execution
         path, _ = app.poll(test_node)
         assert path
+
+        # CLEANUP with recursive=True path
+        add_test_data(app, test_node, "_SUCCESS", "")
+        assert check_test_data(app, test_node, "_SUCCESS"), "Could not create artificial completion file!"
+        app.execute(test_node, wait=True, recursive=True, update_dependency_tree=True, executor_mode=Application.ExecutorMode.CLEANUP)
+        assert not check_test_data(app, test_node, "_SUCCESS"), "Could not clean up node!"
+        #
 
         self.patch_aws_stop()
 
@@ -130,6 +144,45 @@ class TestAWSApplicationExecutionDependencyTree(AWSTestBase):
 
         assert path, "Execution must have been successful!"
 
+        # CLEANUP #1 one level only (not checking dep tree)
+        add_test_data(app, a, "_SUCCESS", "")
+        add_test_data(app, b, "_SUCCESS", "")
+        assert check_test_data(app, a, "_SUCCESS"), "Could not create artificial completion file!"
+        assert check_test_data(app, b, "_SUCCESS"), "Could not create artificial completion file!"
+        app.execute(a, wait=True, recursive=True, update_dependency_tree=False, executor_mode=Application.ExecutorMode.CLEANUP)
+        assert not check_test_data(app, a, "_SUCCESS"), "Could not clean up node 'a'!"
+        assert check_test_data(app, b, "_SUCCESS"), "Should have left node 'b' untouched!"
+        #
+        # CLEANUP #1.1 top-down (this time should visit 'b' as well and clean it up)
+        app.execute(a, wait=True, recursive=True, update_dependency_tree=True, executor_mode=Application.ExecutorMode.CLEANUP)
+        assert not check_test_data(app, a, "_SUCCESS"), "Could not clean up node 'a'!"
+        assert not check_test_data(app, b, "_SUCCESS"), "Could not clean up node 'b'!"
+
+        # CLEANUP #2 Bottom-up
+        add_test_data(app, a, "_SUCCESS", "")
+        add_test_data(app, b, "_SUCCESS", "")
+        # note that entry point is 'b' (child) this time
+        app.execute(b, wait=True, recursive=True, update_dependency_tree=True, executor_mode=Application.ExecutorMode.CLEANUP)
+        assert not check_test_data(app, a, "_SUCCESS"), "Could not clean up node 'a'!"
+        assert not check_test_data(app, b, "_SUCCESS"), "Could not clean up node 'b'!"
+
+        # CLEANUP #2.1 one level only (child cleans itself up only with recursive=False)
+        add_test_data(app, a, "_SUCCESS", "")
+        add_test_data(app, b, "_SUCCESS", "")
+        # note that entry point is 'b' (child) this time
+        app.execute(b, wait=True, recursive=False, update_dependency_tree=True, executor_mode=Application.ExecutorMode.CLEANUP)
+        assert check_test_data(app, a, "_SUCCESS"), "Should have left node 'a' untouched!"
+        assert not check_test_data(app, b, "_SUCCESS"), "Could not clean up node 'b'!"
+        # show that update_dependency_tree is ineffective since entry point is the the leaf node, we still expect 'a'
+        # to stay untouched.
+        app.execute(b, wait=True, recursive=False, update_dependency_tree=False, executor_mode=Application.ExecutorMode.CLEANUP)
+        assert check_test_data(app, a, "_SUCCESS"), "Should have left node 'a' untouched!"
+        assert not check_test_data(app, b, "_SUCCESS"), "Could not clean up node 'b'!"
+        # now clean up with recursive=True
+        app.execute(b, wait=True, recursive=True, update_dependency_tree=False, executor_mode=Application.ExecutorMode.CLEANUP)
+        assert not check_test_data(app, a, "_SUCCESS"), "Could not clean up node 'a'!"
+        assert not check_test_data(app, b, "_SUCCESS"), "Could not clean up node 'b'!"
+
         self.patch_aws_stop()
 
     def test_application_execute_dtree_single_child(self):
@@ -182,6 +235,25 @@ class TestAWSApplicationExecutionDependencyTree(AWSTestBase):
         assert path, "Execution must have been successful!"
 
         assert not app.get_active_routes(), "There should not be any left-over active records after recursive execution!"
+
+        # CLEANUP #1 check external data is not touched even when recursive=True
+        assert check_test_data(app, ext1[1]["2023-11-20"], "_SUCCESS"), "Could not create artificial completion file!"
+        assert check_test_data(app, ext2[1]["2023-11-20"], "_SUCCESS"), "Could not create artificial completion file!"
+        app.execute(
+            a[1]["2023-11-20"], wait=True, recursive=True, update_dependency_tree=False, executor_mode=Application.ExecutorMode.CLEANUP
+        )
+        assert check_test_data(app, ext1[1]["2023-11-20"], "_SUCCESS"), "Should have left external data node 'ext1' untouched!"
+        assert check_test_data(app, ext2[1]["2023-11-20"], "_SUCCESS"), "Should have left external data node 'ext2' untouched!"
+
+        # CLEAN #1.1 show 'a' having data impacts nothing
+        add_test_data(app, a[1]["2023-11-20"], "_SUCCESS", "")
+        assert check_test_data(app, a[1]["2023-11-20"], "_SUCCESS"), "Could not create artificial completion file!"
+        app.execute(
+            a[1]["2023-11-20"], wait=True, recursive=True, update_dependency_tree=False, executor_mode=Application.ExecutorMode.CLEANUP
+        )
+        assert check_test_data(app, ext1[1]["2023-11-20"], "_SUCCESS"), "Should have left external data node 'ext1' untouched!"
+        assert check_test_data(app, ext2[1]["2023-11-20"], "_SUCCESS"), "Should have left external data node 'ext2' untouched!"
+        assert not check_test_data(app, a[1]["2023-11-20"], "_SUCCESS"), "Could not clean up node 'a'!"
 
         self.patch_aws_stop()
 
@@ -305,6 +377,45 @@ class TestAWSApplicationExecutionDependencyTree(AWSTestBase):
 
         inactive_records = app.get_inactive_compute_records(c)
         assert len(list(inactive_records)) == 1
+
+        # CLEAN #1.1 show deletion of 'a' on 2023-11-14 will;
+        #  - not touch B (as it directly consumes 2023-11-20), not using a range of 'a'
+        #  - clean up C (as its 2023-11-20 partition relies on 7 days of a and uses deleted partition)
+        add_test_data(app, a[1]["2023-11-14"], "_SUCCESS", "")
+        add_test_data(app, b[1]["2023-11-20"], "_SUCCESS", "")
+        add_test_data(app, c[1]["2023-11-20"], "_SUCCESS", "")
+        assert check_test_data(app, a[1]["2023-11-14"], "_SUCCESS"), "Could not create artificial completion file!"
+        assert check_test_data(app, b[1]["2023-11-20"], "_SUCCESS"), "Could not create artificial completion file!"
+        assert check_test_data(app, c[1]["2023-11-20"], "_SUCCESS"), "Could not create artificial completion file!"
+        app.execute(
+            a[1]["2023-11-14"], wait=True, recursive=False, update_dependency_tree=True, executor_mode=Application.ExecutorMode.CLEANUP
+        )
+        assert check_test_data(app, ext1[1]["2023-11-14"], "_SUCCESS"), "Should have left external data node 'ext1' untouched!"
+        assert check_test_data(app, ext2[1]["2023-11-20"], "_SUCCESS"), "Should have left external data node 'ext2' untouched!"
+        # now check the internals
+        assert not check_test_data(app, a[1]["2023-11-14"], "_SUCCESS"), "Could not clean up node 'a'!"
+        # b should survive
+        assert check_test_data(app, b[1]["2023-11-20"], "_SUCCESS"), "'b' node must survive deletion"
+        # c should be impacted due to ranged dependency on a
+        assert not check_test_data(app, c[1]["2023-11-20"], "_SUCCESS"), "Could not clean up node 'c'!"
+
+        # CLEANUP #2 simple recursive bottom-up deletion from c to a will destroy entire range
+        # c -> b -> and 7 days on a must be wiped out
+        for i in range(7):
+            add_test_data(app, a[1][f"2023-11-{14 + i}"], object_name="_SUCCESS", data="")
+        add_test_data(app, c[1]["2023-11-20"], "_SUCCESS", "")
+        assert check_test_data(app, a[1]["2023-11-14"], "_SUCCESS"), "Could not create artificial completion file!"
+        assert check_test_data(app, a[1]["2023-11-20"], "_SUCCESS"), "Could not create artificial completion file!"
+        assert check_test_data(app, b[1]["2023-11-20"], "_SUCCESS"), "Could not create artificial completion file!"
+        assert check_test_data(app, c[1]["2023-11-20"], "_SUCCESS"), "Could not create artificial completion file!"
+        # recursive -> True
+        app.execute(
+            c[1]["2023-11-20"], wait=True, recursive=True, update_dependency_tree=True, executor_mode=Application.ExecutorMode.CLEANUP
+        )
+        for i in range(7):
+            assert not check_test_data(app, a[1][f"2023-11-{14 + i}"], "_SUCCESS"), "Could not clean up node 'a'!"
+        assert not check_test_data(app, b[1]["2023-11-20"], "_SUCCESS"), "'b' node must survive deletion"
+        assert not check_test_data(app, c[1]["2023-11-20"], "_SUCCESS"), "Could not clean up node 'c'!"
 
         self.patch_aws_stop()
 
@@ -446,6 +557,25 @@ class TestAWSApplicationExecutionDependencyTree(AWSTestBase):
 
         inactive_records = app.get_inactive_compute_records(c)
         assert len(list(inactive_records)) == (3 + 3 + 1)  # but C should update only one partition because of scan datum
+
+        # CLEANUP just 7 days of cleanup on 'a' should take care of entire dependency tree
+        for i in range(7):
+            app.execute(
+                a[1][f"2023-11-{14 + i}"],
+                wait=True,
+                recursive=False,
+                update_dependency_tree=True,
+                executor_mode=Application.ExecutorMode.CLEANUP,
+            )
+
+        # check 2023-11-14 - 2024-11-20 range is gone on both 'a' and 'b'
+        for i in range(7):
+            assert not check_test_data(app, a[1][f"2023-11-{14 + i}"], "_SUCCESS"), "Could not clean up node 'a'!"
+            assert not check_test_data(app, b[1][f"2023-11-{14 + i}"], "_SUCCESS"), "Could not clean up node 'b'!"
+
+        # check 2023-11-20 - 2024-11-22 range is gone on 'c'
+        for i in range(2):
+            assert not check_test_data(app, c[1][f"2023-11-{20 + i}"], "_SUCCESS"), "Could not clean up node 'c'!"
 
         self.patch_aws_stop()
 
@@ -606,7 +736,11 @@ class TestAWSApplicationExecutionDependencyTree(AWSTestBase):
         a = app.create_data("node_0", inputs=[regionalized_timer], compute_targets=[NOOPCompute])
 
         b = app.create_data("node_1_1", inputs=[regionalized_timer, a.ref.range_check(True)], compute_targets=[NOOPCompute])
-        c = app.create_data("node_1_2", inputs=[regionalized_timer, a.ref.range_check(True)], compute_targets=[NOOPCompute])
+        c = app.create_data(
+            "node_1_2",
+            inputs=[regionalized_timer, a.ref.range_check(True)],
+            compute_targets=[InlinedCompute(lambda input_map, output, params: time.sleep(1))],
+        )
 
         d = app.create_data(
             "node_2",
@@ -725,5 +859,142 @@ class TestAWSApplicationExecutionDependencyTree(AWSTestBase):
             assert len(inactive_records) == range_in_days
             compute_record = inactive_records[0]
             assert compute_record.session_state.state_type == ComputeSessionStateType.COMPLETED, "Execution must be COMPLETED"
+
+        self.patch_aws_stop()
+
+    @pytest.mark.parametrize(
+        "concurrent_executor_pool_size",
+        [
+            (0),
+            (35),
+        ],
+    )
+    def test_application_execute_diamond_hierarchy_with_references_and_fully_scheduled_batch_ranged(
+        self, concurrent_executor_pool_size: int
+    ):
+        """Run a modified version of the test above with a more complex extension having ranged access (aggregations)"""
+        self.patch_aws_start(glue_catalog_has_all_andes_tables=True, concurrent_executor_pool_size=0)
+        app = AWSApplication("execute-dtree-10", self.region)
+
+        daily_timer = app.add_timer(
+            "DAILY_TIMER",
+            schedule_expression="cron(0 0 1 * ? *)",
+            # Run at 00:00 am (UTC) every 1st day of the month
+            time_dimension_id="date",
+        )
+
+        regionalized_timer = app.project(
+            "REGIONAL_DAILY_TIMER",
+            input=daily_timer,
+            output_dimension_spec={
+                "region_id": {
+                    type: DimensionType.LONG,
+                    "marketplace_id": {type: DimensionType.LONG, "date": {type: DimensionType.DATETIME, "format": "%Y-%m-%d"}},
+                }
+            },
+            output_dimension_filter={
+                1: {1: {"*": {}}},
+            },
+        )
+
+        a = app.create_data("node_0", inputs=[regionalized_timer], compute_targets=[NOOPCompute])
+
+        b = app.create_data("node_1_1", inputs=[regionalized_timer, a.ref.range_check(True)], compute_targets=[NOOPCompute])
+        c = app.create_data("node_1_2", inputs=[regionalized_timer, a.ref.range_check(True)], compute_targets=[NOOPCompute])
+        b_1 = app.create_data(
+            "node_1_1_1",
+            inputs=[regionalized_timer, c.ref.range_check(True), b["*"]["*"][:-21].ref.range_check(True)],
+            compute_targets=[NOOPCompute],
+        )
+        c_1 = app.create_data(
+            "node_1_2_1",
+            inputs=[regionalized_timer, b.ref.range_check(True), c["*"]["*"][:-7].ref.range_check(True)],
+            compute_targets=[NOOPCompute],
+        )
+
+        d = app.create_data(
+            "node_2",
+            inputs=[
+                regionalized_timer,
+                b.ref.range_check(True),
+                c.ref.range_check(True),
+                b_1.ref.range_check(True),
+                c_1.ref.range_check(True),
+            ],
+            compute_targets=[NOOPCompute],
+        )
+
+        e = app.create_data(
+            "node_3",
+            inputs=[
+                regionalized_timer,
+                b_1.ref.range_check(True),
+                c_1.ref.range_check(True),
+            ],
+            compute_targets=[NOOPCompute],
+        )
+
+        app.activate()
+
+        self.activate_event_propagation(app, cycle_time_in_secs=10)
+
+        # 1- backfill`the entire tree
+        app.execute(d[1][1]["2024-12-24"], recursive=True)
+        app.execute(d[1][1]["2024-12-26"], recursive=True)
+
+        app.execute(e[1][1]["2024-12-24"], recursive=True)
+        app.execute(e[1][1]["2024-12-26"], recursive=True)
+
+        assert not app.get_active_routes(), "There should not be any left-over active records after recursive execution!"
+
+        # these nodes must have one execution
+        for node in [b_1, c_1, d, e]:
+            inactive_records = list(app.get_inactive_compute_records(node))
+            assert len(inactive_records) == 1 + 1
+            compute_record = inactive_records[0]
+            assert compute_record.session_state.state_type == ComputeSessionStateType.COMPLETED, "Execution must be COMPLETED"
+
+        for node in [a, b]:
+            inactive_records = list(app.get_inactive_compute_records(node))
+            assert len(inactive_records) == 21 + 2
+            compute_record = inactive_records[0]
+            assert compute_record.session_state.state_type == ComputeSessionStateType.COMPLETED, "Execution must be COMPLETED"
+
+        inactive_records = list(app.get_inactive_compute_records(c))
+        assert len(inactive_records) == 7 + 2
+        compute_record = inactive_records[0]
+        assert compute_record.session_state.state_type == ComputeSessionStateType.COMPLETED, "Execution must be COMPLETED"
+
+        # 2- now update "a" and see if the entire tree will be updated
+        app.execute(
+            a[1][1]["2024-12-24"],
+            wait=False,
+            recursive=True,
+            update_dependency_tree=True,
+            concurrent_executor_pool=self.pool,
+        )
+
+        time.sleep(15)
+        app.update_active_routes_status()
+
+        # uncomment for debugging
+        # app.admin_console()
+
+        for node in [b_1, c_1, d, e]:
+            inactive_records = list(app.get_inactive_compute_records(node))
+            assert len(inactive_records) == 1 + 1 + (1 + 1)
+            compute_record = inactive_records[0]
+            assert compute_record.session_state.state_type == ComputeSessionStateType.COMPLETED, "Execution must be COMPLETED"
+
+        for node in [a, b]:
+            inactive_records = list(app.get_inactive_compute_records(node))
+            assert len(inactive_records) == 21 + 2 + (1)
+            compute_record = inactive_records[0]
+            assert compute_record.session_state.state_type == ComputeSessionStateType.COMPLETED, "Execution must be COMPLETED"
+
+        inactive_records = list(app.get_inactive_compute_records(c))
+        assert len(inactive_records) == 7 + 2 + (1)
+        compute_record = inactive_records[0]
+        assert compute_record.session_state.state_type == ComputeSessionStateType.COMPLETED, "Execution must be COMPLETED"
 
         self.patch_aws_stop()

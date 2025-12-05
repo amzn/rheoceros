@@ -53,7 +53,7 @@ from .core.signal_processing.dimension_constructs import (
     DimensionVariant,
     DimensionVariantMapFunc,
 )
-from .core.signal_processing.routing_runtime_constructs import Route, RouteID, RuntimeLinkNode
+from .core.signal_processing.routing_runtime_constructs import Route, RouteID, RouteRetention, RuntimeLinkNode
 from .utils.spark import SparkType
 
 logger = logging.getLogger(__name__)
@@ -386,6 +386,7 @@ class ApplicationExt(Application):
         time_dimension_id: str = "time",
         time_dimension_format: str = "%Y-%m-%d",
         time_dimension_granularity: DatetimeGranularity = None,
+        time_dimension_shift: Optional[int] = None,
         **kwargs,
     ) -> MarshalerNode:
         """Create new timer signal within this application. The signal can be bound to other Application APIs most
@@ -407,7 +408,7 @@ class ApplicationExt(Application):
         dimension of DATETIME type implicitly. Provide datetime 'granularity' of the dimension (e.g DatatimeGranularity.DAY)
         using this parameter. Partition granularity will be set as DatetimeGranularity.DAY implicitly if not defined by
         the user.
-        :param kwargs: user provided metadata (for purposes such as cataloguing, etc)
+        :param kwargs: User-provided metadata for customizing behavior, e.g: State=StateType.DISABLED to set EventBridge rule state.
         :return: A new MarshalerNode that encapsulates the timer in development time. Returned value can be used
         as an input to many other Application APIs in a convenient way. Most important of them is 'create_data'
         which can use MarshalerNode and its filtered version (FilteredView) as inputs.
@@ -416,6 +417,8 @@ class ApplicationExt(Application):
 
         if time_dimension_granularity:
             time_dim_params.update({DateVariant.GRANULARITY_PARAM: time_dimension_granularity.value})
+        if time_dimension_shift:
+            time_dim_params.update({DimensionVariant.RANGE_SHIFT_FIELD_ID: int(time_dimension_shift)})
         time_dim = AnyDate(time_dimension_id, time_dim_params)
         return self.create_timer(id, schedule_expression, time_dim, **kwargs)
 
@@ -641,7 +644,7 @@ class AWSApplication(ApplicationExt):
         pending_node_expiration_ttl_in_secs: int = None,
         auto_input_dim_linking_enabled=True,
         auto_output_dim_linking_enabled=True,
-        auto_backfilling_enabled=False,
+        output_retention: Optional[RouteRetention] = None,
         protocol: SignalIntegrityProtocol = InternalDataNode.DEFAULT_DATA_COMPLETION_PROTOCOL,
         **kwargs,
     ) -> MarshalerNode:
@@ -697,7 +700,8 @@ class AWSApplication(ApplicationExt):
         same 'dimensions'. Unique dimensions are still left unlinked.
         :param auto_output_dim_linking_enabled: Enables the convenience functionality to link output dimensions to any
         of the inputs based on the assumption of dimension name equality.
-        :param auto_backfilling_enabled: TODO
+        :param output_retention: Provide the policy that would determine how long an execution will be retained and/or
+        refreshed periodically. For each action, hooks can be provided.
         :param protocol: completition protocol for the output. default value if "_SUCCESS" file based pritimitive
         protocol (also used by Hadoop, etc).
         :param kwargs: Provide metadata. Format and content are up to the client and they are guaranteed to be preserved.
@@ -718,7 +722,7 @@ class AWSApplication(ApplicationExt):
             pending_node_expiration_ttl_in_secs,
             auto_input_dim_linking_enabled,
             auto_output_dim_linking_enabled,
-            auto_backfilling_enabled,
+            output_retention,
             protocol,
             is_update=False,
             **kwargs,
@@ -745,7 +749,7 @@ class AWSApplication(ApplicationExt):
         pending_node_expiration_ttl_in_secs: int = None,
         auto_input_dim_linking_enabled=True,
         auto_output_dim_linking_enabled=True,
-        auto_backfilling_enabled=False,
+        output_retention: Optional[RouteRetention] = None,
         protocol: SignalIntegrityProtocol = InternalDataNode.DEFAULT_DATA_COMPLETION_PROTOCOL,
         enforce_referential_integrity=True,
         **kwargs,
@@ -766,7 +770,7 @@ class AWSApplication(ApplicationExt):
             pending_node_expiration_ttl_in_secs,
             auto_input_dim_linking_enabled,
             auto_output_dim_linking_enabled,
-            auto_backfilling_enabled,
+            output_retention,
             protocol,
             enforce_referential_integrity,
             is_update=True,
@@ -794,7 +798,7 @@ class AWSApplication(ApplicationExt):
         pending_node_expiration_ttl_in_secs: int = None,
         auto_input_dim_linking_enabled=True,
         auto_output_dim_linking_enabled=True,
-        auto_backfilling_enabled=False,
+        output_retention: Optional[RouteRetention] = None,
         protocol: SignalIntegrityProtocol = InternalDataNode.DEFAULT_DATA_COMPLETION_PROTOCOL,
         enforce_referential_integrity=True,
         is_update=False,
@@ -887,7 +891,7 @@ class AWSApplication(ApplicationExt):
                 pending_node_expiration_ttl_in_secs,
                 auto_input_dim_linking_enabled,
                 auto_output_dim_linking_enabled,
-                auto_backfilling_enabled,
+                output_retention,
                 protocol,
                 **kwargs,
             )
@@ -904,7 +908,7 @@ class AWSApplication(ApplicationExt):
                 pending_node_expiration_ttl_in_secs,
                 auto_input_dim_linking_enabled,
                 auto_output_dim_linking_enabled,
-                auto_backfilling_enabled,
+                output_retention,
                 protocol,
                 enforce_referential_integrity,
                 **kwargs,
@@ -1026,6 +1030,7 @@ class AWSApplication(ApplicationExt):
         extra_compute_targets: Optional[Union[Sequence[ComputeDescriptor], str]] = None,
         execution_hook: RouteExecutionHook = None,
         pending_node_hook: RoutePendingNodeHook = None,
+        output_retention: RouteRetention = None,
         pending_node_expiration_ttl_in_secs: int = None,
         retry_count=0,
         **kwargs,
@@ -1066,6 +1071,7 @@ class AWSApplication(ApplicationExt):
             execution_hook=execution_hook,
             pending_node_hook=pending_node_hook,
             pending_node_expiration_ttl_in_secs=pending_node_expiration_ttl_in_secs,
+            output_retention=output_retention,
             # Sagemaker adds a folder before the model output file using the training job name
             # e.g s3://.../internal_data/data/{dim1}/.../{dimN}/IntelliFlow-TrainingJob-{UUID/output/model.tar.gz
             #   IntelliFlow-TrainingJob-{UUID/output/ is added as a prefix by SM
@@ -1162,8 +1168,8 @@ class EscapeExistingJobParams(dict):
 def python_module(
     module_path: str, external_library_paths: Optional[List[str]] = None, ignored_bundle_modules: Optional[List[str]] = None, **kwargs
 ) -> str:
-    import inspect
     import importlib
+    import inspect
 
     code_spec = importlib.util.find_spec(module_path)
     if not code_spec:
@@ -1206,10 +1212,11 @@ def scala_script(
 
 
 def sql_module(module_root: str, file_name: str) -> str:
-    import inspect
     import importlib
+    import inspect
     from importlib.resources import contents
-    from importlib.resources import path
+
+    from intelliflow.utils.compat import path
 
     code_spec = importlib.util.find_spec(module_root)
 

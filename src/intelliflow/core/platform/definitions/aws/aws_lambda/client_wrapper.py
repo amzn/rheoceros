@@ -40,6 +40,8 @@ def create_lambda_function(
     python_major_ver,
     python_minor_ver,
     dead_letter_target_arn: Optional[str] = None,
+    memory_size=1024,
+    timeout=900,
     **kwargs,
 ):
     """
@@ -60,8 +62,8 @@ def create_lambda_function(
     args = {
         "FunctionName": function_name,
         "Description": description,
-        "Timeout": 900,
-        "MemorySize": 512,
+        "Timeout": timeout,
+        "MemorySize": memory_size,
         "Runtime": "python{}.{}".format(python_major_ver, python_minor_ver),
         "Role": iam_role_arn,
         "Handler": handler_name,
@@ -129,6 +131,8 @@ def update_lambda_function_conf(
     python_major_ver,
     python_minor_ver,
     dead_letter_target_arn: Optional[str] = None,
+    memory_size=1024,
+    timeout=900,
     **kwargs,
 ):
     """
@@ -144,8 +148,8 @@ def update_lambda_function_conf(
     args = {
         "FunctionName": function_name,
         "Description": description,
-        "Timeout": 900,
-        "MemorySize": 512,
+        "Timeout": timeout,
+        "MemorySize": memory_size,
         "Runtime": "python{}.{}".format(python_major_ver, python_minor_ver),
         "Role": iam_role_arn,
         "Handler": handler_name,
@@ -224,16 +228,18 @@ def get_lambda_arn(lambda_client, function_name: str) -> Optional[str]:
     return lambda_detail["Configuration"]["FunctionArn"] if lambda_detail else None
 
 
-def add_permission(lambda_client, function_name, statement_id, action, principal, source_arn, source_account=None):
+def add_permission(lambda_client, function_name, statement_id, action, principal, source_arn=None, source_account=None):
     """https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/lambda.html#Lambda.Client.add_permission"""
 
     kwargs = {
         "FunctionName": function_name,
         "StatementId": statement_id,  # should be unique
         "Action": action,  # 'lambda:InvokeFunction'
-        "Principal": principal,  # 's3.amazonaws.com',
-        "SourceArn": source_arn,
+        "Principal": principal,  # 's3.amazonaws.com', IAM role arn
     }
+    if source_arn:
+        kwargs.update({"SourceArn": source_arn})
+
     if source_account:
         kwargs.update({"SourceAccount": source_account})
 

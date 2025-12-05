@@ -299,7 +299,7 @@ class TestAWSApplicationComputeTargets(AWSTestBase):
                     scala_script(
                         """ this won't get executed in this unit-test, so don't matter. """,
                         external_library_paths=[
-                            "s3://if-awsglue-adex-ml-230392972774-us-east-1/batch/DexmlBladeGlue-super.jar",
+                            "s3://IF-awsglue-adex-ml-230392972774-us-east-1/batch/DexmlBladeGlue-super.jar",
                             "s3://THIS_IS/A NEW LIBRARY PATH",
                         ],
                     ),
@@ -508,7 +508,7 @@ class TestAWSApplicationComputeTargets(AWSTestBase):
                 BatchCompute(
                     scala_script(
                         dummy_scala_code,
-                        external_library_paths=["s3://if-awsglue-adex-ml-230392972774-us-east-1/batch/DexmlBladeGlue-super.jar"],
+                        external_library_paths=["s3://IF-awsglue-adex-ml-230392972774-us-east-1/batch/DexmlBladeGlue-super.jar"],
                     ),
                     lang=Lang.SCALA,
                     GlueVersion="2.0",

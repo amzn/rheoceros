@@ -6,6 +6,7 @@
 #  - partition and migrate reusable parts of test.intelliflow.core.platform.test_commons here as mixins.
 import concurrent.futures
 import datetime
+import json
 import os
 import threading
 import time
@@ -116,6 +117,14 @@ class AWSTestBase:
     _real_emr_empty_bucket = emr_compute_driver.empty_bucket
     _real_emr_delete_bucket = emr_compute_driver.delete_bucket
     _real_emr_delete_instance_profile = emr_compute_driver.delete_instance_profile
+    # Redshift Serverless (imported for mocking)
+    from intelliflow.core.platform.definitions.aws.redshift.client_wrapper import RedshiftServerlessManager
+
+    _real_redshift_workgroup_exists = RedshiftServerlessManager.workgroup_exists
+    _real_redshift_namespace_exists = RedshiftServerlessManager.namespace_exists
+    _real_redshift_delete_workgroup = RedshiftServerlessManager.delete_workgroup
+    _real_redshift_delete_namespace = RedshiftServerlessManager.delete_namespace
+    _real_redshift_cleanup_security_group = RedshiftServerlessManager.cleanup_security_group
     _real_describe_sagemaker_transform_job = sagemaker_transform_job_compute_driver.describe_sagemaker_transform_job
     _real_start_batch_transform_job = sagemaker_transform_job_compute_driver.start_batch_transform_job
     _real_stop_batch_transform_job = sagemaker_transform_job_compute_driver.stop_batch_transform_job
@@ -124,6 +133,7 @@ class AWSTestBase:
     _real_get_s3_bucket = sagemaker_transform_job_compute_driver.get_s3_bucket
     _real_get_s3_bucket_name = sagemaker_transform_job_compute_driver.get_s3_bucket_name
     _real_get_objects_in_folder = sagemaker_transform_job_compute_driver.get_objects_in_folder
+
     #
     _real_auto_scaling_register_scalable_target = routing_driver.register_scalable_target
     _real_auto_scaling_deregister_scalable_target = routing_driver.deregister_scalable_target
@@ -189,6 +199,7 @@ class AWSTestBase:
         with mock_sns():
             yield boto3.client(service_name="sns", region_name=self.region)
 
+    #
     def patch_aws_start(
         self,
         emulate_lambda=False,
@@ -240,6 +251,10 @@ class AWSTestBase:
         self._processor_thread_mutex: threading.RLock = None
         self._processor_thread_running: bool = False
         self._cycle_time_in_secs: int = None
+
+        self._processor_retention_thread: threading.Thread = None
+        self._processor_retention_thread_running: bool = False
+        self._retention_cycle_time_in_secs: int = None
 
         self._routingtable_route_mutex_map: Dict[routing_runtime_constructs.RouteID, threading.RLock] = dict()
 
@@ -300,11 +315,41 @@ class AWSTestBase:
 
         self._processor_thread.start()
 
+    def activate_retention_engine(self, app: "Application", cycle_time_in_secs: int = 120):
+        if self._processor_retention_thread:
+            raise ValueError(f"Retention engine is already active for app: {app.id}!")
+
+        self._retention_cycle_time_in_secs = cycle_time_in_secs
+
+        def next_cycle(self, app):
+            while self._processor_retention_thread_running:
+                try:
+                    if (
+                        app.state == ApplicationState.ACTIVE
+                    ):  # so Application::pause and Application::resume can now be utilized during tests.
+
+                        app.platform.routing_table.check_retention()
+                        app.platform.routing_table.check_retention_refresh()
+
+                    time.sleep(self._retention_cycle_time_in_secs)
+                except:
+                    pass
+
+        self._processor_retention_thread = threading.Thread(target=next_cycle, args=(self, app))
+        self._processor_retention_thread_running = True
+
+        self._processor_retention_thread.start()
+
     def patch_aws_stop(self):
         if self._processor_thread:
             self._processor_thread_running = False
             self._processor_thread.join(timeout=self._cycle_time_in_secs)
             self._processor_thread = None
+
+        if self._processor_retention_thread:
+            self._processor_retention_thread_running = False
+            self._processor_retention_thread.join(timeout=self._retention_cycle_time_in_secs)
+            self._processor_retention_thread = None
 
         for service in self._aws_services:
             service.stop()
@@ -526,6 +571,30 @@ class AWSTestBase:
         emr_compute_driver.delete_bucket = MagicMock()
         emr_compute_driver.delete_instance_profile = MagicMock(side_effect=AWSTestBase._real_emr_delete_instance_profile)
 
+        # Mock Redshift Serverless operations that are not supported by moto
+        def mock_redshift_workgroup_exists(*args, **kwargs):
+            return False  # Assume workgroup doesn't exist to avoid cleanup calls
+
+        def mock_redshift_namespace_exists(*args, **kwargs):
+            return False  # Assume namespace doesn't exist to avoid cleanup calls
+
+        def mock_redshift_delete_workgroup(*args, **kwargs):
+            return  # No-op for tests
+
+        def mock_redshift_delete_namespace(*args, **kwargs):
+            return  # No-op for tests
+
+        def mock_redshift_cleanup_security_group(*args, **kwargs):
+            return  # No-op for tests
+
+        from intelliflow.core.platform.definitions.aws.redshift.client_wrapper import RedshiftServerlessManager
+
+        RedshiftServerlessManager.workgroup_exists = MagicMock(side_effect=mock_redshift_workgroup_exists)
+        RedshiftServerlessManager.namespace_exists = MagicMock(side_effect=mock_redshift_namespace_exists)
+        RedshiftServerlessManager.delete_workgroup = MagicMock(side_effect=mock_redshift_delete_workgroup)
+        RedshiftServerlessManager.delete_namespace = MagicMock(side_effect=mock_redshift_delete_namespace)
+        RedshiftServerlessManager.cleanup_security_group = MagicMock(side_effect=mock_redshift_cleanup_security_group)
+
     def _patch_emr_stop(self):
         emr_compute_driver.get_emr_step = AWSTestBase._real_emr_get_emr_step
         emr_compute_driver.describe_emr_cluster = AWSTestBase._real_emr_describe_emr_cluster
@@ -535,6 +604,15 @@ class AWSTestBase:
         emr_compute_driver.empty_bucket = AWSTestBase._real_emr_empty_bucket
         emr_compute_driver.delete_bucket = AWSTestBase._real_emr_delete_bucket
         emr_compute_driver.delete_instance_profile = AWSTestBase._real_emr_delete_instance_profile
+
+        # Restore Redshift Serverless operations
+        from intelliflow.core.platform.definitions.aws.redshift.client_wrapper import RedshiftServerlessManager
+
+        RedshiftServerlessManager.workgroup_exists = AWSTestBase._real_redshift_workgroup_exists
+        RedshiftServerlessManager.namespace_exists = AWSTestBase._real_redshift_namespace_exists
+        RedshiftServerlessManager.delete_workgroup = AWSTestBase._real_redshift_delete_workgroup
+        RedshiftServerlessManager.delete_namespace = AWSTestBase._real_redshift_delete_namespace
+        RedshiftServerlessManager.cleanup_security_group = AWSTestBase._real_redshift_cleanup_security_group
 
     def _patch_sagemaker_start(self):
         def mock_describe_sagemaker_transform_job(sagemaker_client, job_name):

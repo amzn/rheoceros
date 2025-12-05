@@ -157,7 +157,7 @@ class AWSSFNCompute(AWSConstructMixin, BatchCompute):
 
         # 2- process "input" with inputs', output's alias and dimensions
         inputs: Dict[str, Any] = BatchInputMap(materialized_inputs).create()
-        output: Dict[str, Any] = BatchOutput(materialized_output).create()
+        output: Dict[str, Any] = BatchOutput(materialized_output, route).create()
 
         input_json = json.dumps({"inputs": inputs, "output": output}, default=repr)
         api_params.update({"input": input_json})
@@ -467,7 +467,11 @@ class AWSSFNCompute(AWSConstructMixin, BatchCompute):
                     continue
 
                 sm_arn = self._build_sm_arn(self.region, self.account_id, self.get_platform().context_id, route.route_id, str(i))
-                exponential_retry(self._sfn.delete_state_machine, self.CLIENT_RETRYABLE_EXCEPTION_LIST, stateMachineArn=sm_arn)
+                exponential_retry(
+                    self._sfn.delete_state_machine,
+                    self.CLIENT_RETRYABLE_EXCEPTION_LIST.union({"AccessDeniedException"}),
+                    stateMachineArn=sm_arn,
+                )
 
     def check_update(self, prev_construct: "BaseConstruct") -> None:
         super().check_update(prev_construct)

@@ -10,6 +10,7 @@ import pytest
 import intelliflow.core.platform.drivers.processor.aws as processor_driver
 from intelliflow.api_ext import AnyDate
 from intelliflow.core.platform.definitions.aws.common import CommonParams
+from intelliflow.core.platform.definitions.aws.event_bridge.client_wrapper import StateType
 from intelliflow.core.platform.definitions.aws.s3.bucket_wrapper import create_bucket, get_policy
 from intelliflow.core.platform.definitions.common import ActivationParams
 from intelliflow.core.platform.development import AWSConfiguration, HostPlatform
@@ -146,6 +147,9 @@ class TestAWSLambdaProcessorBasic(AWSTestBase, DriverTestUtils):
             .build()
         )
 
+        # Prevent platform state loading to avoid MagicMock deserialization errors
+        mock_platform.should_load_constructs = lambda: False
+
         from collections import namedtuple
 
         TestRoutingTable = namedtuple("TestRoutingTable", ["is_synchronized"])
@@ -158,10 +162,10 @@ class TestAWSLambdaProcessorBasic(AWSTestBase, DriverTestUtils):
             mock_platform,
         )
 
-    def create_timer_signal(self, context_id):
+    def create_timer_signal(self, context_id, state: str = None):
         time_dim = AnyDate("time", {DateVariant.FORMAT_PARAM: "%Y-%m-%d", DateVariant.TIMEZONE_PARAM: "UTC"})
 
-        timer_source_access_spec = TimerSignalSourceAccessSpec("test_timer", "rate(1 day)", context_id)
+        timer_source_access_spec = TimerSignalSourceAccessSpec("test_timer", "rate(1 day)", context_id, State=state)
 
         spec: DimensionSpec = DimensionSpec()
         spec.add_dimension(Dimension(time_dim.name, time_dim.type, time_dim.params), None)
@@ -388,6 +392,26 @@ class TestAWSLambdaProcessorBasic(AWSTestBase, DriverTestUtils):
         mock_host_platform._context_id = context_id
         mock_processor.dev_init(mock_host_platform)
         mock_processor.activate()
+        test_timer_signal = self.create_timer_signal("test123_l_10", StateType.DISABLED)
+        num_add_permission_before = processor_driver.add_permission.call_count
+        mock_processor._process_internal_timers_signals({test_timer_signal}, {})
+        num_add_permission_after = processor_driver.add_permission.call_count
+        assert (num_add_permission_after - num_add_permission_before) == 1
+        response = events.list_targets_by_rule(Rule=test_timer_signal.resource_access_spec.timer_id)
+        assert response["Targets"][0]["Id"] == self.expected_lambda_name.format(context_id)
+        response = events.describe_rule(Name=test_timer_signal.resource_access_spec.timer_id)
+        assert response["State"] == StateType.DISABLED
+        self.patch_aws_stop()
+
+    def test_processor_process_new_timer_signal_successful_default_state(self):
+        context_id = "test123_l_10"
+        self.patch_aws_start()
+        self.setup_platform_and_params()
+        mock_processor, mock_host_platform = self.get_driver_and_platform()
+        events = self.params[CommonParams.BOTO_SESSION].client(service_name="events", region_name=self.region)
+        mock_host_platform._context_id = context_id
+        mock_processor.dev_init(mock_host_platform)
+        mock_processor.activate()
         test_timer_signal = self.create_timer_signal("test123_l_10")
         num_add_permission_before = processor_driver.add_permission.call_count
         mock_processor._process_internal_timers_signals({test_timer_signal}, {})
@@ -395,6 +419,8 @@ class TestAWSLambdaProcessorBasic(AWSTestBase, DriverTestUtils):
         assert (num_add_permission_after - num_add_permission_before) == 1
         response = events.list_targets_by_rule(Rule=test_timer_signal.resource_access_spec.timer_id)
         assert response["Targets"][0]["Id"] == self.expected_lambda_name.format(context_id)
+        response = events.describe_rule(Name=test_timer_signal.resource_access_spec.timer_id)
+        assert response["State"] == StateType.ENABLED
         self.patch_aws_stop()
 
     def test_processor_process_old_timer_signal_successful(self):

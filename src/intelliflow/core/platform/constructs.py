@@ -1,12 +1,14 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 import logging
 import time
 import traceback
 from abc import ABC, abstractmethod
 from datetime import datetime
 from enum import Enum
+from random import shuffle
 from typing import Any, ClassVar, Dict, Iterable, Iterator, List, NewType, Optional, Sequence, Set, Tuple, Type, Union, cast
 from uuid import uuid4
 
@@ -33,6 +35,7 @@ from intelliflow.core.platform.definitions.compute import (
 )
 from intelliflow.core.serialization import Serializable, loads
 from intelliflow.core.signal_processing import DimensionFilter, Signal, Slot
+from intelliflow.core.signal_processing.analysis import INTEGRITY_CHECKER_MAP
 from intelliflow.core.signal_processing.definitions.dimension_defs import Type as DimensionType
 from intelliflow.core.signal_processing.definitions.metric_alarm_defs import (
     METRIC_DIMENSION_SPEC,
@@ -43,7 +46,15 @@ from intelliflow.core.signal_processing.definitions.metric_alarm_defs import (
     MetricSubDimensionMapType,
     MetricValueCountPairData,
 )
-from intelliflow.core.signal_processing.routing_runtime_constructs import Route, RouteID, RoutingSession, current_timestamp_in_utc
+from intelliflow.core.signal_processing.routing_runtime_constructs import (
+    IRouteMetadataCondition,
+    IRouteRetentionCondition,
+    Route,
+    RouteID,
+    RouteMetadata,
+    RoutingSession,
+    current_timestamp_in_utc,
+)
 from intelliflow.core.signal_processing.signal import SignalDomainSpec, SignalLinkNode, SignalProvider, SignalType
 from intelliflow.core.signal_processing.signal_source import (
     METRIC_VISUALIZATION_PERIOD_HINT,
@@ -220,6 +231,9 @@ class ConstructSecurityConf(CoreData):
         self.processing = processing
 
 
+ConstructExternalEntityAuthConf = Dict[str, Set[ConstructPermission]]
+
+
 class _PendingConnRequest(CoreData):
     """Encapsulates devtime connection requests from other constructs"""
 
@@ -250,20 +264,22 @@ class BaseConstruct(Serializable, ABC):
         self._pending_internal_routes: Set[Route] = set()
         self._pending_internal_signals: Set[Signal] = set()
         self._pending_security_conf: ConstructSecurityConf = None
+        self._pending_external_entity_auth_conf: ConstructExternalEntityAuthConf = None
         self._processed_connection_requests: Set[_PendingConnRequest] = set()
         self._processed_external_signals: Set[Signal] = set()
         self._processed_internal_routes: Set[Route] = set()
         self._processed_internal_signals: Set[Signal] = set()
         self._processed_security_conf: ConstructSecurityConf = None
+        self._processed_external_entity_auth_conf: ConstructExternalEntityAuthConf = None
         self._terminated = False
 
     def _deserialized_init(self, params: ConstructParamsDict) -> None:
         self._params = params
-        # TODO remove after v1.0 release (temporary backwards compatibility)
-        if not getattr(self, "_pending_security_conf", None):
-            self._pending_security_conf: ConstructSecurityConf = None
-        if not getattr(self, "_processed_security_conf", None):
-            self._processed_security_conf: ConstructSecurityConf = None
+        # TODO remove (temporary backwards compatibility)
+        if not getattr(self, "_pending_external_entity_auth_conf", None):
+            self._pending_external_entity_auth_conf: ConstructExternalEntityAuthConf = None
+        if not getattr(self, "_processed_external_entity_auth_conf", None):
+            self._processed_external_entity_auth_conf: ConstructExternalEntityAuthConf = None
 
     def _serializable_copy_init(self, org_instance: "BaseConstruct") -> None:
         self._dev_platform: "DevelopmentPlatform" = None
@@ -521,6 +537,10 @@ class BaseConstruct(Serializable, ABC):
         if not self.terminated:
             self._process_security_conf(self._pending_security_conf, self._processed_security_conf)
 
+    def process_external_entity_auth_conf(self) -> None:
+        if not self.terminated:
+            self._process_external_entity_auth_conf(self._pending_external_entity_auth_conf, self._processed_external_entity_auth_conf)
+
     def process_downstream_connection(self, downstream_platform: "DevelopmentPlatform") -> UpstreamGrants:
         """Called by downstream platform to establish/update the connection"""
         return UpstreamGrants(set())
@@ -536,6 +556,7 @@ class BaseConstruct(Serializable, ABC):
         #  to facilitate rollback in construct impls, via a more transactional approach.
         # Or Versioning will be considered during each activation (this mechanism will be deprecated).
         self._revert_security_conf(self._pending_security_conf, self._processed_security_conf)
+        self._revert_external_entity_auth_conf(self._pending_external_entity_auth_conf, self._processed_external_entity_auth_conf)
         self._revert_construct_connections(self._pending_connection_requests, self._processed_connection_requests)
         self._revert_external(self._pending_external_signals, self._processed_external_signals)
         self._revert_internal(self._pending_internal_routes, self._processed_internal_routes)
@@ -562,11 +583,13 @@ class BaseConstruct(Serializable, ABC):
         self._processed_external_signals = prev_construct._processed_external_signals
         self._processed_internal_routes = prev_construct._processed_internal_routes
         self._processed_internal_signals = prev_construct._processed_internal_signals
-        # TODO remove after v1.0 release (temporary backwards compatibility)
-        if getattr(prev_construct, "_processed_security_conf", None):
-            self._processed_security_conf = prev_construct._processed_security_conf
+        self._processed_security_conf = prev_construct._processed_security_conf
+
+        # TODO remove (temporary backwards compatibility)
+        if getattr(prev_construct, "_processed_external_entity_auth_conf", None):
+            self._processed_external_entity_auth_conf = prev_construct._processed_external_entity_auth_conf
         else:
-            self._processed_security_conf: ConstructSecurityConf = None
+            self._processed_external_entity_auth_conf: ConstructExternalEntityAuthConf = None
 
     def hook_external(self, signals: List[Signal]) -> None:
         self._pending_external_signals.update(signals)
@@ -585,6 +608,13 @@ class BaseConstruct(Serializable, ABC):
     ) -> None:
         self._pending_security_conf = security_conf
 
+    def hook_external_entity_auth_conf(
+        self,
+        external_entity_auth_conf: ConstructExternalEntityAuthConf,
+        platform_entity_auth_conf: Dict[Type["BaseConstruct"], ConstructExternalEntityAuthConf],
+    ) -> None:
+        self._pending_external_entity_auth_conf = external_entity_auth_conf
+
     @abstractmethod
     def _process_external(self, new_signals: Set[Signal], current_signals: Set[Signal]) -> None: ...
 
@@ -601,6 +631,15 @@ class BaseConstruct(Serializable, ABC):
 
     @abstractmethod
     def _process_security_conf(self, new_security_conf: ConstructSecurityConf, current_security_conf: ConstructSecurityConf) -> None: ...
+
+    def _process_external_entity_auth_conf(
+        self, new_auth_conf: ConstructExternalEntityAuthConf, current_auth_conf: ConstructExternalEntityAuthConf
+    ) -> None:
+        if new_auth_conf:
+            raise NotImplementedError(
+                f"External entity authorization not implemented in {self.__class__.__name__!r}! "
+                f"Please choose another platform component to apply auth config: {new_auth_conf!r}"
+            )
 
     @abstractmethod
     def _revert_external(self, signals: Set[Signal], prev_signals: Set[Signal]) -> None: ...
@@ -619,6 +658,11 @@ class BaseConstruct(Serializable, ABC):
     @abstractmethod
     def _revert_security_conf(selfs, security_conf: ConstructSecurityConf, prev_security_conf: ConstructSecurityConf) -> None: ...
 
+    def _revert_external_entity_auth_conf(
+        selfs, auth_conf: ConstructExternalEntityAuthConf, prev_auth_conf: ConstructExternalEntityAuthConf
+    ) -> None:
+        pass
+
     def activation_completed(self) -> None:
         # now we can safely adapt the new state. whole app got into new configuration consistently.
         self._processed_connection_requests = self._pending_connection_requests
@@ -626,11 +670,13 @@ class BaseConstruct(Serializable, ABC):
         self._processed_internal_routes = self._pending_internal_routes
         self._processed_internal_signals = self._pending_internal_signals
         self._processed_security_conf = self._pending_security_conf
+        self._processed_external_entity_auth_conf = self._pending_external_entity_auth_conf
         self._pending_connection_requests = set()
         self._pending_external_signals = set()
         self._pending_internal_routes = set()
         self._pending_internal_signals = set()
         self._pending_security_conf = None
+        self._pending_external_entity_auth_conf = None
 
 
 class Storage(BaseConstruct, ABC):
@@ -688,6 +734,57 @@ class Storage(BaseConstruct, ABC):
         """returns (materialized full path ~ data) pairs"""
         ...
 
+    def _get_internal_metadata_path(self, internal_signal: Signal) -> str:
+        if internal_signal.resource_access_spec.source != SignalSourceType.INTERNAL:
+            internal_signal = self.map_materialized_signal(internal_signal)
+            if not internal_signal:
+                raise ValueError("Input signal is not internal!")
+
+        return internal_signal.get_materialized_resource_paths()[0]
+
+    def save_internal_metadata(
+        self,
+        internal_signal: Signal,
+        route_metadata: RouteMetadata,
+        metadata_file_name: str = InternalDatasetSignalSourceAccessSpec.METADATA_FILE,
+    ) -> None:
+        materialized_path = self._get_internal_metadata_path(internal_signal)
+        self.save(
+            json.dumps(route_metadata, indent=4, default=repr),
+            [InternalDatasetSignalSourceAccessSpec.METADATA_FOLDER, materialized_path.lstrip("/")],
+            metadata_file_name,
+        )
+
+    def load_internal_metadata(
+        self, internal_signal: Signal, metadata_file_name: str = InternalDatasetSignalSourceAccessSpec.METADATA_FILE
+    ) -> Optional[RouteMetadata]:
+        materialized_path = self._get_internal_metadata_path(internal_signal)
+        folders = [InternalDatasetSignalSourceAccessSpec.METADATA_FOLDER, materialized_path.lstrip("/")]
+        if self.check_object(folders, metadata_file_name):
+            return json.loads(self.load(folders, metadata_file_name))
+
+    def delete_internal_metadata(self, internal_signal: Signal) -> None:
+        materialized_path = self._get_internal_metadata_path(internal_signal)
+        folders = [InternalDatasetSignalSourceAccessSpec.METADATA_FOLDER, materialized_path.lstrip("/")]
+        self.delete(folders)
+
+    def scan_internal_metadata(
+        self, internal_signal: Signal, metadata_file_name: str = InternalDatasetSignalSourceAccessSpec.METADATA_FILE
+    ) -> Iterator[Tuple[str, RouteMetadata]]:
+        # append path delimiter so that other nodes using the input's alias as prefix won't be scanned (e.g ORDER, ORDER_ASIN_RANK)
+        path_root = (
+            InternalDatasetSignalSourceAccessSpec.create_path_format_root(internal_signal.alias)
+            + InternalDatasetSignalSourceAccessSpec.path_delimiter()
+        )
+        folders = [InternalDatasetSignalSourceAccessSpec.METADATA_FOLDER, path_root.lstrip("/")]
+        path_it = self.load_folder(folders)
+        for path, data in path_it:
+            if path.endswith(metadata_file_name):
+                internal_data_path = path.replace("/" + InternalDatasetSignalSourceAccessSpec.METADATA_FOLDER, "")
+                internal_data_path = internal_data_path.replace(metadata_file_name, "")
+                metadata = json.loads(data.decode("utf-8"))
+                yield (internal_data_path, metadata)
+
     @abstractmethod
     def load_internal(self, internal_signal: Signal, limit: int = None) -> Iterator[Tuple[str, bytes]]:
         """returns (materialized full path ~ data) pairs of all of the objects represented by this signal
@@ -697,8 +794,16 @@ class Storage(BaseConstruct, ABC):
         """
         ...
 
-    @abstractmethod
     def delete_internal(self, internal_signal: Signal, entire_domain: bool = True) -> bool:
+        if internal_signal.resource_access_spec.source != SignalSourceType.INTERNAL:
+            internal_signal = self.map_materialized_signal(internal_signal)
+            if not internal_signal:
+                raise ValueError("Input signal is not internal!")
+
+        return self._delete_internal(internal_signal, entire_domain)
+
+    @abstractmethod
+    def _delete_internal(self, internal_signal: Signal, entire_domain: bool = True) -> bool:
         """Deletes the internal data represented by this signal.
 
         If 'entire_domain' is True (by default), then internal data represented by the all possible dimension values
@@ -1021,7 +1126,7 @@ class CompositeBatchCompute(BatchCompute):
             )
 
             match: Tuple[DimensionFilter, BatchCompute] = None
-            for batch_compute in self._drivers:
+            for batch_compute in self._drivers + self._removed_drivers:
                 filtered_spec = batch_compute.driver_spec().chain(slot_filter)
                 if filtered_spec:
                     # max-algo to find the match with max spec params.
@@ -1118,8 +1223,11 @@ class CompositeBatchCompute(BatchCompute):
 
     def _get_driver(self, slot: Slot, driver_type: Optional[BatchCompute] = None) -> BatchCompute:
         if driver_type:
-            driver_index: int = self._drivers_priority_list.index(driver_type)
-            return self._drivers[driver_index]
+            # include "removed_drivers" to support cases where application is initiated with different parameters (relying
+            #  on default drivers list) but will never be activated or just wants to take some actions (execute, etc)
+            #  before activation. E.g as RemoteApplication
+            driver_index: int = (self._drivers_priority_list + [type(r) for r in self._removed_drivers]).index(driver_type)
+            return (self._drivers + self._removed_drivers)[driver_index]
 
         driver = self._find_batch_compute(slot)
         # Backwards compatibility: default to 0 when driver_type is not defined in an existing compute resource.
@@ -1267,6 +1375,11 @@ class CompositeBatchCompute(BatchCompute):
         for driver in self._drivers:
             driver.process_security_conf()
 
+    def process_external_entity_auth_conf(self) -> None:
+        super().process_external_entity_auth_conf()
+        for driver in self._drivers:
+            driver.process_external_entity_auth_conf()
+
     def process_downstream_connection(self, downstream_platform: "DevelopmentPlatform") -> UpstreamGrants:
         conf_grants: UpstreamGrants = super().process_downstream_connection(downstream_platform)
         for driver in self._drivers:
@@ -1338,6 +1451,15 @@ class CompositeBatchCompute(BatchCompute):
         for driver in self._drivers:
             driver.hook_security_conf(security_conf, platform_security_conf)
 
+    def hook_external_entity_auth_conf(
+        self,
+        external_entity_auth_conf: ConstructExternalEntityAuthConf,
+        platform_entity_auth_conf: Dict[Type["BaseConstruct"], ConstructExternalEntityAuthConf],
+    ) -> None:
+        super().hook_external_entity_auth_conf(external_entity_auth_conf, platform_entity_auth_conf)
+        for driver in self._drivers:
+            driver.hook_external_entity_auth_conf(external_entity_auth_conf, platform_entity_auth_conf)
+
     def _process_external(self, new_signals: Set[Signal], current_signals: Set[Signal]) -> None:
         pass
 
@@ -1355,6 +1477,11 @@ class CompositeBatchCompute(BatchCompute):
     def _process_security_conf(self, new_security_conf: ConstructSecurityConf, current_security_conf: ConstructSecurityConf) -> None:
         pass
 
+    def _process_external_entity_auth_conf(
+        self, new_auth_conf: ConstructExternalEntityAuthConf, current_auth_conf: ConstructExternalEntityAuthConf
+    ) -> None:
+        pass
+
     def _revert_external(self, signals: Set[Signal], prev_signals: Set[Signal]) -> None:
         pass
 
@@ -1370,6 +1497,11 @@ class CompositeBatchCompute(BatchCompute):
         pass
 
     def _revert_security_conf(self, security_conf: ConstructSecurityConf, prev_security_conf: ConstructSecurityConf) -> None:
+        pass
+
+    def _revert_external_entity_auth_conf(
+        self, auth_conf: ConstructExternalEntityAuthConf, prev_auth_conf: ConstructExternalEntityAuthConf
+    ) -> None:
         pass
 
     def activation_completed(self) -> None:
@@ -1560,8 +1692,6 @@ class Diagnostics(BaseConstruct, ABC):
         """
         if not for_emission:
             if len(metric_signal.get_materialized_resource_paths()) > 1:
-                import json
-
                 filter_spec_dump = json.dumps(
                     {
                         "dimensions": [
@@ -2073,6 +2203,11 @@ class CompositeExtension(BaseConstruct):
         for driver in self._get_extensions():
             driver.process_security_conf()
 
+    def process_external_entity_auth_conf(self) -> None:
+        super().process_external_entity_auth_conf()
+        for driver in self._get_extensions():
+            driver.process_external_entity_auth_conf()
+
     def process_downstream_connection(self, downstream_platform: "DevelopmentPlatform") -> UpstreamGrants:
         conf_grants: UpstreamGrants = super().process_downstream_connection(downstream_platform)
         for driver in self._get_extensions():
@@ -2112,6 +2247,15 @@ class CompositeExtension(BaseConstruct):
         for driver in self._get_extensions():
             driver.hook_security_conf(security_conf, platform_security_conf)
 
+    def hook_external_entity_auth_conf(
+        self,
+        external_entity_auth_conf: ConstructExternalEntityAuthConf,
+        platform_entity_auth_conf: Dict[Type["BaseConstruct"], ConstructExternalEntityAuthConf],
+    ) -> None:
+        super().hook_external_entity_auth_conf(external_entity_auth_conf, platform_entity_auth_conf)
+        for driver in self._get_extensions():
+            driver.hook_external_entity_auth_conf(external_entity_auth_conf, platform_entity_auth_conf)
+
     def _process_external(self, new_signals: Set[Signal], current_signals: Set[Signal]) -> None:
         for driver in self._get_extensions():
             driver._process_external(new_signals, current_signals)
@@ -2133,6 +2277,12 @@ class CompositeExtension(BaseConstruct):
     def _process_security_conf(self, new_security_conf: ConstructSecurityConf, current_security_conf: ConstructSecurityConf) -> None:
         for driver in self._get_extensions():
             driver._process_security_conf(new_security_conf, current_security_conf)
+
+    def _process_external_entity_auth_conf(
+        self, new_auth_conf: ConstructExternalEntityAuthConf, current_auth_conf: ConstructExternalEntityAuthConf
+    ) -> None:
+        for driver in self._get_extensions():
+            driver._process_external_entity_auth_conf(new_auth_conf, current_auth_conf)
 
     def _revert_external(self, signals: Set[Signal], prev_signals: Set[Signal]) -> None:
         for driver in self._get_extensions():
@@ -2156,6 +2306,12 @@ class CompositeExtension(BaseConstruct):
         for driver in self._get_extensions():
             driver._revert_security_conf(security_conf, prev_security_conf)
 
+    def _revert_external_entity_auth_conf(
+        self, auth_conf: ConstructExternalEntityAuthConf, prev_auth_conf: ConstructExternalEntityAuthConf
+    ) -> None:
+        for driver in self._get_extensions():
+            driver._revert_external_entity_auth_conf(auth_conf, prev_auth_conf)
+
     def activation_completed(self) -> None:
         super().activation_completed()
         for driver in self._get_extensions():
@@ -2164,11 +2320,17 @@ class CompositeExtension(BaseConstruct):
 
 FEEDBACK_SIGNAL_TYPE_EVENT_KEY: str = "if_internal_feedback_signal"
 FEEDBACK_SIGNAL_PROCESSING_MODE_KEY: str = "if_internal_feedback_signal_process_mode"
+FEEDBACK_SIGNAL_TYPE = "if_internal_feedback_signal_type"
 
 
 class FeedBackSignalProcessingMode(str, Enum):
     FULL_DOMAIN = "FULL_DOMAIN"
     ONLY_HEAD = "ONLY_HEAD"
+
+
+class FeedBackSignalType(str, Enum):
+    NORMAL = "NORMAL"
+    RETENTION_DELETION_REQUEST = "RETENTION_DELETION_REQUEST"
 
 
 ProcessorEvent = Dict[str, Any]
@@ -2230,6 +2392,7 @@ class ProcessorQueue(BaseConstruct, ABC):
 
 SIGNAL_TARGET_ROUTE_ID_KEY: str = "if_signal_target_route_id"
 SIGNAL_IS_BLOCKED_KEY: str = "if_signal_is_blocked"
+SIGNAL_TRANSFORM: str = "if_signal_transform"
 
 
 class ProcessingUnit(BaseConstruct, ABC):
@@ -2256,6 +2419,7 @@ class ProcessingUnit(BaseConstruct, ABC):
         is_async=True,
         filter=False,
         is_blocked=False,
+        transform=True,
     ) -> Optional[List["RoutingTable.Response"]]:
         """Injects a new signal or raw event into the system.
 
@@ -2438,6 +2602,23 @@ class RoutingHookInterface:
                 **params,
             ) -> None: ...
 
+        class IExecutionMetadataCondition(IRouteMetadataCondition):
+            @abstractmethod
+            def __call__(self, route_metadata: RouteMetadata) -> bool: ...
+
+        class IExecutionMetadataHook:
+            @abstractmethod
+            def __call__(
+                self,
+                routing_table: "RoutingTable",
+                route_record: "RoutingTable.RouteRecord",
+                execution_context_id: str,
+                materialized_inputs: List[Signal],
+                materialized_output: Signal,
+                current_timestamp_in_utc: int,
+                **params,
+            ) -> None: ...
+
     class PendingNode:
         class IPendingNodeCreationHook:
             @abstractmethod
@@ -2472,6 +2653,33 @@ class RoutingHookInterface:
                 current_timestamp_in_utc: int,
                 **params,
             ): ...
+
+    class Retention:
+        class IRetentionCondition(IRouteRetentionCondition):
+            @abstractmethod
+            def __call__(self, dimensions: Dict[str, any]) -> bool: ...
+
+        class IRetentionRIPHook:
+            @abstractmethod
+            def __call__(
+                self,
+                routing_table: "RoutingTable",
+                route_record: "RoutingTable.RouteRecord",
+                materialized_output: Signal,
+                current_timestamp_in_utc: int,
+                **params,
+            ) -> None: ...
+
+        class IRetentionRefreshHook:
+            @abstractmethod
+            def __call__(
+                self,
+                routing_table: "RoutingTable",
+                route_record: "RoutingTable.RouteRecord",
+                materialized_output: Signal,
+                current_timestamp_in_utc: int,
+                **params,
+            ) -> None: ...
 
 
 class RoutingTable(BaseConstruct, ABC):
@@ -2511,11 +2719,13 @@ class RoutingTable(BaseConstruct, ABC):
         def add(self, route: Route):
             self._index.append(route)
 
-        def find(self, signal_type: SignalType, source_type: SignalSourceType, resource_path: str) -> Dict[Route, Signal]:
+        def find(
+            self, signal_type: SignalType, source_type: SignalSourceType, resource_path: str, transform_source: bool = False
+        ) -> Dict[Route, Signal]:
             matches: Dict[Route, Signal] = dict()
             for route in self._index:
                 for signal in route.link_node.signals:
-                    matching_signal: Signal = signal.create(signal_type, source_type, resource_path)
+                    matching_signal: Signal = signal.create(signal_type, source_type, resource_path, transform_source=transform_source)
                     if matching_signal:
                         matches[route] = matching_signal
                         # move to next Route
@@ -2843,11 +3053,12 @@ class RoutingTable(BaseConstruct, ABC):
                             # state of the route (pending nodes, active computes, etc). It is time to reset.
                             # trade-off: currently active computes and pending nodes (dependency check, etc) will be
                             # orphaned. Real damage is to 'pending nodes' actually, since that data is kind of lost.
+                            current_pending_executions = None
                             try:
                                 logger.warning(
                                     f"Integrity change detected in route {new.route_id!r}! Its existing"
                                     f" active compute records (if any) will be tombstoned as inactive and also"
-                                    f" its pending execution candidates (if any) will be deleted."
+                                    f" its pending execution candidates (if any) will be updated."
                                 )
                                 logger.critical(
                                     f"Retaining lock on route {current.route_id!r} (max wait time={RoutingTable.DEFAULT_LOCK_DURATION_IN_SECS!r})..."
@@ -2863,6 +3074,7 @@ class RoutingTable(BaseConstruct, ABC):
                                 # we won't track them anymore, move them to historical db
                                 route_record = self._load(current.route_id)
                                 if route_record:
+                                    current_pending_executions = route_record.route.pending_nodes
                                     if route_record.active_compute_records:
                                         logger.warning(
                                             f"Moving {len(route_record.active_compute_records)} active "
@@ -2891,6 +3103,29 @@ class RoutingTable(BaseConstruct, ABC):
                                 # next time a signal hits the same route from RoutingIndex, it will be loaded with
                                 # the up-to-date version.
                                 self._delete({current})
+
+                                # update pending nodes (only previously received signals)
+                                if current_pending_executions:
+                                    logger.warning(f"Updating pending executions of modified active route {new.route_id!r}...")
+                                    new_route_record = RoutingTable.RouteRecord(new.clone())
+                                    # redrive previously ingested signals
+                                    for pending_node in current_pending_executions:
+                                        for received_signal in pending_node.ready_signals:
+                                            if not received_signal.is_dependent:
+                                                # we won't want executions to start or do implicit range/completion
+                                                # analysis during activation. leave it to the next engine cycle.
+                                                # example case where execution might happen: a previously blocking input
+                                                # might be removed in the new version.
+                                                new_route_record.route.receive(received_signal, self.get_platform(), defer_response=True)
+
+                                    # transfer range_check and blocked states
+                                    for pending_node in new_route_record.route.pending_nodes:
+                                        pending_node.transfer_ranges(current_pending_executions)
+
+                                    self._save(new_route_record)
+
+                                    logger.warning(f"Pending executions all updated for route: {new.route_id!r}.")
+
                                 self._release(current.route_id)
                         elif not current.check_auxiliary_data_integrity(new):
                             # intentionally separating the logic from integrity check above to avoid complexity,
@@ -2932,6 +3167,11 @@ class RoutingTable(BaseConstruct, ABC):
                 id="routing_table.receive", metric_names=["RouteHit", "RouteDeferred", "RouteLoadError", "RouteSaveError"]
             ),
             ConstructInternalMetricDesc(
+                id="routing_table.receive.execution.compute",
+                metric_names=["TotalDurationInSecs"],
+                metadata={METRIC_VISUALIZATION_PERIOD_HINT: MetricPeriod.ONE_MIN, METRIC_VISUALIZATION_STAT_HINT: MetricStatistic.MAXIMUM},
+            ),
+            ConstructInternalMetricDesc(
                 id="routing_table.receive.hook",
                 metric_names=[
                     hook_type.__name__
@@ -2944,6 +3184,7 @@ class RoutingTable(BaseConstruct, ABC):
                         RoutingHookInterface.Execution.IComputeSuccessHook,
                         RoutingHookInterface.Execution.IComputeRetryHook,
                         RoutingHookInterface.Execution.IExecutionCheckpointHook,
+                        RoutingHookInterface.Execution.IExecutionMetadataHook,
                         RoutingHookInterface.PendingNode.IPendingNodeCreationHook,
                         RoutingHookInterface.PendingNode.IPendingNodeExpirationHook,
                         RoutingHookInterface.PendingNode.IPendingCheckpointHook,
@@ -2963,9 +3204,34 @@ class RoutingTable(BaseConstruct, ABC):
                         RoutingHookInterface.Execution.IComputeSuccessHook,
                         RoutingHookInterface.Execution.IComputeRetryHook,
                         RoutingHookInterface.Execution.IExecutionCheckpointHook,
+                        RoutingHookInterface.Execution.IExecutionMetadataHook,
                         RoutingHookInterface.PendingNode.IPendingNodeCreationHook,
                         RoutingHookInterface.PendingNode.IPendingNodeExpirationHook,
                         RoutingHookInterface.PendingNode.IPendingCheckpointHook,
+                    ]
+                ],
+                metadata={METRIC_VISUALIZATION_PERIOD_HINT: MetricPeriod.ONE_MIN, METRIC_VISUALIZATION_STAT_HINT: MetricStatistic.MAXIMUM},
+            ),
+            ConstructInternalMetricDesc(
+                id="routing_table.retention", metric_names=["RouteRetentionCheckError", "RouteRetentionRefreshCheckError"]
+            ),
+            ConstructInternalMetricDesc(
+                id="routing_table.retention.hook",
+                metric_names=[
+                    hook_type.__name__
+                    for hook_type in [
+                        RoutingHookInterface.Retention.IRetentionRIPHook,
+                        RoutingHookInterface.Retention.IRetentionRefreshHook,
+                    ]
+                ],
+            ),
+            ConstructInternalMetricDesc(
+                id="routing_table.retention.hook.time_in_utc",
+                metric_names=[
+                    hook_type.__name__
+                    for hook_type in [
+                        RoutingHookInterface.Retention.IRetentionRIPHook,
+                        RoutingHookInterface.Retention.IRetentionRefreshHook,
                     ]
                 ],
                 metadata={METRIC_VISUALIZATION_PERIOD_HINT: MetricPeriod.ONE_MIN, METRIC_VISUALIZATION_STAT_HINT: MetricStatistic.MAXIMUM},
@@ -2999,9 +3265,23 @@ class RoutingTable(BaseConstruct, ABC):
                         RoutingHookInterface.Execution.IExecutionBeginHook,
                         RoutingHookInterface.Execution.IExecutionSuccessHook,
                         RoutingHookInterface.Execution.IExecutionFailureHook,
+                        RoutingHookInterface.Execution.IExecutionMetadataHook,
                         RoutingHookInterface.Execution.IComputeFailureHook,
                         RoutingHookInterface.Execution.IComputeSuccessHook,
                         RoutingHookInterface.Execution.IComputeRetryHook,
+                    ]
+                ],
+            ),
+            ConstructInternalMetricDesc(
+                id="routing_table.retention", metric_names=["RouteRetentionCheckError", "RouteRetentionRefreshCheckError"]
+            ),
+            ConstructInternalMetricDesc(
+                id="routing_table.retention.hook",
+                metric_names=[
+                    hook_type.__name__
+                    for hook_type in [
+                        RoutingHookInterface.Retention.IRetentionRIPHook,
+                        RoutingHookInterface.Retention.IRetentionRefreshHook,
                     ]
                 ],
             ),
@@ -3019,6 +3299,7 @@ class RoutingTable(BaseConstruct, ABC):
         filter_only=False,
         routing_session: RoutingSession = RoutingSession(),
         is_blocked: bool = False,
+        transform: bool = False,
     ) -> "RoutingTable.Response":
         """RheocerOS routing core that relies on persistence/synchronization methods from
         RoutingTable impls.
@@ -3080,7 +3361,9 @@ class RoutingTable(BaseConstruct, ABC):
         #
         # find matching / eligible [Route, Signal] pairs
         # TODO add comment on why 1 Signal retrieval is enough for 1 Route.
-        route_and_signal_map = self._route_index.find(signal_type, data_access_spec.source, data_access_spec.path_format)
+        route_and_signal_map = self._route_index.find(
+            signal_type, data_access_spec.source, data_access_spec.path_format, transform_source=transform
+        )
         if filter_only:
             for route, _ in route_and_signal_map.items():
                 if not target_route_id or route.route_id == target_route_id:
@@ -3190,10 +3473,10 @@ class RoutingTable(BaseConstruct, ABC):
             else:
                 materialized_output = execution_context.output
 
-            # TODO check node.is_idempotent
-            if route_record.has_active_record_for(materialized_output):
-                # skip the whole execution if we have an active record from previous executions,
-                # working on the same output.
+            if route_record.has_active_record_for(materialized_output) or not self.check_output_retention(materialized_output, route):
+                # skip the whole execution if:
+                # - we have an active record from previous executions, working on the same output.
+                # - or retention mechanism rejects it
                 self._execute_init_hook(
                     route.execution_hook.on_exec_skipped,
                     route_record,
@@ -3223,6 +3506,15 @@ class RoutingTable(BaseConstruct, ABC):
                             #  - create locals variables (ask impls to provide locals and inject them), i.e embedded ABI
                             #  For now, assuming Python inlined (with no requirement from the env)
                             compute_response, compute_session_state = self._execute_inlined(materialized_inputs, slot, materialized_output)
+                            compute_response, compute_session_state = self._execute_metadata_actions(
+                                compute_response,
+                                compute_session_state,
+                                compute_candidate,
+                                route_record,
+                                execution_context.id,
+                                materialized_inputs,
+                                materialized_output,
+                            )
                             compute_candidate.state = compute_response
                             compute_candidate.session_state = compute_session_state
                             # check if retryable failure, in all other cases terminate the execution.
@@ -3298,6 +3590,15 @@ class RoutingTable(BaseConstruct, ABC):
                                     )
 
                                 compute_candidate.session_state = internal_session_state
+                                compute_candidate.state, compute_candidate.session_state = self._execute_metadata_actions(
+                                    compute_candidate.state,
+                                    compute_candidate.session_state,
+                                    compute_candidate,
+                                    route_record,
+                                    execution_context.id,
+                                    materialized_inputs,
+                                    materialized_output,
+                                )
                                 # following statement added for testing support (to facilitate tests actually)
                                 if internal_session_state.state_type == ComputeSessionStateType.COMPLETED:
                                     compute_candidate.deactivated_timestamp_utc = self._current_timestamp_in_utc()
@@ -3375,6 +3676,275 @@ class RoutingTable(BaseConstruct, ABC):
                         completion_hook, route_record, execution_context.id, materialized_inputs, materialized_output, hook_type
                     )
                     route_record.remove_execution_context(execution_context.id)
+
+    def check_retention(self, routing_session: RoutingSession = RoutingSession()) -> None:
+        """Periodical check triggered by ProcessingUnit
+
+        Go over all retention check enabled Routes
+        """
+        logger.critical("Retention check begin...")
+        # keep track of ongoing retention check session to prevent starvation on some routes when routing session is not
+        # enough to visit all routes. in the following cycles remaining routes will eventually be checked as well.
+        retention_folder: str = "retention_data"
+        retention_state_file: str = "_retention_check_state.json"
+        retention_state = {}
+        if self.get_platform().storage.check_object([retention_folder], retention_state_file):
+            retention_state = json.loads(self.get_platform().storage.load([retention_folder], retention_state_file))
+
+        randomized_routes = list(self._route_index.get_all_routes())
+        shuffle(randomized_routes)
+        for route in randomized_routes:
+            if routing_session.is_expired():
+                logger.critical("Retention check end due to routing session expiration...")
+                return
+            if route.route_id not in retention_state:
+                self.check_route_retention(route, routing_session)
+                retention_state.update({route.route_id: True})
+                self.get_platform().storage.save(
+                    json.dumps(retention_state, indent=2, default=repr), [retention_folder], retention_state_file
+                )
+
+        # reset if all routes complete
+        self.get_platform().storage.save(json.dumps({}), [retention_folder], retention_state_file)
+
+    def check_route_retention(self, route: Route, routing_session: RoutingSession) -> None:
+        try:
+            route_id = route.route_id
+
+            if not route.output_retention or not route.output_retention.condition:
+                return
+
+            for path, metadata in self.get_platform().storage.scan_internal_metadata(
+                route.output, InternalDatasetSignalSourceAccessSpec.EXECUTION_METADATA_FILE
+            ):
+                if routing_session.is_expired():
+                    break
+                # e.g
+                # path -> s3://.../internal_data/dim1/.../dimN/
+                # metadata -> {'trigger_timestamp_in_utc': 12312, ...}"
+
+                matching_materialized_signal: Optional[Signal] = self._create_retention_output_signal(route, path)
+                if not matching_materialized_signal:
+                    # incompatible signal! metadata is not compatible with the new version of the signal
+                    # TODO nuke everything related to this path
+                    # - kill ongoing execution if any (has_active_records_on)
+                    # - delete internal data
+                    # - self.get_platform().storage.delete_zombie_metadata(path)
+                    pass
+                elif not self.check_output_retention(matching_materialized_signal, route):
+                    deletion_req_event = {
+                        FEEDBACK_SIGNAL_TYPE: FeedBackSignalType.RETENTION_DELETION_REQUEST.value,
+                        FEEDBACK_SIGNAL_TYPE_EVENT_KEY: matching_materialized_signal.serialize(),
+                        FEEDBACK_SIGNAL_PROCESSING_MODE_KEY: FeedBackSignalProcessingMode.ONLY_HEAD.value,
+                    }
+                    self.get_platform().processor.process(
+                        deletion_req_event, use_activated_instance=True, target_route_id=route.route_id, is_async=True
+                    )
+        except Exception as err:
+            logger.critical(
+                f"Encountered error: '{str(err)}',  while checking the status of route: {route_id!r}"
+                f" stack trace: {traceback.format_exc()}"
+            )
+            self.metric("routing_table.retention")["RouteRetentionCheckError"].emit(1)
+            self.metric("routing_table.retention", route=route)["RouteRetentionCheckError"].emit(1)
+
+    def check_output_retention(self, materialized_output: Signal, route: Route) -> bool:
+        """Run retention rules on the dimension values of the output"""
+        if route.output_retention and route.output_retention.condition:
+            materialized_output.tip().dimension_values_map()
+            # for retention condition check we provide dimension values as raw (not string as in other computes)
+            dimension_map = create_output_dimension_map(materialized_output, raw_value=True)
+            return route.output_retention.condition(dimension_map)
+        return True
+
+    def handle_retention_deletion_request(self, materialized_output: Signal, route_id: RouteID):
+        # at this point, there won't be new executoins on the same partition (check_output_retention should return False)
+        # but we might have something that has started befroe the retention engine sends this request.
+        # so check active exexecutions on the same partition, kill it. this action is non-blocking and can only cause
+        # a slight delay.
+        # self.kill(route_id, materialized_output)
+
+        self.get_platform().storage.delete_internal(materialized_output, entire_domain=False)
+        self.get_platform().storage.delete_internal_metadata(materialized_output)
+
+        if route_id:
+            route: Optional[Route] = self._route_index.get_route(route_id)
+            if route:  # it is technically possible that route might have been removed from the app (race)
+                if route.output_retention:  # it is possible that route might not have the retention policy anymore (race)
+                    route_record = self._load(route_id)
+                    self._execute_retention_hook(
+                        route.output_retention.rip_slot, route_record, materialized_output, RoutingHookInterface.Retention.IRetentionRIPHook
+                    )
+
+    def check_retention_refresh(self, routing_session: RoutingSession = RoutingSession()) -> None:
+        """Periodical check triggered by ProcessingUnit
+
+        Find the past executions that need to be re-run.
+        """
+        logger.critical("Retention refresh check begin...")
+        # keep track of ongoing retention check session to prevent starvation on some routes when routing session is not
+        # enough to visit all routes. in the following cycles remaining routes will eventually be checked as well.
+        retention_folder: str = "retention_data"
+        retention_state_file: str = "_retention_refresh_check_state.json"
+        retention_state = {}
+        if self.get_platform().storage.check_object([retention_folder], retention_state_file):
+            retention_state = json.loads(self.get_platform().storage.load([retention_folder], retention_state_file))
+
+        randomized_routes = list(self._route_index.get_all_routes())
+        shuffle(randomized_routes)
+        for route in randomized_routes:
+            if routing_session.is_expired():
+                logger.critical("Retention refresh check end due to routing session expiration...")
+                return
+            if route.route_id not in retention_state:
+                self.check_route_retention_refresh(route, routing_session)
+                retention_state.update({route.route_id: True})
+                self.get_platform().storage.save(
+                    json.dumps(retention_state, indent=2, default=repr), [retention_folder], retention_state_file
+                )
+
+        # reset if all routes complete
+        self.get_platform().storage.save(json.dumps({}), [retention_folder], retention_state_file)
+
+    def check_route_retention_refresh(self, route: Route, routing_session: RoutingSession) -> None:
+        try:
+            route_id = route.route_id
+            if not route.output_retention or not route.output_retention.refresh_period_in_secs:
+                return
+
+            for path, metadata in self.get_platform().storage.scan_internal_metadata(
+                route.output, InternalDatasetSignalSourceAccessSpec.EXECUTION_METADATA_FILE
+            ):
+                if routing_session.is_expired():
+                    break
+                # e.g
+                # path -> s3://.../internal_data/dim1/.../dimN/
+                # metadata -> {'trigger_timestamp_in_utc': 12312, ...}"
+
+                # backwards compatibility
+                if not metadata or (
+                    "trigger_timestamp_utc" not in metadata
+                    or "deactivated_timestamp_utc" not in metadata
+                    or "compute_session_state_type" not in metadata
+                ):
+                    continue
+
+                now = self._current_timestamp_in_utc()
+                deactivated_timestamp_utc = int(metadata["deactivated_timestamp_utc"])
+                if now < (deactivated_timestamp_utc + route.output_retention.refresh_period_in_secs):
+                    # not stale yet
+                    continue
+
+                # refresh begin
+                matching_materialized_signal: Optional[Signal] = self._create_retention_output_signal(route, path)
+                if not matching_materialized_signal:
+                    # incompatible signal! metadata is not compatible with the new version of the signal
+                    # TODO nuke everything related to this path
+                    # - kill ongoing execution if any (has_active_records_on)
+                    # - delete internal data
+                    # - self.get_platform().storage.delete_zombie_metadata(path)
+                    continue
+
+                compute_session_state_type = metadata["compute_session_state_type"]
+                if compute_session_state_type == ComputeSessionStateType.FAILED:
+                    # send delete req (similar to end of retention req)
+                    deletion_req_event = {
+                        FEEDBACK_SIGNAL_TYPE: FeedBackSignalType.RETENTION_DELETION_REQUEST.value,
+                        FEEDBACK_SIGNAL_TYPE_EVENT_KEY: matching_materialized_signal.serialize(),
+                        FEEDBACK_SIGNAL_PROCESSING_MODE_KEY: FeedBackSignalProcessingMode.ONLY_HEAD.value,
+                    }
+                    self.get_platform().processor.process(
+                        deletion_req_event, use_activated_instance=True, target_route_id=route.route_id, is_async=True
+                    )
+                elif compute_session_state_type != ComputeSessionStateType.COMPLETED:
+                    continue  # not actionable (should not be possible)
+
+                # Request for re-execution
+                # find the actual (historical) compute record that created this output
+                trigger_timestamp_utc = int(metadata["trigger_timestamp_utc"])
+                trigger_range = (trigger_timestamp_utc - 60, trigger_timestamp_utc + 60)
+                inactive_record = self.load_inactive_compute_record(
+                    route_id,
+                    matching_materialized_signal,
+                    trigger_range=trigger_range,
+                    session_state=ComputeSessionStateType.COMPLETED,
+                )
+                if not inactive_record:
+                    continue
+
+                # Dependency check (inputs must be refreshed first)
+                # - check if inputs have refreshed within this cycle
+                inputs_satisfied = True
+                materialized_inputs = inactive_record.materialized_inputs
+                for materialized_input in materialized_inputs:
+                    internal_signal = self.get_platform().storage.map_materialized_signal(materialized_input)
+                    if not internal_signal:
+                        continue  # no need to check for refresh dependency
+
+                    # find input route and see if retention refresh check is REQUIRED
+                    input_route_id = internal_signal.resource_access_spec.route_id
+                    input_route = self._route_index.get_route(input_route_id)
+                    if not input_route.output_retention or not input_route.output_retention.refresh_period_in_secs:
+                        continue
+
+                    input_metadata = self.get_platform().storage.load_internal_metadata(
+                        internal_signal, InternalDatasetSignalSourceAccessSpec.EXECUTION_METADATA_FILE
+                    )
+                    if not input_metadata:
+                        inputs_satisfied = False
+                        continue
+
+                    # backwards compatibility
+                    if not input_metadata or (
+                        "trigger_timestamp_utc" not in input_metadata
+                        or "deactivated_timestamp_utc" not in input_metadata
+                        or "compute_session_state_type" not in input_metadata
+                    ):
+                        continue
+
+                    deactivated_timestamp_utc = int(input_metadata["deactivated_timestamp_utc"])
+                    if now > (deactivated_timestamp_utc + input_route.output_retention.refresh_period_in_secs):
+                        # this input needs to be refreshed first. defer this rerun request.
+                        inputs_satisfied = False
+                        break
+
+                if inputs_satisfied:
+                    # execute!
+                    for materialized_input in materialized_inputs:
+                        self.get_platform().processor.process(
+                            materialized_input, use_activated_instance=True, target_route_id=route.route_id, is_async=True
+                        )
+                    route_record = self._load(route_id)
+                    self._execute_retention_hook(
+                        route.output_retention.refresh_slot,
+                        route_record,
+                        matching_materialized_signal,
+                        RoutingHookInterface.Retention.IRetentionRefreshHook,
+                    )
+        except Exception as err:
+            logger.critical(
+                f"Encountered error: '{str(err)}',  while checking the status of route: {route_id!r}"
+                f" stack trace: {traceback.format_exc()}"
+            )
+            self.metric("routing_table.retention")["RouteRetentionRefreshCheckError"].emit(1)
+            self.metric("routing_table.retention", route=route)["RouteRetentionRefreshCheckError"].emit(1)
+
+    def _create_retention_output_signal(self, route: Route, path: str) -> Optional[Signal]:
+        output_in_external_form: Signal = self.get_platform().storage.map_internal_signal(route.output)
+        # finalize the path
+        resource_path = path.rstrip(output_in_external_form.resource_access_spec.path_delimiter())
+        if output_in_external_form.resource_access_spec.path_format_requires_resource_name():
+            required_resource_name = "_resource"
+            if output_in_external_form.domain_spec.integrity_check_protocol:
+                integrity_checker = INTEGRITY_CHECKER_MAP[output_in_external_form.domain_spec.integrity_check_protocol.type]
+                required_resource_name = integrity_checker.get_required_resource_name(
+                    output_in_external_form.resource_access_spec, output_in_external_form.domain_spec.integrity_check_protocol
+                )
+
+            resource_path = resource_path + output_in_external_form.resource_access_spec.path_delimiter() + required_resource_name
+        return output_in_external_form.create(
+            output_in_external_form.type, output_in_external_form.resource_access_spec.source, resource_path
+        )
 
     def check_active_routes(self, routing_session: RoutingSession = RoutingSession()) -> None:
         """Periodical check triggered by ProcessingUnit
@@ -3497,6 +4067,15 @@ class RoutingTable(BaseConstruct, ABC):
                             )
 
                     active_compute_record.session_state = internal_session_state
+                    active_compute_record.state, active_compute_record.session_state = self._execute_metadata_actions(
+                        active_compute_record.state,
+                        active_compute_record.session_state,
+                        active_compute_record,
+                        route_record,
+                        active_compute_record.execution_context_id,
+                        active_compute_record.materialized_inputs,
+                        active_compute_record.materialized_output,
+                    )
                     if not internal_session_state.state_type.is_active():
                         logger.critical(f"Detected inactive record on route: {route_record.route.route_id!r}!")
                         if (
@@ -3626,6 +4205,15 @@ class RoutingTable(BaseConstruct, ABC):
                     )
                     compute_response, compute_session_state = self._execute_inlined(
                         active_compute_record.materialized_inputs, active_compute_record.slot, active_compute_record.materialized_output
+                    )
+                    compute_response, compute_session_state = self._execute_metadata_actions(
+                        compute_response,
+                        compute_session_state,
+                        active_compute_record,
+                        route_record,
+                        active_compute_record.execution_context_id,
+                        active_compute_record.materialized_inputs,
+                        active_compute_record.materialized_output,
                     )
 
                     active_compute_record.state = compute_response
@@ -3888,6 +4476,7 @@ class RoutingTable(BaseConstruct, ABC):
         materialized_inputs: List[Signal],
         materialized_output: Signal,
         hook_type: Type,
+        fail_on_error: bool = False,
     ) -> None:
         timestamp_in_utc = self._current_timestamp_in_utc()
         self.metric("routing_table.receive.hook")[hook_type.__name__].emit(1)
@@ -3917,6 +4506,8 @@ class RoutingTable(BaseConstruct, ABC):
             except Exception as err:
                 stack_trace: str = traceback.format_exc()
                 logger.critical(f"Inlined execution context hook failed!" f"Error:{str(err)}, Stack Trace:{stack_trace}")
+                if fail_on_error:
+                    raise err
 
     def _execute_compute_hook(
         self,
@@ -3951,6 +4542,90 @@ class RoutingTable(BaseConstruct, ABC):
             except Exception as err:
                 stack_trace: str = traceback.format_exc()
                 logger.critical(f"Inlined compute hook failed!" f"Error:{str(err)}, Stack Trace:{stack_trace}")
+
+    def _execute_metadata_actions(
+        self,
+        compute_response: ComputeResponse,
+        compute_session_state: ComputeSessionState,
+        compute_record: "RoutingTable.ComputeRecord",
+        route_record: "RoutingTable.RouteRecord",  # persistent route object
+        execution_ctx_id: str,
+        materialized_inputs: List[Signal],
+        materialized_output: Signal,
+    ) -> Tuple[ComputeResponse, ComputeSessionState]:
+        """Execute output metadata actions (if defined on Route) upon successful completion of one of the compute records
+        to trigger actions (compute targets) that would change the final state of the entire execution.
+        Please note that this will be called for each compute in an execution. So metadata defined in any of the compute
+        records can change the final state of the entire execution. Here the logic is agnostic from how the output
+        metadata is created.
+        If a metadata action fails the compute records, its successful "execution details" from the original session state
+        is still used and appended to the error/stack-trace of metadata action before persistence.
+        """
+        current_timestamp = self._current_timestamp_in_utc()
+        exec_metadata = {
+            "trigger_timestamp_utc": compute_record.trigger_timestamp_utc,
+            "deactivated_timestamp_utc": current_timestamp,
+            "compute_session_state_type": compute_session_state.state_type.value,
+        }
+        self.get_platform().storage.save_internal_metadata(
+            materialized_output, exec_metadata, InternalDatasetSignalSourceAccessSpec.EXECUTION_METADATA_FILE
+        )
+        self.metric("routing_table.receive.execution.compute", route=route_record.route)["TotalDurationInSecs"].emit(
+            current_timestamp - compute_record.trigger_timestamp_utc
+        )
+        if compute_session_state.state_type == ComputeSessionStateType.COMPLETED:
+            if route_record.route.has_execution_metadata_actions():
+                start_time = self._current_timestamp_in_utc()
+                output_metadata: Optional[RouteMetadata] = self.get_platform().storage.load_internal_metadata(materialized_output)
+                if output_metadata:
+                    output_metadata.update(exec_metadata)
+                    for metadata_action in route_record.route.execution_hook.get_metadata_actions:
+                        try:
+                            condition_met = metadata_action.condition(output_metadata)
+                        except:
+                            condition_met = False
+
+                        if condition_met:
+                            try:
+                                self._execute_context_hook(
+                                    metadata_action.slot,
+                                    route_record,
+                                    execution_ctx_id,
+                                    materialized_inputs,
+                                    materialized_output,
+                                    RoutingHookInterface.Execution.IExecutionMetadataHook,
+                                    fail_on_error=True,
+                                )
+                            except Exception as err:
+                                # invalidate output immediately, if this fails or routing session times out,
+                                # in the next orchestration cycle we should hit the same path again
+                                self.get_platform().storage.delete_internal(materialized_output, entire_domain=False)
+
+                                stack_trace: str = traceback.format_exc()
+                                error_message = f"Metadata action failed on output metadata: {output_metadata!r}! Condition: {metadata_action.describe_condition()!r}, Error:{str(err)}"
+                                stack_dump = f"Stack Trace:{stack_trace}"
+                                logger.critical(f"{error_message}, {stack_dump}")
+                                failure_session_state_type = ComputeFailedSessionStateType.METADATA_ACTION
+                                failure_response_type = ComputeFailedResponseType.METADATA_ACTION
+                                return (
+                                    ComputeFailedResponse(
+                                        failure_response_type, ComputeResourceDesc(None, None), None, error_message + ", " + stack_dump
+                                    ),
+                                    ComputeFailedSessionState(
+                                        failure_session_state_type,
+                                        None,
+                                        compute_session_state.executions
+                                        + [
+                                            ComputeExecutionDetails(
+                                                start_time,
+                                                self._current_timestamp_in_utc(),
+                                                {"ErrorMessage": error_message, "stack_trace": stack_trace},
+                                            )
+                                        ],
+                                    ),
+                                )
+
+        return compute_response, compute_session_state
 
     def _execute_active_context_checkpoint_hook(
         self,
@@ -4061,6 +4736,40 @@ class RoutingTable(BaseConstruct, ABC):
                 stack_trace: str = traceback.format_exc()
                 logger.critical(f"Inlined pending node hook failed!" f"Error:{str(err)}, Stack Trace:{stack_trace}")
 
+    def _execute_retention_hook(
+        self,
+        slot: Slot,
+        route_record: "RoutingTable.RouteRecord",  # persistent route object
+        materialized_output: Signal,
+        hook_type: Type,
+    ) -> None:
+        timestamp_in_utc = self._current_timestamp_in_utc()
+        self.metric("routing_table.retention.hook")[hook_type.__name__].emit(1)
+        self.metric("routing_table.retention.hook", route=route_record.route)[hook_type.__name__].emit(1)
+        self.metric("routing_table.retention.hook.time_in_utc", route=route_record.route)[hook_type.__name__].emit(timestamp_in_utc)
+        if slot:
+            dimensions = dimensions_map = create_output_dimension_map(materialized_output)
+            params = dict(self._params)
+            params.update(
+                {
+                    RoutingHookInterface.HOOK_TYPE_PARAM: hook_type,
+                    "_route_record": route_record,
+                    "_materialized_output": materialized_output,
+                    "_current_timestamp_in_utc": timestamp_in_utc,
+                    "dimensions": dimensions,
+                    "dimensions_map": dimensions,
+                }
+            )
+            try:
+                code = loads(slot.code)
+                if isinstance(code, str):
+                    exec(code)
+                else:
+                    code(self, route_record, materialized_output, timestamp_in_utc, **params)
+            except Exception as err:
+                stack_trace: str = traceback.format_exc()
+                logger.critical(f"Retention RIP hook failed!" f"Error:{str(err)}, Stack Trace:{stack_trace}")
+
     @property
     def is_synchronized(self) -> bool:
         """Inform the rest of the Platform as to whether a routing impl supports synchronization
@@ -4121,6 +4830,27 @@ class RoutingTable(BaseConstruct, ABC):
     def load_pending_nodes(
         self, route_id: Optional[RouteID] = None, ascending: bool = False
     ) -> Union[Iterator[Tuple[RouteID, "RuntimeLinkNode"]], Iterator["RuntimeLinkNode"]]: ...
+
+    def delete_pending_node(self, route_id: RouteID, pending_node_id: str) -> None:
+        retained: bool = False
+        try:
+            if not self._lock(route_id, retain_attempt_duration_in_secs=64):
+                raise RuntimeError(f"Route {route_id!r} is locked by Processor! Could not retain it now. Please try again later.")
+            retained = True
+
+            self._delete_pending_node(route_id, pending_node_id)
+        except Exception as err:
+            logger.critical(
+                f"Encountered error: '{str(err)}', while attempting to delete pending node {pending_node_id!r} on route: {route_id!r}"
+                f" stack trace: {traceback.format_exc()}"
+            )
+            raise err
+        finally:
+            if retained:
+                self._release(route_id)
+
+    @abstractmethod
+    def _delete_pending_node(self, route_id: RouteID, pending_node_id: str) -> None: ...
 
     @abstractmethod
     def load_inactive_compute_records(
@@ -4229,6 +4959,16 @@ class RoutingTable(BaseConstruct, ABC):
                             if active_record.slot.type.is_batch_compute():
                                 try:
                                     self.get_platform().batch_compute.kill_session(active_record)
+                                    # some compute tech does not raise when a failed execution receives a kill req (e.g EMR)
+                                    # we need to force stop when the error is transient (otherwise routing will spawn a new execution)
+                                    if active_record.session_state and not active_record.session_state.state_type.is_active():
+                                        if (
+                                            active_record.session_state.state_type == ComputeSessionStateType.FAILED
+                                            and cast(ComputeFailedSessionState, active_record.session_state).failed_type
+                                            == ComputeFailedSessionStateType.TRANSIENT
+                                        ):
+                                            active_record.session_state.failed_type = ComputeFailedResponseType.TRANSIENT_FORCE_STOPPED
+                                            modified = True
                                 except Exception:
                                     # there is only one case that we need to evaluate here.
                                     # it is when the compute is a FAILED one with a TRANSIENT error and waiting

@@ -973,7 +973,7 @@ class TestAWSSagemakerBatchCompute(AWSTestBase, DriverTestUtils):
                 SignalType.INTERNAL_PARTITION_CREATION,
                 SignalSourceAccessSpec(
                     SignalSourceType.INTERNAL,
-                    "S3://bucket-name/model.tar.gz",
+                    "S3://BUCKET-name/model.tar.gz",
                     {
                         "data_type": DataType.MODEL_ARTIFACT,
                         "model_format": ModelSignalSourceFormat.SAGEMAKER_TRAINING_JOB,
@@ -982,7 +982,7 @@ class TestAWSSagemakerBatchCompute(AWSTestBase, DriverTestUtils):
                                 "TrainingImage": Any,  # Use something else here
                             }
                         },
-                        # "bucket": "S3://bucket-name/*/model.tar.gz"
+                        # "bucket": "S3://BUCKET-name/*/model.tar.gz"
                     },
                 ),
                 SignalDomainSpec(DimensionSpec.load_from_pretty({"input_dim": {type: Type.LONG}}), None, None),
@@ -1039,7 +1039,7 @@ class TestAWSSagemakerBatchCompute(AWSTestBase, DriverTestUtils):
                 SignalType.EXTERNAL_S3_OBJECT_CREATION,
                 SignalSourceAccessSpec(
                     SignalSourceType.S3,
-                    "S3://bucket-name/model.tar.gz",
+                    "S3://BUCKET-name/model.tar.gz",
                     {
                         "data_type": DataType.MODEL_ARTIFACT,
                         "model_format": ModelSignalSourceFormat.SAGEMAKER_TRAINING_JOB,
@@ -1048,7 +1048,7 @@ class TestAWSSagemakerBatchCompute(AWSTestBase, DriverTestUtils):
                                 "TrainingImage": Any,  # Use something else here
                             }
                         },
-                        # "bucket": "S3://bucket-name/*/model.tar.gz"
+                        # "bucket": "S3://BUCKET-name/*/model.tar.gz"
                     },
                 ),
                 SignalDomainSpec(DimensionSpec.load_from_pretty({"input_dim": {type: Type.LONG}}), None, None),

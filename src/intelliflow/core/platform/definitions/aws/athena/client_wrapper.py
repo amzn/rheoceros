@@ -109,7 +109,11 @@ def get_athena_query_execution_failure_type(query_execution_response) -> Compute
 
 def create_or_update_workgroup(athena, workgroup: str, output_location: str, enforce: bool = True, description: str = "", **tags):
     try:
-        response = exponential_retry(athena.get_work_group, ATHENA_CLIENT_RETRYABLE_EXCEPTION_LIST, WorkGroup=workgroup)
+        response = exponential_retry(
+            athena.get_work_group,
+            ATHENA_CLIENT_RETRYABLE_EXCEPTION_LIST.union({"AccessDeniedException", "AccessDenied"}),
+            WorkGroup=workgroup,
+        )
     except ClientError as error:
         error_code = get_code_for_exception(error)
         if error_code in ["InvalidRequestException"]:

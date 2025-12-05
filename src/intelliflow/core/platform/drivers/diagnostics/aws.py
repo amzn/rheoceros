@@ -1453,6 +1453,7 @@ Layout of the dashboard:
             metrics_or_alarm=metric_signals_or_alarm,
             width=kwargs.get("width", 8),
             height=kwargs.get("height", 6),
+            properties=kwargs.get("properties", None),
         )
         current_data.setdefault("widgets", []).append(widget)
 
