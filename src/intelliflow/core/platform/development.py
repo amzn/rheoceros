@@ -7,7 +7,7 @@ from abc import abstractmethod
 from enum import Enum
 from typing import Any, ClassVar, Dict, List, Optional, Sequence, Set, Type
 
-from intelliflow.core.deployment import is_on_remote_dev_env
+from intelliflow.core.deployment import IS_ON_AWS_LAMBDA, is_on_remote_dev_env
 from intelliflow.core.platform.definitions.aws.sagemaker import notebook
 from intelliflow.core.platform.definitions.aws.sagemaker.common import SAGEMAKER_NOTEBOOK_INSTANCE_ASSUMED_ROLE_USER
 from intelliflow.core.platform.endpoint import DevEndpoint
@@ -38,6 +38,7 @@ from .constructs import (
 from .definitions.aws.common import (
     AWS_ASSUMED_ROLE_ARN_ROOT,
     AWS_MAX_ROLE_NAME_SIZE,
+    IF_BOOTSTRAPPER_ROLE_FORMAT,
     IF_DEV_POLICY_NAME_FORMAT,
     IF_DEV_REMOVED_DRIVERS_TEMP_POLICY_NAME_FORMAT,
     IF_DEV_ROLE_FORMAT,
@@ -64,6 +65,7 @@ from .definitions.aws.common import (
     is_in_role_trust_policy,
     normalize_policy_arn,
     put_inlined_policy,
+    segregate_trusted_entities,
     update_role,
     update_role_trust_policy,
 )
@@ -745,6 +747,10 @@ class AWSConfiguration(Configuration):
     def _build_exe_role_name(self) -> str:
         return IF_EXE_ROLE_NAME_FORMAT.format(self._context_id, self._params[AWSCommonParams.REGION])
 
+    @classmethod
+    def _build_bootstrapper_role(self, account_id: str) -> str:
+        return IF_BOOTSTRAPPER_ROLE_FORMAT.format(account_id)
+
     # override
     def _add_common_params(self) -> None:
         # add common params to be used by local constructs into self._params
@@ -810,7 +816,7 @@ class AWSConfiguration(Configuration):
                         session,
                         self._params[AWSCommonParams.REGION],
                         True,
-                        ["sagemaker.amazonaws.com", "glue.amazonaws.com"],
+                        ["sagemaker.amazonaws.com", "glue.amazonaws.com", "lambda.amazonaws.com"],
                     )
 
                     if self._params.get(ActivationParams.REMOTE_DEV_ENV_SUPPORT, True):
@@ -819,9 +825,20 @@ class AWSConfiguration(Configuration):
                         )
                     )
                 else:
-                    # TODO support restoration of trusted-services as well (e.g. if role's trust policy is not manually restored after Conduit wipes it out).
-                    # so basically support 'services' in 'update_role_trust_policy' (add 'sagemaker.amazonaws.com').
-                    update_role_trust_policy(if_dev_role_name, session, self._params[AWSCommonParams.REGION], set(), set(), True)
+                    # Support restoration of trusted-services as well (e.g. if role's trust policy is not manually restored after Conduit wipes it out).
+                    # Add default AWS services that IntelliFlow needs for dev role functionality
+                    default_aws_services = {"sagemaker.amazonaws.com", "glue.amazonaws.com", "lambda.amazonaws.com"}
+                    update_role_trust_policy(
+                        if_dev_role_name,
+                        session,
+                        self._params[AWSCommonParams.REGION],
+                        set(),
+                        set(),
+                        True,
+                        None,
+                        default_aws_services,
+                        set(),
+                    )
 
                 if update_dev_role or new_role:
                     # dynamically adapt the policy to the current configuration
@@ -849,18 +866,42 @@ class AWSConfiguration(Configuration):
                         # should be able to get itself, and update its own policies.
                         ConstructPermission(
                             [self._params[AWSCommonParams.IF_DEV_ROLE]],
-                            ["iam:GetRole", "iam:UpdateAssumeRolePolicy", "iam:PutRolePolicy", "iam:DeleteRolePolicy"],
+                            [
+                                "iam:GetRole",
+                                "iam:UpdateAssumeRolePolicy",
+                                "iam:PutRolePolicy",
+                                "iam:DeleteRolePolicy",
+                                "iam:PassRole",
+                                "iam:AttachRolePolicy",
+                                "iam:DetachRolePolicy",
+                                "iam:ListAttachedRolePolicies",
+                            ],
                         ),
                         # allow upstream connections (granular control is from upstream trust policy)
                         ConstructPermission([IF_DEV_ROLE_FORMAT.format("*", "*", "*")], ["sts:AssumeRole"]),
-                        # should be able to check the existence of managed policies
+                        # should be able to check the existence of managed policies and manage customer-managed policies
                         ConstructPermission(
                             [
                                 f"arn:aws:iam::{self._params[AWSCommonParams.ACCOUNT_ID]}:policy/*",
                                 f"arn:aws:iam::{self._params[AWSCommonParams.ACCOUNT_ID]}:policy/*/*",
                                 normalize_policy_arn("*"),
                             ],
-                            ["iam:GetPolicy"],
+                            [
+                                "iam:GetPolicy",
+                                "iam:CreatePolicy",
+                                "iam:CreatePolicyVersion",
+                                "iam:DeletePolicy",
+                                "iam:DeletePolicyVersion",
+                                "iam:ListPolicyVersions",
+                                "iam:ListEntitiesForPolicy",
+                            ],
+                        ),
+                        # Native Extension invocations:
+                        ConstructPermission(
+                            [
+                                f"arn:aws:lambda:{self._params[AWSCommonParams.REGION]}:{self._params[AWSCommonParams.ACCOUNT_ID]}:function:IntelliFlow-Native-*"
+                            ],
+                            ["lambda:InvokeFunction"],
                         ),
                     ]
                     put_inlined_policy(
@@ -908,6 +949,17 @@ class AWSConfiguration(Configuration):
             session = self._params[AWSCommonParams.HOST_BOTO_SESSION]
             # Remote conf/app must have already given permission to us (probably via App::export_to_remote_app) or directly.
             # so the role switch will succeed and the owner context/app of this app will be loaded seamlessly.
+            needs_to_assume_role = True
+        elif self.is_on_remote_dev_env() or IS_ON_AWS_LAMBDA:
+            # if bootstrapped / deployed on AWS
+            # treat the credentials as an admin
+            session = get_session(None, self._params[AWSCommonParams.REGION], None)
+
+            session = self._check_cross_account_admin(session)
+
+            self.add_param(AWSCommonParams.AUTO_UPDATE_DEV_ROLE, True)
+
+            needs_to_check_role = True
             needs_to_assume_role = True
         elif AWSCommonParams.AUTHENTICATE_WITH_DEV_ROLE in self._params:
             # first always get the root session (account based one, also an assumed-role per user)
@@ -989,9 +1041,45 @@ class AWSConfiguration(Configuration):
             needs_to_assume_role = True
         return needs_to_assume_role, needs_to_check_role, session
 
+    def _check_cross_account_admin(self, session):
+        user_account_id = self._params[AWSCommonParams.ACCOUNT_ID]  # force the user to declare ACCOUNT_ID
+        session_account_id = get_aws_account_id(session, self._params[AWSCommonParams.REGION])
+        if user_account_id != session_account_id:
+            role_to_be_assumed: Optional[str] = None
+            # assume into one of the roles below from the target account
+            if AWSCommonParams.IF_ADMIN_ROLE in self._params:
+                role_to_be_assumed = self.get_param(AWSCommonParams.IF_ADMIN_ROLE)
+            elif AWSCommonParams.TURTLE_CONFIG in self._params:
+                role_to_be_assumed = self.get_param(AWSCommonParams.TURTLE_CONFIG).role_arn
+            else:
+                role_to_be_assumed = self._build_bootstrapper_role(user_account_id)
+
+            module_logger.info(
+                "Assuming into role as admin_role: {0} in different account {1} from account {2}".format(
+                    role_to_be_assumed, user_account_id, session_account_id
+                )
+            )
+
+            if role_to_be_assumed:
+                session = RefreshableBotoSession(
+                    role_arn=role_to_be_assumed,
+                    session_name=self._generate_unique_id_for_context(),
+                    base_session=session,
+                ).refreshable_session()
+
+        return session
+
     def get_admin_session(self) -> "boto3.Session":
+        """Return admin session that belongs to the same account as the application account id.
+        This can happen when bootstrapper env is on a different account than the application.
+        """
         if_dev_role_name: str = self._build_dev_role_name()
-        if AWSCommonParams.AUTHENTICATE_WITH_DEV_ROLE in self._params:
+        if self.is_on_remote_dev_env() or IS_ON_AWS_LAMBDA:
+            # if bootstrapped / deployed on AWS
+            # treat the credentials as an admin
+            session = get_session(None, self._params[AWSCommonParams.REGION], None)
+            admin_session = self._check_cross_account_admin(session)
+        elif AWSCommonParams.AUTHENTICATE_WITH_DEV_ROLE in self._params:
             # this means that previously the conf was gotten up with this mode.
             # so it should be ok to get the credentials root (account based one) to do the clean-up.
             admin_session = get_session_with_account(self._params[AWSCommonParams.ACCOUNT_ID], self._params[AWSCommonParams.REGION])
@@ -1050,7 +1138,15 @@ class AWSConfiguration(Configuration):
     # override
     def add_permissions_for_removed_drivers(self, removed_drivers: Set[BaseConstruct]) -> None:
         if removed_drivers:
-            devrole_permissions = set(p for r in removed_drivers for p in r.provide_devtime_permissions(self._params))
+            devrole_permissions = set(
+                p
+                for r in removed_drivers
+                for p in (
+                    r.provide_devtime_permissions_ext(r.desc, self._params)
+                    if isinstance(r, Extension)
+                    else r.provide_devtime_permissions(self._params)
+                )
+            )
 
             if devrole_permissions:
                 session = self._params[AWSCommonParams.BOTO_SESSION]
@@ -1078,6 +1174,10 @@ class AWSConfiguration(Configuration):
         self._params[AWSCommonParams.IF_EXE_ROLE] = if_exe_role
 
         session = self._params[AWSCommonParams.BOTO_SESSION]
+
+        # Segregate trusted entities into services and entities
+        trusted_services, trusted_entities = segregate_trusted_entities(self.provide_runtime_trusted_entities())
+
         # check the role first
         if not has_role(if_exe_role_name, session):
             create_role(
@@ -1085,7 +1185,8 @@ class AWSConfiguration(Configuration):
                 session,
                 self._params[AWSCommonParams.REGION],
                 False,
-                self.provide_runtime_trusted_entities(),
+                trusted_services,
+                trusted_entities,
                 # will cause malformed entity if the role is new
                 # [if_exe_role],
             )
@@ -1094,17 +1195,25 @@ class AWSConfiguration(Configuration):
             session,
             self._params[AWSCommonParams.REGION],
             False,
-            self.provide_runtime_trusted_entities(),
-            [if_exe_role],
+            trusted_services,
+            trusted_entities + [if_exe_role],
         )
 
         for managed_policy in self.provide_runtime_default_policies():
             exponential_retry(attach_aws_managed_policy, ["ServiceFailureException"], if_exe_role_name, managed_policy, session)
 
+        runtime_permissions = self.provide_runtime_construct_permissions() + [
+            # Native Extension invocations:
+            ConstructPermission(
+                [
+                    f"arn:aws:lambda:{self._params[AWSCommonParams.REGION]}:{self._params[AWSCommonParams.ACCOUNT_ID]}:function:IntelliFlow-Native-*"
+                ],
+                ["lambda:InvokeFunction"],
+            )
+        ]
+
         # always update
-        put_inlined_policy(
-            if_exe_role_name, IF_EXE_POLICY_NAME_FORMAT.format(self._context_id), set(self.provide_runtime_construct_permissions()), session
-        )
+        put_inlined_policy(if_exe_role_name, IF_EXE_POLICY_NAME_FORMAT.format(self._context_id), set(runtime_permissions), session)
 
     # override
     def _clean_runtime_params(self) -> None:
@@ -1459,6 +1568,21 @@ class HostPlatform(DevelopmentPlatform):
             const_conf = security_conf.get(const_type, None)
             const_ins.hook_security_conf(const_conf, security_conf)
 
+    def add_external_entity_auth_conf(self, external_entity_auth_conf: Dict[Type[BaseConstruct], Dict[str, Set[ConstructPermission]]]):
+        common_conf = external_entity_auth_conf.get(None, None)
+        for const_type, const_ins in self._conf._activated_construct_instance_map.items():
+            const_conf = external_entity_auth_conf.get(const_type, None)
+            if const_conf:
+                if common_conf:
+                    # merge
+                    for entity, common_perms in common_conf.items():
+                        const_conf.setdefault(entity, set()).update(common_perms)
+                const_ins.hook_external_entity_auth_conf(const_conf, external_entity_auth_conf)
+            else:
+                const_conf = common_conf
+
+            const_ins.hook_external_entity_auth_conf(const_conf, external_entity_auth_conf)
+
     def add_dashboards(self, dashboards: Dict[str, Any]):
         self.diagnostics.hook_dashboards(dashboards)
 
@@ -1642,6 +1766,7 @@ class HostPlatform(DevelopmentPlatform):
             self._process_signals()
             self._process_connections()
             self._process_security_conf()
+            self._process_external_entity_auth_conf()
             self._process_dashboards()
 
             self._process_upstream_connections()
@@ -1691,6 +1816,10 @@ class HostPlatform(DevelopmentPlatform):
     def _process_security_conf(self):
         for const_ins in self._conf._activated_construct_instance_map.values():
             const_ins.process_security_conf()
+
+    def _process_external_entity_auth_conf(self):
+        for const_ins in self._conf._activated_construct_instance_map.values():
+            const_ins.process_external_entity_auth_conf()
 
     def _process_dashboards(self):
         self.diagnostics.process_dashboards()

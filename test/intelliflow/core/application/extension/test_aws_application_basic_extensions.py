@@ -42,9 +42,8 @@ class TestAWSApplicationBasicExtensions(AWSTestBase):
         with pytest.raises(ValueError):
             DynamoDBTable(extension_id=extension_id, table_name="my_table", TableName="my_table")
 
-        # provisioned mode not supported
-        with pytest.raises(ValueError):
-            DynamoDBTable(extension_id=extension_id, table_name="my_table", BillingMode=BillingMode.PROVISIONED)
+        # provisioned mode now supported
+        DynamoDBTable(extension_id=extension_id, table_name="my_table", BillingMode=BillingMode.PROVISIONED)
 
         my_table = DynamoDBTable(extension_id=extension_id, table_name="my_extension_table")
 

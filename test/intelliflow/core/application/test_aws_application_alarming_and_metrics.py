@@ -786,12 +786,22 @@ class TestAWSApplicationAlarmingMetrics(AWSTestBase):
             RoutingHookInterface.Execution.IComputeSuccessHook,
             RoutingHookInterface.Execution.IComputeRetryHook,
             RoutingHookInterface.Execution.IExecutionCheckpointHook,
+            RoutingHookInterface.Execution.IExecutionMetadataHook,
             RoutingHookInterface.PendingNode.IPendingNodeCreationHook,
             RoutingHookInterface.PendingNode.IPendingNodeExpirationHook,
             RoutingHookInterface.PendingNode.IPendingCheckpointHook,
         ]:
             # if the signal does not have the hook within its dimension filter (as one of the 'Name' dimension values)
             assert app._get_input_signal(test_node_state_metric_signal[hook_type.__name__][MetricStatistic.SUM][MetricPeriod.MINUTES(5)])
+
+        test_node_state_metric_signal_retention = test_node_routing_metrics_map["routing_table.retention.hook" + "." + node_id]
+
+        # verify all of the critical state-change/hook points are tracked by the metric
+        for hook_type in [RoutingHookInterface.Retention.IRetentionRIPHook, RoutingHookInterface.Retention.IRetentionRefreshHook]:
+            # if the signal does not have the hook within its dimension filter (as one of the 'Name' dimension values)
+            assert app._get_input_signal(
+                test_node_state_metric_signal_retention[hook_type.__name__][MetricStatistic.SUM][MetricPeriod.MINUTES(5)]
+            )
 
         test_node_failure_alarm = app.create_alarm(
             id="metric_emitting_node_failure",

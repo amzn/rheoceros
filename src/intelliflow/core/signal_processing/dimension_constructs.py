@@ -574,6 +574,7 @@ class DimensionVariant(Dimension):
                     shifted_variant = shifted_variant + abs(shift)
                 else:
                     shifted_variant = shifted_variant - abs(shift)
+                shifted_variant.params.pop(self.RANGE_SHIFT_FIELD_ID)
         return shifted_variant
 
     def _transform(self) -> "DimensionVariant":

@@ -3,7 +3,7 @@
 
 """Module to encapsulate Application code in RheocerOS' internal entity model.
 
-   - Context:
+- Context:
 
 """
 
@@ -12,7 +12,7 @@ import logging
 from typing import Any, Dict, List, NewType, Optional, Set, Type
 
 from intelliflow.core.application.context.traversal import ContextVisitor
-from intelliflow.core.platform.constructs import BaseConstruct, ConstructSecurityConf
+from intelliflow.core.platform.constructs import BaseConstruct, ConstructExternalEntityAuthConf, ConstructPermission, ConstructSecurityConf
 from intelliflow.core.serialization import Serializable, dumps, loads
 
 from ...platform.development import Configuration, HostPlatform
@@ -27,6 +27,7 @@ _SymbolTable = NewType("_SymbolTable", Dict[str, Node])
 _ImportedData = NewType("_ImportedData", Set[RemoteApplication])
 _DownstreamApps = NewType("_DownstreamApps", Set[DownstreamApplication])
 _SecurityConf = NewType("_SecurityConf", Dict[Type[BaseConstruct], ConstructSecurityConf])
+_ExternalEntityAuthConf = NewType("_ExternalEntityAuthConf", Dict[Type[BaseConstruct], Dict[str, Set[ConstructPermission]]])
 _Dashboards = NewType("_Dashboards", Dict[str, Any])
 
 
@@ -48,6 +49,7 @@ class Context(Serializable["Context"]):
             self._downstream_apps = _DownstreamApps(set())
 
             self._security_conf = _SecurityConf(dict())
+            self._external_entity_auth_conf = _ExternalEntityAuthConf(dict())
 
             self._dashboards = _Dashboards(dict())
         else:
@@ -59,6 +61,11 @@ class Context(Serializable["Context"]):
             self._downstream_apps = _DownstreamApps(set(other.downstream_dependencies))
 
             self._security_conf = _SecurityConf(dict(other.security_conf))
+            # TODO remove (temporary backwards compatibility)
+            if getattr(other, "_external_entity_auth_conf", None):
+                self._external_entity_auth_conf = _ExternalEntityAuthConf(dict(other.external_entity_auth_conf))
+            else:
+                self._external_entity_auth_conf = _ExternalEntityAuthConf(dict())
 
             # TODO remove custom dashboards release (temporary backwards compatibility)
             if getattr(other, "_dashboards", None):
@@ -102,6 +109,10 @@ class Context(Serializable["Context"]):
     @property
     def security_conf(self) -> _SecurityConf:
         return self._security_conf
+
+    @property
+    def external_entity_auth_conf(self) -> _ExternalEntityAuthConf:
+        return self._external_entity_auth_conf
 
     @property
     def dashboards(self) -> _Dashboards:
@@ -191,6 +202,18 @@ class Context(Serializable["Context"]):
     def add_security_conf(self, construct: Type[BaseConstruct], conf: ConstructSecurityConf):
         self._security_conf[construct] = conf
 
+    def authorize_external_entity(
+        self,
+        entity: str,
+        construct_type: Optional[Type[BaseConstruct]] = None,
+        custom_permissions: Optional[List[ConstructPermission]] = None,
+    ) -> None:
+        entity_permissions: Set[ConstructPermission] = self._external_entity_auth_conf.setdefault(construct_type, dict()).setdefault(
+            entity, set()
+        )
+        if custom_permissions:
+            entity_permissions.update(custom_permissions)
+
     def add_dashboard(self, dashboard_id: str, data: Dict[str, Any]):
         self._dashboards[dashboard_id] = data
 
@@ -225,6 +248,7 @@ class Context(Serializable["Context"]):
             host_platform.connect_downstream(downstream_app.id, downstream_app.conf)
 
         host_platform.add_security_conf(self._security_conf)
+        host_platform.add_external_entity_auth_conf(self._external_entity_auth_conf)
         host_platform.add_dashboards(self._dashboards)
 
     def accept(self, visitor: ContextVisitor) -> None:

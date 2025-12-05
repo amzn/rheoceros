@@ -646,7 +646,7 @@ class TestAWSApplicationExecutionRecursive(AWSTestBase):
                 BatchCompute(
                     code="""PYSPARK CODE HERE""",
                     lang=Lang.PYTHON,
-                    GlueVersion="1.0",
+                    GlueVersion="5.0",
                     WorkerType=GlueWorkerType.G_1X.value,
                     NumberOfWorkers=150,
                     Timeout=4 * 60,  # 4 hours

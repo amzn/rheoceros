@@ -26,7 +26,9 @@ from intelliflow.core.platform.definitions.compute import (
     ComputeSuccessfulResponseType,
 )
 from intelliflow.core.signal_processing import Slot
+from intelliflow.core.signal_processing.routing_runtime_constructs import RouteMetadataAction
 from intelliflow.core.signal_processing.signal import *
+from intelliflow.core.signal_processing.signal_source import DatasetMetadata
 from intelliflow.mixins.aws.test import AWSTestBase
 from intelliflow.utils.test.hook import GenericComputeDescriptorHookVerifier, GenericRoutingHookImpl, OnExecBeginHookImpl
 from intelliflow.utils.test.inlined_compute import NOOPCompute
@@ -91,13 +93,26 @@ class TestAWSApplicationExecutionHooks(AWSTestBase):
             RouteCheckpoint(checkpoint_in_secs=10, slot=hook_generator()),
             RouteCheckpoint(checkpoint_in_secs=20, slot=hook_generator()),
         ]
+        exec_metadata_actions = [
+            RouteMetadataAction(
+                condition=lambda output_metadata: output_metadata[DatasetMetadata.RECORD_COUNT.value] < 5, slot=hook_generator()
+            ),
+            RouteMetadataAction(
+                condition=lambda output_metadata: output_metadata["custom_metadata_field"] == "hello", slot=hook_generator()
+            ),
+        ]
+
+        def metadata_provider_compute(input_map, output, params):
+            params["runtime_platform"].storage.save_internal_metadata(
+                output, {DatasetMetadata.RECORD_COUNT.value: 4, "custom_metadata_field": "hello"}
+            )
 
         repeat_ducsi = app.create_data(
             id="REPEAT_DUCSI",
             inputs={
                 "DEXML_DUCSI": ducsi_data,
             },
-            compute_targets="output=DEXML_DUCSI.limit(100)",
+            compute_targets=[Glue("output=DEXML_DUCSI.limit(100)"), InlinedCompute(metadata_provider_compute)],
             execution_hook=RouteExecutionHook(
                 on_exec_begin=on_exec_begin_hook,
                 on_exec_skipped=on_exec_skipped_hook,
@@ -107,6 +122,7 @@ class TestAWSApplicationExecutionHooks(AWSTestBase):
                 on_success=on_success_hook,
                 on_failure=on_failure_hook,
                 checkpoints=exec_checkpoints,
+                metadata_actions=exec_metadata_actions,
             ),
         )
 
@@ -165,7 +181,7 @@ class TestAWSApplicationExecutionHooks(AWSTestBase):
         assert on_exec_begin_hook.verify(app)
         assert not on_exec_skipped_hook.verify(app)
         assert not on_compute_failure_hook.verify(app)
-        assert not on_compute_success_hook.verify(app)
+        assert on_compute_success_hook.verify(app)  # InlinedCompute succeeds right away in the first pass
         assert not on_compute_retry_hook.verify(app)
         assert not on_success_hook.verify(app)
         assert not on_failure_hook.verify(app)
@@ -180,6 +196,8 @@ class TestAWSApplicationExecutionHooks(AWSTestBase):
         # a 'next cycle/tick',
         app.update_active_routes_status()
         assert not any([c.slot.verify(app) for c in exec_checkpoints])
+        # metadata actions must be fired up already thanks to InlinedCompute
+        assert all([c.slot.verify(app) for c in exec_metadata_actions])
         assert not any([c.slot.verify(app) for c in pending_node_checkpoints])
 
         time.sleep(10)
@@ -281,6 +299,7 @@ class TestAWSApplicationExecutionHooks(AWSTestBase):
         assert not on_compute_failure_hook.verify(app)
         assert not on_compute_retry_hook.verify(app)
         assert on_success_hook.verify(app)
+        assert all([c.slot.verify(app) for c in exec_metadata_actions])
         assert not on_failure_hook.verify(app)
 
         # we now have only one active record (active batch compute session) and a pending node, move 15 secs to:
@@ -423,7 +442,7 @@ class TestAWSApplicationExecutionHooks(AWSTestBase):
 
         self.patch_aws_start(glue_catalog_has_all_tables=True)
 
-        app = self._create_test_application("exec-hooks")
+        app = self._create_test_application("retry-hook")
 
         ducsi_data = app.get_data("DEXML_DUCSI", context=Application.QueryContext.DEV_CONTEXT)[0]
 
@@ -523,5 +542,86 @@ class TestAWSApplicationExecutionHooks(AWSTestBase):
         # now during the second check max_retry_count of 1 must be hit and the compute must fail.
         app.update_active_routes_status()
         assert on_failure_hook.verify(app)
+
+        self.patch_aws_stop()
+
+    def test_application_metadata_action_failure(self):
+        from test.intelliflow.core.application.test_aws_application_execution_control import TestAWSApplicationExecutionControl
+
+        self.patch_aws_start(glue_catalog_has_all_andes_tables=True)
+
+        app = self._create_test_application("meta-hooks")
+
+        ducsi_data = app.get_data("DEXML_DUCSI", context=Application.QueryContext.DEV_CONTEXT)[0]
+
+        exec_metadata_actions = [
+            RouteMetadataAction(
+                condition=lambda output_metadata: output_metadata[DatasetMetadata.RECORD_COUNT.value] < 1,
+                slot=FailedMetadataAction("Failed due to zero count in region ${region_id} on date ${ship_day}"),
+            ),
+        ]
+
+        # test BatchCompute path
+        repeat_ducsi = app.create_data(
+            id="REPEAT_DUCSI",
+            inputs={
+                "DEXML_DUCSI": ducsi_data,
+            },
+            compute_targets=[GlueBatchCompute(code="output=DEXML_DUCSI.limit(100)")],
+            execution_hook=RouteExecutionHook(metadata_actions=exec_metadata_actions),
+        )
+
+        def metadata_provider_compute(input_map, output, params):
+            params["runtime_platform"].storage.save_internal_metadata(output, {DatasetMetadata.RECORD_COUNT.value: 0})
+
+        # test InlinedCompute path
+        app.create_data(
+            id="REPEAT_DUCSI2",
+            inputs={
+                "DEXML_DUCSI": ducsi_data,
+            },
+            compute_targets=[InlinedCompute(metadata_provider_compute)],
+            execution_hook=RouteExecutionHook(metadata_actions=exec_metadata_actions),
+        )
+
+        app.activate()
+
+        # 1- Inject DUCSI event to trigger execution on the nodes/routes
+        # mock batch_compute response
+        def compute(
+            route: Route,
+            materialized_inputs: List[Signal],
+            slot: Slot,
+            materialized_output: Signal,
+            execution_ctx_id: str,
+            retry_session_desc: Optional[ComputeSessionDesc] = None,
+        ) -> ComputeResponse:
+            # both of the nodes will have a new compute session
+            return TestAWSApplicationExecutionControl.create_batch_compute_response(
+                ComputeSuccessfulResponseType.PROCESSING, f"job_id-{materialized_output.alias}"
+            )
+
+        # let the Batch Compute complete
+        def get_session_state(session_desc: ComputeSessionDesc, active_compute_record: "RoutingTable.ComputeRecord") -> ComputeSessionState:
+            return TestAWSApplicationExecutionControl.create_batch_compute_session_state(ComputeSessionStateType.COMPLETED)
+
+        app.platform.batch_compute.compute = MagicMock(side_effect=compute)
+        app.platform.batch_compute.get_session_state = MagicMock(side_effect=get_session_state)
+
+        # artificially get the output metadata ready for the batch compute
+        app.platform.storage.save_internal_metadata(repeat_ducsi[1]["2020-12-25"].get_signal(), {DatasetMetadata.RECORD_COUNT.value: 0})
+
+        # trigger the executions by sending in the common input
+        app.process(
+            ducsi_data[1]["2020-12-25"],
+            # make it SYNC (use the local processor instance in sync mode)
+            with_activated_processor=False,
+        )
+
+        # show that both must have failed
+        path, _ = app.poll(app["REPEAT_DUCSI"][1]["2020-12-25"])
+        assert not path
+        path, _ = app.poll(app["REPEAT_DUCSI2"][1]["2020-12-25"])
+        assert not path
 
         self.patch_aws_stop()

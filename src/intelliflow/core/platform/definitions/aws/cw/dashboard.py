@@ -105,6 +105,7 @@ def create_metric_widget(
     y: Optional[int] = None,
     width: Optional[int] = None,
     height: Optional[int] = None,
+    properties: Optional[Dict] = None,
 ) -> Dict[str, Any]:
     """Creates a dictionary that represents a CW Dashboard metric type widget.
         Refer
@@ -156,14 +157,19 @@ def create_metric_widget(
     stat: Optional[MetricStatistic] = next(iter(stat_hints)) if stat_hints else None
     period: Optional[MetricPeriod] = next(iter(period_hints)) if period_hints else None
 
-    properties = {
-        "title": title,
-        "legend": {"position": legend_pos.value},
-        "liveData": False,
-        # Timezone format is + or - followed by four digits. The first two digits indicate the number of hours ahead or
-        # behind of UTC, and the final two digits are the number of minutes. The default is +0000.
-        # "timezone": "+0130"
-    }
+    if properties is None:
+        properties = dict()
+
+    properties.update(
+        {
+            "title": title,
+            "legend": {"position": legend_pos.value},
+            "liveData": False,
+            # Timezone format is + or - followed by four digits. The first two digits indicate the number of hours ahead or
+            # behind of UTC, and the final two digits are the number of minutes. The default is +0000.
+            # "timezone": "+0130"
+        }
+    )
 
     if view:
         properties.update({"view": view if view else "timeSeries"})  # | singleValue | bar | pie

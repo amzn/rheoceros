@@ -109,6 +109,18 @@ class DataType(str, Enum):
     RAW_CONTENT = "content"
 
 
+DATA_PERSISTENCE_KEY = "data_persistence"
+
+
+@unique
+class DataPersistence(str, Enum):
+    MANAGED = "managed"
+    UNMANAGED = "unmanaged"
+
+
+MANAGED_RAW_CONTENT_OUTPUT_FILE_NAME = "output"
+
+
 CONTENT_TYPE_KEY = "content_type"
 
 
@@ -185,6 +197,10 @@ class SignalSourceAccessSpec:
         return DataType(self.attrs[DATA_TYPE_KEY]) if DATA_TYPE_KEY in self.attrs else None
 
     @property
+    def data_persistence(self) -> Optional[DataPersistence]:
+        return DataPersistence(self.attrs[DATA_PERSISTENCE_KEY]) if DATA_PERSISTENCE_KEY in self.attrs else None
+
+    @property
     def encryption_key(self) -> Optional[str]:
         return self._attrs.get(ENCRYPTION_KEY_KEY, None)
 
@@ -242,6 +258,8 @@ class SignalSourceAccessSpec:
             and self._path_format == other.path_format
             and ((not self.proxy and not other.proxy) or (self.proxy and other.proxy and self.proxy.check_integrity(other.proxy)))
             and self.encryption_key == other.encryption_key
+            and self.data_type == other.data_type
+            and self.data_persistence == other.data_persistence
         )
 
     def link(self, proxy: "SignalSourceAccessSpec") -> None:
@@ -313,9 +331,9 @@ class SignalSourceAccessSpec:
 
         return SignalSource(self._source, dimension_list, resource_name)
 
-    def materialize_for_filter(self, dim_filter: DimensionFilter) -> List["SignalSourceAccessSpec"]:
+    def materialize_for_filter(self, dim_filter: DimensionFilter, transform: bool = True) -> List["SignalSourceAccessSpec"]:
         """Returns empty array if 'dim_filter' is not compatible with the path_format of the spec"""
-        materialized_paths: List[str] = self.create_paths_from_filter(dim_filter)
+        materialized_paths: List[str] = self.create_paths_from_filter(dim_filter, transform)
         materialized_specs: List["SignalSourceAccessSpec"] = []
 
         for path in materialized_paths:
@@ -323,12 +341,12 @@ class SignalSourceAccessSpec:
 
         return materialized_specs
 
-    def create_paths_from_filter(self, dim_filter: DimensionFilter) -> List[str]:
+    def create_paths_from_filter(self, dim_filter: DimensionFilter, transform: bool = True) -> List[str]:
         """Returns empty array if 'dim_filter' is not compatible with the path_format of the spec"""
         paths: List[str] = []
         current_path_values: List[str] = []
         try:
-            self._create_path_from_filter(self.path_format, paths, current_path_values, dim_filter)
+            self._create_path_from_filter(self.path_format, paths, current_path_values, dim_filter, transform)
         except IndexError as error:
             # return empty array if dim_filter is not compatible with the expected path_format
             pass
@@ -338,7 +356,7 @@ class SignalSourceAccessSpec:
     # TODO make this abstract and move into impls. Impl below suits Datasets more, for example.
     @classmethod
     def _create_path_from_filter(
-        cls, path_format: str, paths: List[str], current_path_values: List[str], dim_filter: DimensionFilter
+        cls, path_format: str, paths: List[str], current_path_values: List[str], dim_filter: DimensionFilter, transform: bool = True
     ) -> None:
         if not dim_filter:
             new_path = path_format.format(*current_path_values)
@@ -351,7 +369,8 @@ class SignalSourceAccessSpec:
         # this logic suits datasets, for other resource type dimensions from the same level can contribute together,
         # with different schemes to materialize a path.
         for dim, sub_filter in dim_filter.get_dimensions():
-            path_values: List[str] = list(current_path_values) + [str(cast(DimensionVariant, dim).transform().value)]
+            value = cast(DimensionVariant, dim).transform().value if transform else cast(DimensionVariant, dim).value
+            path_values: List[str] = list(current_path_values) + [str(value)]
             cls._create_path_from_filter(path_format, paths, path_values, sub_filter)
 
     @classmethod
@@ -545,6 +564,11 @@ class DataFrameFormat(str, Enum):
     SPARK = "SPARK"
     PANDAS = "PANDAS"
     ORIGINAL = "ORIGINAL"
+
+
+@unique
+class DatasetMetadata(str, Enum):
+    RECORD_COUNT = "record_count"
 
 
 # TODO extract core data spec into a base class (DataSignalSourceAccessSpec)
@@ -765,6 +789,9 @@ INTERNAL_DATA_OVERWRITE_DEFAULT_VALUE = True
 
 class InternalDatasetSignalSourceAccessSpec(DatasetSignalSourceAccessSpec):
     FOLDER: ClassVar[str] = "internal_data"
+    METADATA_FOLDER: ClassVar[str] = "internal_metadata"
+    METADATA_FILE: ClassVar[str] = "route_metadata.json"
+    EXECUTION_METADATA_FILE: ClassVar[str] = "route_exec_metadata.json"
     SCHEMA_FILE_DEFAULT_VALUE = "_SCHEMA"
     SCHEMA_FILE_DEFAULT_TYPE = DatasetSchemaType.SPARK_SCHEMA_JSON
 

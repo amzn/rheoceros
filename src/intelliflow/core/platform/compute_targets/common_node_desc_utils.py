@@ -25,6 +25,21 @@ class _InlinedComputeParamExtractor(RoutingComputeInterface.IInlinedCompute):
 InlinedComputeParamExtractor = _InlinedComputeParamExtractor()
 
 
+class _RetentionHookParamExtractor(RoutingHookInterface.Retention.IRetentionRIPHook, RoutingHookInterface.Retention.IRetentionRefreshHook):
+    def __call__(
+        self,
+        routing_table: "RoutingTable",
+        route_record: "RoutingTable.RouteRecord",
+        materialized_output: Signal,
+        current_timestamp_in_utc: int,
+        **params,
+    ) -> Tuple["RoutingTable", "RoutingTable.RouteRecord", "Signal", int, dict]:
+        return routing_table, route_record, materialized_output, current_timestamp_in_utc, params
+
+
+RetentionHookParamExtractor = _RetentionHookParamExtractor()
+
+
 class _ExecutionInitHookParamExtractor(
     RoutingHookInterface.Execution.IExecutionBeginHook, RoutingHookInterface.Execution.IExecutionSkippedHook
 ):
@@ -43,7 +58,9 @@ ExecutionInitHookParamExtractor = _ExecutionInitHookParamExtractor()
 
 
 class _ExecutionContextHookParamExtractor(
-    RoutingHookInterface.Execution.IExecutionSuccessHook, RoutingHookInterface.Execution.IExecutionFailureHook
+    RoutingHookInterface.Execution.IExecutionSuccessHook,
+    RoutingHookInterface.Execution.IExecutionFailureHook,
+    RoutingHookInterface.Execution.IExecutionMetadataHook,
 ):
     def __call__(
         self,
@@ -262,7 +279,11 @@ def get_route_information_from_callback(
             node_info = get_node_information(params, input_map, materialized_output)
             # TODO read
             # node_info["EXECUTION_SLOTS"] = [repr(slot) for slot in execution_context.slots]
-        elif callback_type in [RoutingHookInterface.Execution.IExecutionSuccessHook, RoutingHookInterface.Execution.IExecutionFailureHook]:
+        elif callback_type in [
+            RoutingHookInterface.Execution.IExecutionSuccessHook,
+            RoutingHookInterface.Execution.IExecutionFailureHook,
+            RoutingHookInterface.Execution.IExecutionMetadataHook,
+        ]:
             _, _, _, materialized_inputs, materialized_output, _, _ = ExecutionContextHookParamExtractor(
                 input_map_OR_routing_table, materialized_output_OR_route_record, *args, **params
             )
@@ -325,5 +346,11 @@ def get_route_information_from_callback(
             except:
                 pass
             node_info = get_pending_node_information(params, ready_input_map, pending_input_map, materialized_output)
+        elif callback_type in [RoutingHookInterface.Retention.IRetentionRIPHook, RoutingHookInterface.Retention.IRetentionRefreshHook]:
+            _, _, materialized_output, _, _ = RetentionHookParamExtractor(
+                input_map_OR_routing_table, materialized_output_OR_route_record, *args, **params
+            )
+            input_map = {}  # skip input dump for retention reporting
+            node_info = get_node_information(params, input_map, materialized_output)
 
     return (route_id, json.dumps(node_info, indent=11, default=repr))

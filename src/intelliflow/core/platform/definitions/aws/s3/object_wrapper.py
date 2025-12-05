@@ -19,7 +19,7 @@ https://github.com/awsdocs/aws-doc-sdk-examples/blob/master/python/example_code/
 
 
 def build_object_key(folders: Sequence[str], object_name: str) -> str:
-    return "/".join(folders + [object_name])
+    return "/".join(folders + ([object_name] if object_name else []))
 
 
 def get_object_metadata(s3, bucket: str, object_key: str, critical_path: bool = False) -> Dict[str, Any]:
@@ -113,22 +113,23 @@ def put_file(bucket, object_key, file_name):
             put_data.close()
 
 
-def put_object(bucket, object_key: str, put_data: Union[str, bytes]) -> bool:
+def put_object(bucket, object_key: str, put_data: Union[str, bytes], metadata={}) -> bool:
     """
     Upload data to a bucket and identify it with the specified object key.
     If the object is bytes, its SHA256 digest will be associated as object's metadata.
     :param bucket: The S3 bucket to receive the data. as boto3 resource.
     :param object_key: The key of the object in the bucket.
     :param put_data: The data to upload, file path or bytes.
+    :param metadata: Metadata that will be associated with the object.
     :return true if put operation succeed.
     """
     try:
         obj = bucket.Object(object_key)
         if isinstance(put_data, bytes):
             sha256_digest = calculate_bytes_sha256(put_data)
-            obj.put(Body=put_data, Metadata={"sha256": sha256_digest})
+            obj.put(Body=put_data, Metadata={"sha256": sha256_digest, **metadata})
         else:
-            obj.put(Body=put_data)
+            obj.put(Body=put_data, Metadata=metadata)
         obj.wait_until_exists()
         logger.info("Put object '%s' to bucket '%s'.", object_key, bucket.name)
         return True

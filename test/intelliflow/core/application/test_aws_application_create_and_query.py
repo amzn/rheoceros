@@ -38,7 +38,7 @@ class TestAWSApplicationBuild(AWSTestBase):
             S3(
                 "123456789012",
                 "test-model-training-data",
-                "data_p3/v8_00/training-data-prod",
+                "eureka_p3/v8_00/training-data-prod",
                 StringVariant("NA", "region"),
                 AnyDate("my_day_my_way", {"format": "%Y-%m-%d"}),
                 **{"key1": 1, "key2": {}}
@@ -49,7 +49,7 @@ class TestAWSApplicationBuild(AWSTestBase):
             S3Dataset(
                 "123456789012",
                 "test-model-training-data",
-                "data_p3/v8_00/all-data-prod",
+                "eureka_p3/v8_00/all-data-prod",
                 "partition_day={}",
                 dataset_format=DataFormat.CSV,
                 **{"key1": 1, "key2": {}}
@@ -93,12 +93,12 @@ class TestAWSApplicationBuild(AWSTestBase):
                     # extra_params
                     spark_ver="2.4",
                     # see https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/glue.html#Glue.Client.start_job_run
-                    MaxCapacity=60,
+                    NumberOfWorkers=60,
+                    WorkerType=GlueWorkerType.G_1X.value,
                     Timeout=60,  # in minutes
-                    GlueVersion="1.0",
+                    GlueVersion="5.0",
                 )
             ],
-            auto_backfilling_enabled=False,
             protocol=SignalIntegrityProtocol("FILE_CHECK", {"file": "_FILE"}),
             **{"foo": "i am DEFAULT_DATAset"}
         )
@@ -130,12 +130,12 @@ class TestAWSApplicationBuild(AWSTestBase):
                     Lang.PYTHON,
                     ABI.GLUE_EMBEDDED,
                     spark_ver="2.4",
-                    MaxCapacity=5,
-                    Timeout=30,  # in minutes
-                    GlueVersion="1.0",
+                    NumberOfWorkers=5,
+                    WorkerType=GlueWorkerType.G_4X.value,
+                    Timeout=45,  # in minutes
+                    GlueVersion="5.0",
                 )
             ],
-            auto_backfilling_enabled=False,
             **{"foo": "i am also default_dataset"}
         )
 
@@ -520,12 +520,12 @@ class TestAWSApplicationBuild(AWSTestBase):
                         # extra_params
                         spark_ver="2.4",
                         # see https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/glue.html#Glue.Client.start_job_run
-                        MaxCapacity=5,
+                        NumberofWorkers=5,
+                        WorkerType=GlueWorkerType.G_2X.value,
                         Timeout=30,  # in minutes
-                        GlueVersion="1.0",
+                        GlueVersion="5.0",
                     )
                 ],
-                auto_backfilling_enabled=False,
                 **{"foo": "i am DEFAULT_DATAset"}
             )
 
@@ -576,9 +576,10 @@ class TestAWSApplicationBuild(AWSTestBase):
                     # extra_params
                     spark_ver="2.4",
                     # see https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/glue.html#Glue.Client.start_job_run
-                    MaxCapacity=5,
+                    NumberOfWorkers=5,
+                    WorkerType=GlueWorkerType.G_1X.value,
                     Timeout=30,  # in minutes
-                    GlueVersion="1.0",
+                    GlueVersion="5.0",
                 )
             ],
             protocol=SignalIntegrityProtocol("FILE_CHECK", {"file": "_FILE"}),
@@ -677,12 +678,12 @@ class TestAWSApplicationBuild(AWSTestBase):
                     Lang.PYTHON,
                     ABI.GLUE_EMBEDDED,
                     spark_ver="2.4",
-                    MaxCapacity=5,
+                    NumberOfWorkers=5,
+                    WorkerType=GlueWorkerType.G_1X.value,
                     Timeout=30,  # in minutes
-                    GlueVersion="1.0",
+                    GlueVersion="5.0",
                 )
             ],
-            auto_backfilling_enabled=False,
             enforce_referential_integrity=True,  # Enforce
             **{"foo": "i am also default_dataset"}
         )

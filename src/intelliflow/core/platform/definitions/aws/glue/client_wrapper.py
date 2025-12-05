@@ -130,6 +130,7 @@ class GlueVersion(str, Enum):
     VERSION_2_0 = "2.0"
     VERSION_3_0 = "3.0"
     VERSION_4_0 = "4.0"
+    VERSION_5_0 = "5.0"
 
 
 def glue_spark_version_map() -> Dict[GlueVersion, Version]:
@@ -142,6 +143,7 @@ def glue_spark_version_map() -> Dict[GlueVersion, Version]:
         GlueVersion.VERSION_2_0: version.parse("2.4.3"),
         GlueVersion.VERSION_3_0: version.parse("3.1.1"),
         GlueVersion.VERSION_4_0: version.parse("3.3.0"),
+        GlueVersion.VERSION_5_0: version.parse("3.5.4"),
     }
 
 
@@ -177,6 +179,7 @@ def _create_job_params(
         GlueVersion.VERSION_2_0.value,
         GlueVersion.VERSION_3_0.value,
         GlueVersion.VERSION_4_0.value,
+        GlueVersion.VERSION_5_0.value,
     ]:
         capacity_params.update({"WorkerType": GlueWorkerType.G_1X.value})
         if job_command_type == GlueJobCommandType.BATCH:
@@ -350,7 +353,12 @@ def evaluate_execution_params(
 
         if fail_on_misconfiguration and max_capacity and ("WorkerType" in org_params or "NumberOfWorkers" in org_params):
             raise ValueError(f"Do not set Max Capacity for an AWS Glue Job if using WorkerType and NumberOfWorkers.")
-    elif glue_version in [GlueVersion.VERSION_2_0.value, GlueVersion.VERSION_3_0.value, GlueVersion.VERSION_4_0.value]:
+    elif glue_version in [
+        GlueVersion.VERSION_2_0.value,
+        GlueVersion.VERSION_3_0.value,
+        GlueVersion.VERSION_4_0.value,
+        GlueVersion.VERSION_5_0.value,
+    ]:
         if fail_on_misconfiguration and ("WorkerType" not in org_params or "NumberOfWorkers" not in org_params):
             raise ValueError(f"AWS Glue Version {glue_version} jobs require 'WorkerType' and 'NumberOfWorkers' to be defined.")
     else:
@@ -447,7 +455,7 @@ def get_glue_job_run(glue_client, job_name, job_run_id):
 
 def get_glue_job_run_state_type(job_run) -> ComputeSessionStateType:
     run_state = job_run["JobRunState"]
-    if run_state in ["STARTING", "RUNNING"]:
+    if run_state in ["STARTING", "WAITING", "RUNNING"]:
         return ComputeSessionStateType.PROCESSING
     elif run_state in ["SUCCEEDED"]:
         return ComputeSessionStateType.COMPLETED
@@ -488,7 +496,25 @@ def get_glue_job_run_failure_type(job_run) -> ComputeFailedSessionStateType:
 
 
 def get_bundles(glue_version: str) -> List[Tuple[str, Path]]:
-    from importlib.resources import contents, path
+    """
+    Choose which JARs to be loaded based on the Glue version and guide.
+
+    It decides on the bundle based on the following logic:
+
+        https://w.amazon.com/bin/view/BDT/Products/Andes3.0/Guides/GlueETLAndes30TechnicalGuide/#HMandatorydependencies
+
+        Use the suggested release labels (package versions) from this table see what EMR release group they map to in
+
+        https://w.amazon.com/bin/view/BDT/Products/Andes3.0/Guides/EMRAndes30Technicalguide#HMandatorydependencies
+
+        and decide which python module to choose from `..emr.andes` (e.g spark_6_x_x, spark_7_x_x).
+
+    :param glue_version: AWS Glue version as string (e.g "4.0", "5.0")
+    :return:
+    """
+    from importlib.resources import contents
+
+    from intelliflow.utils.compat import path
 
     bundles = []
     if glue_version in [
@@ -502,12 +528,17 @@ def get_bundles(glue_version: str) -> List[Tuple[str, Path]]:
             with path(bundle, resource) as resource_path:
                 if Path(resource_path).suffix.lower() == ".jar":
                     bundles.append((resource, Path(resource_path)))
-    elif glue_version in [GlueVersion.VERSION_4_0]:
+    elif glue_version in [GlueVersion.VERSION_4_0, GlueVersion.VERSION_5_0]:
         from ..emr.andes import spark_jars as bundle
 
         for resource in contents(bundle):
             with path(bundle, resource) as resource_path:
                 if Path(resource_path).suffix.lower() == ".jar":
                     bundles.append((resource, Path(resource_path)))
+
+    # FUTURE: for future versions check the table
+    # https://w.amazon.com/bin/view/BDT/Products/Andes3.0/Guides/GlueETLAndes30TechnicalGuide/#HMandatorydependencies
+    # see what the suggested package versions map to in EMR JAR release table. Based on that we might need to load
+    # bundle from a different module from "..emr.andes".
 
     return bundles

@@ -16,7 +16,14 @@ from intelliflow.core.serialization import SerializationError, dumps
 from intelliflow.core.signal_processing import Signal, Slot
 from intelliflow.core.signal_processing.definitions.compute_defs import ABI, Lang
 from intelliflow.core.signal_processing.dimension_constructs import DimensionSpec
-from intelliflow.core.signal_processing.routing_runtime_constructs import Route, RouteCheckpoint, RouteExecutionHook, RoutePendingNodeHook
+from intelliflow.core.signal_processing.routing_runtime_constructs import (
+    Route,
+    RouteCheckpoint,
+    RouteExecutionHook,
+    RouteMetadataAction,
+    RoutePendingNodeHook,
+    RouteRetention,
+)
 from intelliflow.core.signal_processing.signal import (
     DimensionLinkMatrix,
     SignalDimensionLink,
@@ -108,14 +115,14 @@ class InternalDataNode(DataNode):
         execution_hook: Optional[RouteExecutionHook] = None,
         pending_node_hook: Optional[RoutePendingNodeHook] = None,
         pending_node_expiration_ttl_in_secs: int = None,
-        auto_backfilling_enabled: bool = False,
+        output_retention: Optional[RouteRetention] = None,
         protocol: SignalIntegrityProtocol = DEFAULT_DATA_COMPLETION_PROTOCOL,
         **kwargs,
     ) -> None:
         self._compute_targets = list(compute_targets)
         self._signal_link_node = signal_link_node
         self._output_dim_matrix = output_dim_matrix
-        self._auto_backfilling_enabled = auto_backfilling_enabled
+        self._output_retention = self._check_retention_callables(output_retention)
         self._execution_hook = self._check_execution_callables(execution_hook)
         self._pending_node_hook = self._check_pending_node_callables(pending_node_hook)
         self._pending_node_expiration_ttl_in_secs = pending_node_expiration_ttl_in_secs
@@ -178,6 +185,11 @@ class InternalDataNode(DataNode):
                     if execution_hook.checkpoints
                     else execution_hook.checkpoints
                 ),
+                metadata_actions=(
+                    [RouteMetadataAction(m.condition, self._check_hook_type(m.slot)) for m in execution_hook.get_metadata_actions]
+                    if execution_hook.get_metadata_actions
+                    else execution_hook.get_metadata_actions
+                ),
             )
 
     def _check_pending_node_callables(self, pending_node_hook: Optional[RoutePendingNodeHook]) -> Optional[RoutePendingNodeHook]:
@@ -199,6 +211,22 @@ class InternalDataNode(DataNode):
                 ),
             )
 
+    def _check_retention_callables(self, route_retention: Optional[RouteRetention]) -> Optional[RouteRetention]:
+        """Check the callables and convert them to Slots by reusing InlinedComputeDescriptor
+
+        For user convenience, we support Callables (probably implementing RoutingHookInterface.Execution.I...).
+        But framework strictly expects Slot type on the hooks and the necessary conversion.
+        Please see RoutingTable for more details on how those Slots are executed.
+        """
+
+        if route_retention:
+            return RouteRetention(
+                condition=route_retention.condition,
+                refresh_period_in_secs=route_retention.refresh_period_in_secs,
+                rip_hook=self._check_hook_type(route_retention.rip_slot),
+                refresh_hook=self._check_hook_type(route_retention.refresh_slot),
+            )
+
     @property
     def signal_link_node(self) -> SignalLinkNode:
         return self._signal_link_node
@@ -214,6 +242,10 @@ class InternalDataNode(DataNode):
     @property
     def pending_node_hook(self) -> Optional[RoutePendingNodeHook]:
         return getattr(self, "_pending_node_hook", None)
+
+    @property
+    def output_retention(self) -> Optional[RouteRetention]:
+        return getattr(self, "_output_retention", None)
 
     @property
     def pending_node_expiration_ttl_in_secs(self) -> int:
@@ -232,7 +264,7 @@ class InternalDataNode(DataNode):
             self._output_signal,
             self._output_dim_matrix,
             self._slots(),
-            self._auto_backfilling_enabled,
+            self.output_retention,
             self.execution_hook,
             self.pending_node_expiration_ttl_in_secs,
             self.pending_node_hook,

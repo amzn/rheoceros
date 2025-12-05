@@ -33,20 +33,24 @@ from intelliflow.utils.digest import calculate_bytes_sha256
 
 from ...constructs import (
     FEEDBACK_SIGNAL_PROCESSING_MODE_KEY,
+    FEEDBACK_SIGNAL_TYPE,
     FEEDBACK_SIGNAL_TYPE_EVENT_KEY,
     SIGNAL_IS_BLOCKED_KEY,
     SIGNAL_TARGET_ROUTE_ID_KEY,
+    SIGNAL_TRANSFORM,
     ConstructInternalMetricDesc,
     ConstructParamsDict,
     ConstructPermission,
     ConstructSecurityConf,
     FeedBackSignalProcessingMode,
+    FeedBackSignalType,
     ProcessingUnit,
     RoutingTable,
 )
 from ...definitions.aws.aws_lambda.client_wrapper import *
 from ...definitions.aws.common import CommonParams as AWSCommonParams
 from ...definitions.aws.common import exponential_retry, generate_statement_id
+from ...definitions.aws.event_bridge.client_wrapper import EVENT_BRIDGE_RULE_STATE_KEY, StateType
 from ...definitions.aws.glue import catalog as glue_catalog
 from ...definitions.aws.glue.catalog import MAX_PUT_RULE_LIMIT, CatalogCWEventResource, provision_cw_event_rule
 from ...definitions.aws.s3.bucket_wrapper import (
@@ -111,9 +115,13 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
     MAIN_LOOP_INTERVAL_IN_MINUTES: ClassVar[int] = 1
     REPLAY_LOOP_INTERVAL_IN_MINUTES: ClassVar[int] = 5
 
+    RETENTION_LOOP_INTERVAL_IN_HOURS: ClassVar[int] = 12
+    RETENTION_REFRESH_LOOP_INTERVAL_IN_HOURS: ClassVar[int] = 8
+
     CORE_LAMBDA_CONCURRENCY_PARAM: ClassVar[str] = "CORE_LAMBDA_CONCURRENCY"
     MAX_CORE_LAMBDA_CONCURRENCY: ClassVar[int] = 15  # set to None to remove limit
     MAX_REPLAY_LAMBDA_CONCURRENCY: ClassVar[int] = 1
+    MAX_RETENTION_LAMBDA_CONCURRENCY: ClassVar[int] = 1
 
     def __init__(self, params: ConstructParamsDict) -> None:
         """Called the first time this construct is added/configured within a platform.
@@ -141,6 +149,8 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
 
         self._main_loop_timer_id = None
         self._replay_loop_timer_id = None
+        self._retention_loop_timer_id = None
+        self._retention_refresh_loop_timer_id = None
         self._update_desired_core_lambda_concurrency()
 
     def _deserialized_init(self, params: ConstructParamsDict) -> None:
@@ -178,6 +188,7 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
         is_async=True,
         filter=False,
         is_blocked=False,
+        transform=True,
     ) -> Optional[List[RoutingTable.Response]]:
         if isinstance(signal_or_event, Signal):
             lambda_event = {
@@ -192,6 +203,8 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
 
         if is_blocked:
             lambda_event.update({SIGNAL_IS_BLOCKED_KEY: is_blocked})
+
+        lambda_event.update({SIGNAL_TRANSFORM: transform})
 
         if use_activated_instance or not self._dev_platform:
             while True:
@@ -270,6 +283,9 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
         self._replay_lambda_name: str = self._lambda_name + "-REPLAY"
         self._replay_lambda_arn = f"arn:aws:lambda:{self._region}:{self._account_id}:function:{self._replay_lambda_name}"
 
+        self._retention_lambda_name: str = self._lambda_name + "-RETENTION"
+        self._retention_lambda_arn = f"arn:aws:lambda:{self._region}:{self._account_id}:function:{self._retention_lambda_name}"
+
         self._dlq_name = self._lambda_name + "-DLQ"
         queue_name_len_diff = len(self._dlq_name) - MAX_QUEUE_NAME_SIZE
         if queue_name_len_diff > 0:
@@ -305,6 +321,18 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
         self._replay_loop_timer_id = self._lambda_name + "-replay"
         if (len(self._replay_loop_timer_id) - MAX_PUT_RULE_LIMIT) > 0:
             msg = f"Replay Loop Timer Id ({self._replay_loop_timer_id}) length needs to be less than or equal to {str(MAX_PUT_RULE_LIMIT)}"
+            module_logger.error(msg)
+            raise ValueError(msg)
+
+        self._retention_loop_timer_id = self._lambda_name + "-ret"
+        if (len(self._retention_loop_timer_id) - MAX_PUT_RULE_LIMIT) > 0:
+            msg = f"Retention Loop Timer Id ({self._retention_loop_timer_id}) length needs to be less than or equal to {str(MAX_PUT_RULE_LIMIT)}"
+            module_logger.error(msg)
+            raise ValueError(msg)
+
+        self._retention_refresh_loop_timer_id = self._lambda_name + "-ret-ref"
+        if (len(self._retention_refresh_loop_timer_id) - MAX_PUT_RULE_LIMIT) > 0:
+            msg = f"Retention Refresh Loop Timer Id ({self._retention_refresh_loop_timer_id}) length needs to be less than or equal to {str(MAX_PUT_RULE_LIMIT)}"
             module_logger.error(msg)
             raise ValueError(msg)
 
@@ -388,7 +416,7 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
                         if compute_perm.context != PermissionContext.DEVTIME:
                             permissions.append(ConstructPermission(compute_perm.resource, compute_perm.action))
             # check Slots from hooks
-            for hook in (route.execution_hook, route.pending_node_hook):
+            for hook in (route.execution_hook, route.pending_node_hook, route.output_retention):
                 if hook:
                     for callback in hook.callbacks():
                         if isinstance(callback, Slot) and callback.permissions:
@@ -409,6 +437,7 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
         lambda_name_format: str = cls.LAMBDA_NAME_FORMAT.format(cls.__name__, "*", params[AWSCommonParams.REGION])
         filter_lambda_name_format: str = lambda_name_format + "-FILTER"
         replay_lambda_name_format: str = lambda_name_format + "-REPLAY"
+        retention_lambda_name_format: str = lambda_name_format + "-RETENTION"
         dlq_name_format: str = lambda_name_format + "-DLQ"
         return [
             # full permission on its own bucket
@@ -432,6 +461,7 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
                     f"arn:aws:lambda:{params[AWSCommonParams.REGION]}:{params[AWSCommonParams.ACCOUNT_ID]}:function:{lambda_name_format}",
                     f"arn:aws:lambda:{params[AWSCommonParams.REGION]}:{params[AWSCommonParams.ACCOUNT_ID]}:function:{filter_lambda_name_format}",
                     f"arn:aws:lambda:{params[AWSCommonParams.REGION]}:{params[AWSCommonParams.ACCOUNT_ID]}:function:{replay_lambda_name_format}",
+                    f"arn:aws:lambda:{params[AWSCommonParams.REGION]}:{params[AWSCommonParams.ACCOUNT_ID]}:function:{retention_lambda_name_format}",
                 ],
                 ["lambda:*"],
             ),
@@ -466,8 +496,8 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
             SQS:
             https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-available-cloudwatch-metrics.html
         """
-        function_names = [self._lambda_name, self._filter_lambda_name, self._replay_lambda_name]
-        function_types = ["core", "filter", "replay"]
+        function_names = [self._lambda_name, self._filter_lambda_name, self._replay_lambda_name, self._retention_lambda_name]
+        function_types = ["core", "filter", "replay", "retention"]
         function_level_metrics = [
             "Throttles",
             "Errors",
@@ -576,11 +606,20 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
             ConstructInternalMetricDesc(
                 id="processor.replay.event.type",
                 metric_names=["Internal", "ProcessorQueue", "NextCycle", "S3", "SNS", "CW_Alarm", "Glue", "EventBridge", "Unrecognized"],
-                # since metric names are shared with the other event type, we have to
-                # discriminate using a sub-dimension.
                 extra_sub_dimensions={"replay_mode": "True"},
             ),
+            ConstructInternalMetricDesc(
+                id="processor.retention.event.type",
+                metric_names=["Internal", "ProcessorQueue", "NextCycle", "S3", "SNS", "CW_Alarm", "Glue", "EventBridge", "Unrecognized"],
+                extra_sub_dimensions={"retention_mode": "True"},
+            ),
+            # error.type
             ConstructInternalMetricDesc(id="processor.event.error.type", metric_names=["NameError", "Exception"]),
+            ConstructInternalMetricDesc(
+                id="processor.retention.event.error.type",
+                metric_names=["Exception"],
+                extra_sub_dimensions={"retention_mode": "True"},
+            ),
         ]
 
     def _provide_internal_alarms(self) -> List[Signal]:
@@ -679,8 +718,10 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
             self._activate_core_lambda(deployment_package)
             # filter lambda
             self._activate_filter_lambda(deployment_package)
-            # filter lambda
+            # replay lambda
             self._activate_replay_lambda(deployment_package)
+            # retention lambda
+            self._activate_retention_lambda(deployment_package)
             # So what about ASYNC invocation configuration?
             # Why not use https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/lambda.html#Lambda.Client.put_function_event_invoke_config
             # - Because, default settings (6 hours event age, 2 retries, etc) are perfectly ok for this driver impl and
@@ -690,6 +731,8 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
 
         self._activate_main_loop()
         self._activate_replay_loop()
+        self._activate_retention_loop()
+        self._activate_retention_refresh_loop()
 
     def _upload_working_set_to_s3(self, working_set_stream: bytes, bucket, s3_object_key: str) -> Dict[str, str]:
         # Upload working set to S3 if has not been loaded yet, return bucket name and object key as dict.
@@ -850,6 +893,60 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
             # delete the limit
             exponential_retry(delete_function_concurrency, self.CLIENT_RETRYABLE_EXCEPTION_LIST, self._lambda, self._replay_lambda_name)
 
+    def _activate_retention_lambda(self, deployment_package):
+        lambda_arn = exponential_retry(get_lambda_arn, self.CLIENT_RETRYABLE_EXCEPTION_LIST, self._lambda, self._retention_lambda_name)
+        if lambda_arn and lambda_arn != self._retention_lambda_arn:
+            raise RuntimeError(
+                f"AWS Lambda returned an ARN in an unexpected format." f" Expected: {self._retention_lambda_arn}. Got: {lambda_arn}"
+            )
+
+        if not lambda_arn:
+            # create the function without the 'bootstrapper' first so that connections can be established,
+            # bootstrapper is later on set within _update_bootstrapper below as an env param.
+            self._retention_lambda_arn = exponential_retry(
+                create_lambda_function,
+                self.CLIENT_RETRYABLE_EXCEPTION_LIST,
+                self._lambda,
+                self._retention_lambda_name,
+                "IntelliFlow application Processor construct Retention Engine Lambda",
+                "intelliflow.core.platform.drivers.processor.aws.AWSLambdaProcessorBasic_retention_lambda_handler",
+                self._params[AWSCommonParams.IF_EXE_ROLE],
+                deployment_package,
+                PYTHON_VERSION_MAJOR,
+                PYTHON_VERSION_MINOR,
+                None,  # DLQ
+            )
+
+            # see '_update_bootstrapper' callback below to see how bootstrapper is set
+            # at the end of the activation cycle. we cannot set it now since activation across
+            # other drivers might happen in parallel and they might impact the final state of
+            # the platform which needs to be serialized as the bootstrapper.
+        elif not self._lambda_code_source_in_sync(deployment_package, self._retention_lambda_name):  # update
+            # code should be updated first, as the workset should naturally be backward compatible
+            # with the conf (which carries the bootstrapper [RuntimePlatform]).
+            exponential_retry(
+                update_lambda_function_code,
+                self.CLIENT_RETRYABLE_EXCEPTION_LIST,
+                self._lambda,
+                self._retention_lambda_name,
+                deployment_package,
+            )
+        else:
+            logger.info("Same working set already uploaded to retention Lambda, upload skipped")
+
+        concurreny_limit = self.MAX_RETENTION_LAMBDA_CONCURRENCY
+        if concurreny_limit:
+            exponential_retry(
+                put_function_concurrency,
+                self.CLIENT_RETRYABLE_EXCEPTION_LIST,
+                self._lambda,
+                self._retention_lambda_name,
+                concurreny_limit,
+            )
+        else:
+            # delete the limit
+            exponential_retry(delete_function_concurrency, self.CLIENT_RETRYABLE_EXCEPTION_LIST, self._lambda, self._retention_lambda_name)
+
     def build_bootstrapper_object_key(self) -> str:
         return build_object_key(["bootstrapper"], f"{self.__class__.__name__.lower()}_RuntimePlatform.data")
 
@@ -906,6 +1003,22 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
             self._replay_lambda_name,
             "IntelliFlow application Processor construct throttled (retryable) event replay Lambda",
             "intelliflow.core.platform.drivers.processor.aws.AWSLambdaProcessorBasic_replay_lambda_handler",
+            self._params[AWSCommonParams.IF_EXE_ROLE],
+            PYTHON_VERSION_MAJOR,
+            PYTHON_VERSION_MINOR,
+            None,
+            bootstrapper_bucket=self._bucket_name,
+            bootstrapper_key=bootstrapper_object_key,
+        )
+
+        # retention
+        exponential_retry(
+            update_lambda_function_conf,
+            self.CLIENT_RETRYABLE_EXCEPTION_LIST,
+            self._lambda,
+            self._retention_lambda_name,
+            "IntelliFlow application Processor construct Retention Engine Lambda",
+            "intelliflow.core.platform.drivers.processor.aws.AWSLambdaProcessorBasic_retention_lambda_handler",
             self._params[AWSCommonParams.IF_EXE_ROLE],
             PYTHON_VERSION_MAJOR,
             PYTHON_VERSION_MINOR,
@@ -1101,6 +1214,200 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
 
         self._replay_loop_timer_id = None
 
+    def _activate_retention_loop(self) -> None:
+        events = self._session.client(service_name="events", region_name=self._region)
+
+        interval = self.RETENTION_LOOP_INTERVAL_IN_HOURS
+        retention_loop_schedule_expression = f"rate({interval} hour{'s' if interval > 1 else ''})"
+
+        statement_id: str = self._get_unique_statement_id_for_cw(self._retention_loop_timer_id)
+        try:
+            exponential_retry(
+                remove_permission, self.CLIENT_RETRYABLE_EXCEPTION_LIST, self._lambda, self._retention_lambda_name, statement_id
+            )
+        except ClientError as error:
+            if error.response["Error"]["Code"] not in ["ResourceNotFoundException"]:
+                raise
+
+        response = exponential_retry(
+            events.put_rule,
+            ["ConcurrentModificationException", "InternalException"],
+            Name=self._retention_loop_timer_id,
+            ScheduleExpression=retention_loop_schedule_expression,
+            State="ENABLED",
+        )
+        rule_arn = response["RuleArn"]
+
+        try:
+            exponential_retry(
+                add_permission,
+                # on platforms where related waiters are not supported, func might not be ready yet.
+                self.CLIENT_RETRYABLE_EXCEPTION_LIST.union({"ResourceNotFoundException"}),
+                self._lambda,
+                self._retention_lambda_name,
+                statement_id,
+                "lambda:InvokeFunction",
+                "events.amazonaws.com",
+                rule_arn,
+            )
+        except ClientError as error:
+            # TODO remove this special handling since we remove and add every time.
+            if error.response["Error"]["Code"] not in ["ResourceConflictException"]:
+                raise
+
+        # now connect rule & lambda (add lamda as target on the CW side)
+        response = exponential_retry(
+            events.put_targets,
+            ["ConcurrentModificationException", "InternalException"],
+            Rule=self._retention_loop_timer_id,
+            Targets=[
+                {
+                    "Arn": self._retention_lambda_arn,
+                    "Id": self._retention_lambda_name,
+                }
+            ],
+        )
+        if "FailedEntryCount" in response and response["FailedEntryCount"] > 0:
+            raise RuntimeError(
+                f"Cannot create timer {self._retention_loop_timer_id} for Lambda {self._retention_lambda_arn}. Response: {response}"
+            )
+
+    def _deactivate_retention_loop(self) -> None:
+        """Retry friendly. Be resilient against retries during the high-level termination workflow."""
+        if not self._retention_loop_timer_id:
+            return
+        events = self._session.client(service_name="events", region_name=self._region)
+
+        statement_id: str = self._get_unique_statement_id_for_cw(self._retention_loop_timer_id)
+        try:
+            exponential_retry(
+                events.remove_targets,
+                ["ConcurrentModificationException", "InternalException"],
+                Rule=self._retention_loop_timer_id,
+                Ids=[
+                    self._retention_lambda_name,
+                ],
+            )
+        except ClientError as error:
+            if error.response["Error"]["Code"] not in ["ResourceNotFoundException"]:
+                raise
+
+        try:
+            exponential_retry(
+                remove_permission, self.CLIENT_RETRYABLE_EXCEPTION_LIST, self._lambda, self._retention_lambda_name, statement_id
+            )
+        except ClientError as error:
+            if error.response["Error"]["Code"] not in ["ResourceNotFoundException"]:
+                raise
+
+        try:
+            exponential_retry(
+                events.delete_rule, ["ConcurrentModificationException", "InternalException"], Name=self._retention_loop_timer_id
+            )
+        except ClientError as error:
+            if error.response["Error"]["Code"] not in ["ResourceNotFoundException"]:
+                logger.critical(f"Cannot delete timer {self._retention_loop_timer_id} for Lambda {self._retention_lambda_arn}!")
+                raise
+
+        self._retention_loop_timer_id = None
+
+    def _activate_retention_refresh_loop(self) -> None:
+        events = self._session.client(service_name="events", region_name=self._region)
+
+        interval = self.RETENTION_REFRESH_LOOP_INTERVAL_IN_HOURS
+        retention_refresh_loop_schedule_expression = f"rate({interval} hour{'s' if interval > 1 else ''})"
+
+        statement_id: str = self._get_unique_statement_id_for_cw(self._retention_refresh_loop_timer_id)
+        try:
+            exponential_retry(
+                remove_permission, self.CLIENT_RETRYABLE_EXCEPTION_LIST, self._lambda, self._retention_lambda_name, statement_id
+            )
+        except ClientError as error:
+            if error.response["Error"]["Code"] not in ["ResourceNotFoundException"]:
+                raise
+
+        response = exponential_retry(
+            events.put_rule,
+            ["ConcurrentModificationException", "InternalException"],
+            Name=self._retention_refresh_loop_timer_id,
+            ScheduleExpression=retention_refresh_loop_schedule_expression,
+            State="ENABLED",
+        )
+        rule_arn = response["RuleArn"]
+
+        try:
+            exponential_retry(
+                add_permission,
+                # on platforms where related waiters are not supported, func might not be ready yet.
+                self.CLIENT_RETRYABLE_EXCEPTION_LIST.union({"ResourceNotFoundException"}),
+                self._lambda,
+                self._retention_lambda_name,
+                statement_id,
+                "lambda:InvokeFunction",
+                "events.amazonaws.com",
+                rule_arn,
+            )
+        except ClientError as error:
+            # TODO remove this special handling since we remove and add every time.
+            if error.response["Error"]["Code"] not in ["ResourceConflictException"]:
+                raise
+
+        # now connect rule & lambda (add lamda as target on the CW side)
+        response = exponential_retry(
+            events.put_targets,
+            ["ConcurrentModificationException", "InternalException"],
+            Rule=self._retention_refresh_loop_timer_id,
+            Targets=[
+                {
+                    "Arn": self._retention_lambda_arn,
+                    "Id": self._retention_lambda_name,
+                }
+            ],
+        )
+        if "FailedEntryCount" in response and response["FailedEntryCount"] > 0:
+            raise RuntimeError(
+                f"Cannot create timer {self._retention_refresh_loop_timer_id} for Lambda {self._retention_lambda_arn}. Response: {response}"
+            )
+
+    def _deactivate_retention_refresh_loop(self) -> None:
+        """Retry friendly. Be resilient against retries during the high-level termination workflow."""
+        if not self._retention_refresh_loop_timer_id:
+            return
+        events = self._session.client(service_name="events", region_name=self._region)
+
+        statement_id: str = self._get_unique_statement_id_for_cw(self._retention_refresh_loop_timer_id)
+        try:
+            exponential_retry(
+                events.remove_targets,
+                ["ConcurrentModificationException", "InternalException"],
+                Rule=self._retention_refresh_loop_timer_id,
+                Ids=[
+                    self._retention_lambda_name,
+                ],
+            )
+        except ClientError as error:
+            if error.response["Error"]["Code"] not in ["ResourceNotFoundException"]:
+                raise
+
+        try:
+            exponential_retry(
+                remove_permission, self.CLIENT_RETRYABLE_EXCEPTION_LIST, self._lambda, self._retention_lambda_name, statement_id
+            )
+        except ClientError as error:
+            if error.response["Error"]["Code"] not in ["ResourceNotFoundException"]:
+                raise
+
+        try:
+            exponential_retry(
+                events.delete_rule, ["ConcurrentModificationException", "InternalException"], Name=self._retention_refresh_loop_timer_id
+            )
+        except ClientError as error:
+            if error.response["Error"]["Code"] not in ["ResourceNotFoundException"]:
+                logger.critical(f"Cannot delete timer {self._retention_refresh_loop_timer_id} for Lambda {self._retention_lambda_arn}!")
+                raise
+
+        self._retention_refresh_loop_timer_id = None
+
     def rollback(self) -> None:
         # roll back activation, something bad has happened (probably in another Construct) during app launch
         super().rollback()
@@ -1116,6 +1423,12 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
 
         if self._replay_loop_timer_id:
             self._deactivate_replay_loop()
+
+        if self._retention_loop_timer_id:
+            self._deactivate_retention_loop()
+
+        if self._retention_refresh_loop_timer_id:
+            self._deactivate_retention_refresh_loop()
 
         # 2- remove lambda
         if self._lambda_name:
@@ -1143,6 +1456,15 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
                 if error.response["Error"]["Code"] not in ["ResourceNotFoundException", "404"]:
                     raise
             self._replay_lambda_name = None
+
+        # 2.3- remove retention lambda
+        if self._retention_lambda_name:
+            try:
+                exponential_retry(delete_lambda_function, self.CLIENT_RETRYABLE_EXCEPTION_LIST, self._lambda, self._retention_lambda_name)
+            except ClientError as error:
+                if error.response["Error"]["Code"] not in ["ResourceNotFoundException", "404"]:
+                    raise
+            self._retention_lambda_name = None
 
         # 3- remove the resources that lambda relies on
         # 3.1- DLQ
@@ -1397,13 +1719,14 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
 
             # create the cw rule
             if new_signal.resource_access_spec.context_id == self._dev_platform.context_id:
+                state = new_signal.resource_access_spec.attrs.get(EVENT_BRIDGE_RULE_STATE_KEY, StateType.ENABLED)
                 # timer is owner by the same context (application)
                 response = exponential_retry(
                     events.put_rule,
                     ["ConcurrentModificationException", "InternalException"],
                     Name=new_timer_id,
                     ScheduleExpression=new_signal.resource_access_spec.schedule_expression,
-                    State="ENABLED",
+                    State=state if state else StateType.ENABLED,
                 )
                 rule_arn = response["RuleArn"]
             else:
@@ -2419,24 +2742,33 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
         routing_responses: List[RoutingTable.Response] = []
         target_route_id = event.get(SIGNAL_TARGET_ROUTE_ID_KEY, None)
         is_blocked = event.get(SIGNAL_IS_BLOCKED_KEY, False)
+        transform = event.get(SIGNAL_TRANSFORM, True)
         serialized_feed_back_signal: str = event.get(FEEDBACK_SIGNAL_TYPE_EVENT_KEY, None)
 
         if not serialized_feed_back_signal:
             module_logger.info(f"Processing event: {event!r}")
 
         if serialized_feed_back_signal:
+            serialized_feedback_signal_type: FeedBackSignalType = FeedBackSignalType(
+                event.get(FEEDBACK_SIGNAL_TYPE, FeedBackSignalType.NORMAL.value)
+            )
+
             feed_back_signal: Signal = Signal.deserialize(serialized_feed_back_signal)
-            module_logger.info(f"Processing internal event: {feed_back_signal.unique_key()!r}")
+            module_logger.info(
+                f"Processing internal event: {feed_back_signal.unique_key()!r}, event_type={serialized_feedback_signal_type!r}"
+            )
             processing_mode: FeedBackSignalProcessingMode = FeedBackSignalProcessingMode(
                 event.get(FEEDBACK_SIGNAL_PROCESSING_MODE_KEY, FeedBackSignalProcessingMode.FULL_DOMAIN.value)
             )
             # TODO move this block to RoutingTable::receive(feed_back: Signal)
-            if feed_back_signal.type not in [
+            if serialized_feedback_signal_type == FeedBackSignalType.RETENTION_DELETION_REQUEST:
+                runtime_platform.routing_table.handle_retention_deletion_request(feed_back_signal, target_route_id)
+            elif feed_back_signal.type not in [
                 SignalType.INTERNAL_PARTITION_CREATION_REQUEST,
                 SignalType.EXTERNAL_S3_OBJECT_CREATION_REQUEST,
             ]:
                 self.metric(f"processor{'.filter' if filter_only else ''}.event.type")["Internal"].emit(1)
-                for source_spec in feed_back_signal.get_materialized_access_specs():
+                for source_spec in feed_back_signal.get_materialized_access_specs(transform=transform):
                     resource_path = source_spec.path_format
                     if feed_back_signal.resource_access_spec.path_format_requires_resource_name():
                         # feed-back signals should be mapped to real resources for routing to work.
@@ -2638,6 +2970,7 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
                             filter_only,
                             routing_session,
                             is_blocked,
+                            transform=True,  # enable transformation (date shift) on timer signals. FUTURE evaluate this behaviour on all system events?
                         )
                         routing_responses.append(routing_response)
                     else:
@@ -2654,14 +2987,14 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
                         f" Error: {bad_code_path!r}"
                     )
                     # we cannot bail out at this point, since we need to iterate over other signals
-                    self.metric("processor.event.failure.type")["NameError"].emit(1)
+                    self.metric("processor.event.error.type")["NameError"].emit(1)
                 except Exception as error:
                     module_logger.critical(
                         f"Received event: {event} contains an unrecognized resource: {resource}!"
                         f" Error: '{str(error)}'."
                         f" Ignoring and moving to the next event resource..."
                     )
-                    self.metric("processor.event.failure.type")["Exception"].emit(1)
+                    self.metric("processor.event.error.type")["Exception"].emit(1)
         else:
             self.metric(f"processor{'.filter' if filter_only else ''}.event.type")["Unrecognized"].emit(1)
             msg = "Unrecognized event: {}".format(event)
@@ -2728,6 +3061,35 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
             if replay_count:
                 module_logger.critical(f"{replay_count} events have been sent back to core processor Lambda!")
                 self.metric(f"processor.replay.event.type")["ProcessorQueue"].emit(replay_count)
+
+    def retention_event_handler(self, runtime_platform: "Platform", event, context, routing_session: RoutingSession = RoutingSession()):
+
+        if "source" in event and event["source"] == "aws.events":
+            self.metric(f"processor.retention.event.type")["EventBridge"].emit(1)
+            for resource in event["resources"]:
+                try:
+                    # expecting 'resource' to be a rule arn now
+                    timer_resource_partitioned = unquote_plus(resource).rsplit("/", 1)
+                    timer_id = timer_resource_partitioned[-1]
+                    if timer_id == self._retention_loop_timer_id:
+                        self.metric(f"processor.retention.event.type")["NextCycle"].emit(1)
+                        # NEXT CYCLE RETENTION CHECK
+                        runtime_platform.routing_table.check_retention(routing_session)
+                    elif timer_id == self._retention_refresh_loop_timer_id:
+                        self.metric(f"processor.retention.event.type")["NextCycle"].emit(1)
+                        # NEXT CYCLE RETENTION REFRESH CHECK
+                        runtime_platform.routing_table.check_retention_refresh(routing_session)
+                except Exception as error:
+                    module_logger.critical(
+                        f"Received event: {event} contains an unrecognized resource: {resource}!"
+                        f" Error: '{str(error)}'."
+                        f" Ignoring and moving to the next event resource..."
+                    )
+                    self.metric("processor.retention.event.error.type")["Exception"].emit(1)
+        else:
+            self.metric(f"processor.retention.event.type")["Unrecognized"].emit(1)
+            msg = "Unrecognized event: {}".format(event)
+            module_logger.error(msg)
 
     @staticmethod
     def lambda_handler(event, context):
@@ -2828,9 +3190,36 @@ class AWSLambdaProcessorBasic(AWSConstructMixin, ProcessingUnit):
             traceback.print_exc()
             return {"message": msg, "code": "500"}
 
+    @staticmethod
+    def retention_lambda_handler(event, context):
+        import traceback
+
+        try:
+            init_basic_logging(None, False, logging.CRITICAL)
+
+            runtime_platform = AWSLambdaProcessorBasic.runtime_bootstrap()
+            cast("AWSLambdaProcessorBasic", runtime_platform.processor).retention_event_handler(
+                runtime_platform,
+                event,
+                context,
+                RoutingSession(max_duration_in_secs=13 * 60),
+            )
+
+            lambda_response = {"code": "200", "message": "SUCCESS"}
+            # make sure that Lambda response is json serializable
+            return json.dumps(lambda_response)
+        except Exception as swallow:
+            # swallow (by returning to Lambda), this will disable implicit retries for ASYNC requests.
+            # TODO ALARM metric (will be addressed as part of the overall IF error handling/conf support)
+            msg = "Replay lambda raised an exception {}".format(event, str(swallow))
+            print(msg)
+            traceback.print_exc()
+            return {"message": msg, "code": "500"}
+
 
 AWSLambdaProcessorBasic_lambda_handler = AWSLambdaProcessorBasic.lambda_handler
 AWSLambdaProcessorBasic_replay_lambda_handler = AWSLambdaProcessorBasic.replay_lambda_handler
+AWSLambdaProcessorBasic_retention_lambda_handler = AWSLambdaProcessorBasic.retention_lambda_handler
 
 
 # avoid cyclic module dependency

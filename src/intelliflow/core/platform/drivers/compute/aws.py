@@ -3,7 +3,7 @@
 
 """Constructs that provide big-data workload execution abstraction to a Processor,
 achieving a simple RPC dispatch, micro-service feel from an integration point of view.
- 
+
 They generally constitute other AWS resources to control request-buffering, de-duping, execution status check and other integration
 related aspects. Request-buffering would be required to abstract other Platform components (aka the Processor) from
 the internal details
@@ -12,6 +12,7 @@ the internal details
 import json
 import logging
 import uuid
+from datetime import datetime
 from typing import Any, ClassVar, Dict, List, Optional, Set, Tuple, Type, cast
 
 import boto3
@@ -105,6 +106,7 @@ from ...definitions.compute import (
     ComputeSessionStateType,
     ComputeSuccessfulResponse,
     ComputeSuccessfulResponseType,
+    validate_compute_runtime_identifiers,
 )
 from ..aws_common import AWSConstructMixin
 
@@ -128,8 +130,12 @@ class AWSGlueBatchComputeBasic(AWSConstructMixin, BatchCompute):
     def driver_spec(cls) -> DimensionFilter:
         return DimensionFilter.load_raw(
             {
-                Lang.PYTHON: {ABI.GLUE_EMBEDDED: {"GlueVersion": {GlueVersion.AUTO.value: {}, "1.0": {}, "2.0": {}, "3.0": {}, "4.0": {}}}},
-                Lang.SCALA: {ABI.GLUE_EMBEDDED: {"GlueVersion": {GlueVersion.AUTO.value: {}, "1.0": {}, "2.0": {}, "3.0": {}, "4.0": {}}}},
+                Lang.PYTHON: {
+                    ABI.GLUE_EMBEDDED: {"GlueVersion": {GlueVersion.AUTO.value: {}, "1.0": {}, "2.0": {}, "3.0": {}, "4.0": {}, "5.0": {}}}
+                },
+                Lang.SCALA: {
+                    ABI.GLUE_EMBEDDED: {"GlueVersion": {GlueVersion.AUTO.value: {}, "1.0": {}, "2.0": {}, "3.0": {}, "4.0": {}, "5.0": {}}}
+                },
             }
         )
 
@@ -162,10 +168,8 @@ class AWSGlueBatchComputeBasic(AWSConstructMixin, BatchCompute):
         self._bucket = None
 
     def provide_output_attributes(self, inputs: List[Signal], slot: Slot, user_attrs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        if user_attrs.get(DATA_TYPE_KEY, DataType.DATASET) != DataType.DATASET:
-            raise ValueError(
-                f"{DATA_TYPE_KEY!r} must be defined as {DataType.DATASET} or left undefined for {self.__class__.__name__} output!"
-            )
+        # early validation to avoid bad debugging xp at runtime
+        validate_compute_runtime_identifiers(inputs, extra_reserved_keywords=GlueDefaultABIPython.RESERVED_KEYWORDS)
 
         # early validation for compute params that will be used at runtime
         if slot.extra_params and "partition_by" in slot.extra_params:
@@ -183,7 +187,7 @@ class AWSGlueBatchComputeBasic(AWSConstructMixin, BatchCompute):
 
         # header: supports both so it is up to user input. but default to True if not set.
         return {
-            DATA_TYPE_KEY: DataType.DATASET,
+            DATA_TYPE_KEY: user_attrs.get(DATA_TYPE_KEY, DataType.DATASET),
             DATASET_HEADER_KEY: user_attrs.get(DATASET_HEADER_KEY, True),
             DATASET_SCHEMA_TYPE_KEY: DatasetSchemaType.SPARK_SCHEMA_JSON,
             DATASET_FORMAT_KEY: data_format,
@@ -228,7 +232,7 @@ class AWSGlueBatchComputeBasic(AWSConstructMixin, BatchCompute):
         # PROCESSOR must have materialized the signals in the exec context
         # so even for internal signals, paths should be absolute, fully materialized.
         input_map = BatchInputMap(materialized_inputs)
-        output = BatchOutput(materialized_output)
+        output = BatchOutput(materialized_output, route)
 
         lang_code = str(slot.code_lang.value)
         unique_compute_id: str = str(uuid.uuid1())
@@ -384,6 +388,25 @@ class AWSGlueBatchComputeBasic(AWSConstructMixin, BatchCompute):
 
         return ComputeSessionState(session_desc, session_state, [execution_details])
 
+    def terminate_session(self, active_compute_record: "RoutingTable.ComputeRecord") -> None:
+        if active_compute_record.session_state and active_compute_record.session_state.state_type == ComputeSessionStateType.COMPLETED:
+            # EPILOGUE
+            # first map materialized output into internal signal form
+            output = self.get_platform().storage.map_materialized_signal(active_compute_record.materialized_output)
+            path = output.get_materialized_resource_paths()[0]
+
+            # 1- activate completion, etc
+            if output.domain_spec.integrity_check_protocol:
+                from intelliflow.core.signal_processing.analysis import INTEGRITY_CHECKER_MAP
+
+                integrity_checker = INTEGRITY_CHECKER_MAP[output.domain_spec.integrity_check_protocol.type]
+                completion_resource_name = integrity_checker.get_required_resource_name(
+                    output.resource_access_spec, output.domain_spec.integrity_check_protocol
+                )
+                if completion_resource_name:  # ex: _SUCCESS file/object
+                    folder = path[path.find(output.resource_access_spec.FOLDER) :]
+                    self.get_platform().storage.save("", [folder], completion_resource_name)
+
     def kill_session(self, active_compute_record: "RoutingTable.ComputeRecord") -> None:
         # skip if initial response ('state') is not SUCCESS to 'compute' call
         if active_compute_record.state.response_type == ComputeResponseType.SUCCESS:
@@ -423,12 +446,14 @@ class AWSGlueBatchComputeBasic(AWSConstructMixin, BatchCompute):
                 "2.0": {"job_name": "", "job_arn": "", "boilerplate": GlueDefaultABIPython, "suffix": "v2_0", "ext": "py"},
                 "3.0": {"job_name": "", "job_arn": "", "boilerplate": GlueDefaultABIPython, "suffix": "v3_0", "ext": "py"},
                 "4.0": {"job_name": "", "job_arn": "", "boilerplate": GlueDefaultABIPython, "suffix": "v4_0", "ext": "py"},
+                "5.0": {"job_name": "", "job_arn": "", "boilerplate": GlueDefaultABIPython, "suffix": "v5_0", "ext": "py"},
             },
             GlueJobLanguage.SCALA: {
                 "1.0": {"job_name": "", "job_arn": "", "boilerplate": GlueAllABIScala, "suffix": "", "ext": "scala"},
                 "2.0": {"job_name": "", "job_arn": "", "boilerplate": GlueAllABIScala, "suffix": "v2_0", "ext": "scala"},
                 "3.0": {"job_name": "", "job_arn": "", "boilerplate": GlueAllABIScala, "suffix": "v3_0", "ext": "scala"},
                 "4.0": {"job_name": "", "job_arn": "", "boilerplate": GlueAllABIScala, "suffix": "v4_0", "ext": "scala"},
+                "5.0": {"job_name": "", "job_arn": "", "boilerplate": GlueAllABIScala, "suffix": "v5_0", "ext": "scala"},
             },
         }
 
@@ -1150,35 +1175,47 @@ class AWSGlueBatchComputeBasic(AWSConstructMixin, BatchCompute):
             # TODO: Create presigned url. Find a way to redirect th user to jobrun
             if active_compute_record.session_state.executions:
                 # We only check and gather details for the final execution
-                final_execution_details = active_compute_record.session_state.executions[::-1][0].details
-                details = dict()
-                details["JobId"] = final_execution_details.get("Id", None)
-                details["JobName"] = final_execution_details.get("JobName", None)
-                details["JobURL"] = (
-                    f"https://{self.region}.console.aws.amazon.com/gluestudio/home?region={self.region}#/editor/job/{details['JobName']}/details"
-                )
-                details["JobRunURL"] = (
-                    f"https://{self.region}.console.aws.amazon.com/gluestudio/home?region={self.region}#/job/{details['JobName']}/run/{details['JobId']}"
-                )
-                details["JobLogURL"] = (
-                    f"https://{self.region}.console.aws.amazon.com/cloudwatch/home?region={self.region}#logsV2:log-groups/log-group/$252Faws-glue$252Fjobs$252Foutput/log-events/{details['JobId']}"
-                )
-                details["StartedOn"] = final_execution_details.get("StartedOn", None)
-                details["CompletedOn"] = final_execution_details.get("CompletedOn", None)
-                details["JobRunState"] = final_execution_details.get("JobRunState", None)
-                details["Attempt"] = final_execution_details.get("Attempt", None)
-                details["ExecutionTime"] = final_execution_details.get("ExecutionTime", None)
-                details["WorkerType"] = final_execution_details.get("WorkerType", None)
-                details["NumberOfWorkers"] = final_execution_details.get("NumberOfWorkers", None)
-                details["GlueVersion"] = final_execution_details.get("GlueVersion", None)
+                final_execution_details_list = [
+                    exec.details
+                    for exec in reversed(active_compute_record.session_state.executions)
+                    if (exec and exec.details and exec.details.get("Id", None))
+                ]
 
-                job_run_state = final_execution_details.get("JobRunState", None)
-                # Adding error message if the JobRun FAILED OR TIMEDOUT
-                if job_run_state == "FAILED" or job_run_state == "TIMEOUT":
-                    details["ErrorMessage"] = final_execution_details.get("ErrorMessage", None)
-                    details["Timeout"] = final_execution_details.get("Timeout", None)
+                if final_execution_details_list:
+                    final_execution_details = final_execution_details_list[0]
+                    details = dict()
+                    details["JobId"] = final_execution_details.get("Id", None)
+                    common_keys = [
+                        "JobName",
+                        "StartedOn",
+                        "CompletedOn",
+                        "JobRunState",
+                        "Attempt",
+                        "ExecutionTime",
+                        "WorkerType",
+                        "NumberOfWorkers",
+                        "GlueVersion",
+                    ]
+                    for k in common_keys:
+                        details[k] = final_execution_details.get(k, None)
 
-                execution_details.update({"details": details})
+                    details["JobURL"] = (
+                        f"https://{self.region}.console.aws.amazon.com/gluestudio/home?region={self.region}#/editor/job/{details['JobName']}/details"
+                    )
+                    details["JobRunURL"] = (
+                        f"https://{self.region}.console.aws.amazon.com/gluestudio/home?region={self.region}#/job/{details['JobName']}/run/{details['JobId']}"
+                    )
+                    details["JobLogURL"] = (
+                        f"https://{self.region}.console.aws.amazon.com/cloudwatch/home?region={self.region}#logsV2:log-groups/log-group/$252Faws-glue$252Fjobs$252Foutput/log-events/{details['JobId']}"
+                    )
+
+                    job_run_state = final_execution_details.get("JobRunState", None)
+                    # Adding error message if the JobRun FAILED OR TIMEDOUT
+                    if job_run_state == "FAILED" or job_run_state == "TIMEOUT":
+                        details["ErrorMessage"] = final_execution_details.get("ErrorMessage", None)
+                        details["Timeout"] = final_execution_details.get("Timeout", None)
+
+                    execution_details.update({"details": details})
 
             # Extract SLOT info
             if active_compute_record.slot:
@@ -1203,54 +1240,78 @@ class AWSGlueBatchComputeBasic(AWSConstructMixin, BatchCompute):
     ) -> Optional[ComputeLogQuery]:
         if compute_record.session_state:
             if compute_record.session_state.executions:
-                final_execution_details = compute_record.session_state.executions[::-1][0].details
-                job_run_id = final_execution_details.get("Id", None)
-                start_timestamp = final_execution_details.get("StartedOn", None)
-                end_timestamp = final_execution_details.get("CompletedOn", None)
-                query = {
-                    # don't use this, there are multiple log-streams created by each executor. all share the same log stream prefix
-                    # "logStreamNames": [job_run_id],
-                    "logStreamNamePrefix": job_run_id
-                }
-                if start_timestamp:
-                    start_timestamp = int(round(start_timestamp.timestamp()))
-                    query.update({"startTime": start_timestamp})
-                if end_timestamp:
-                    end_timestamp = int(round(end_timestamp.timestamp()))
-                    query.update({"endTime": end_timestamp})
+                final_execution_details_list = [
+                    exec.details
+                    for exec in reversed(compute_record.session_state.executions)
+                    if (exec and exec.details and exec.details.get("Id", None))
+                ]
+                if final_execution_details_list:
+                    final_execution_details = final_execution_details_list[0]
+                    job_run_id = final_execution_details.get("Id", None)
+                    start_timestamp = final_execution_details.get("StartedOn", None)
+                    end_timestamp = final_execution_details.get("CompletedOn", None)
+                    query = {
+                        # don't use this, there are multiple log-streams created by each executor. all share the same log stream prefix
+                        # "logStreamNames": [job_run_id],
+                        "logStreamNamePrefix": job_run_id,
+                    }
+                    if start_timestamp:
+                        start_timestamp = int(round(start_timestamp.timestamp() * 1000))
+                        query.update({"startTime": start_timestamp})
+                    if end_timestamp:
+                        end_timestamp = int(round(end_timestamp.timestamp() * 1000))
+                        query.update({"endTime": end_timestamp})
 
-                # build the filter pattern
-                # refer
-                #  https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/FilterAndPatternSyntax.html
-                pattern = None
-                if error_only:
-                    pattern = "?Error ?Exception ?Failure ?ERROR ?EXCEPTION ?FAILURE"
+                    # build the filter pattern
+                    # refer
+                    #  https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/FilterAndPatternSyntax.html
+                    pattern = None
+                    if error_only:
+                        pattern = "?Error ?Exception ?Failure ?ERROR ?EXCEPTION ?FAILURE"
 
-                if filter_pattern:
-                    pattern = (pattern + " " + filter_pattern) if pattern else filter_pattern
+                    if filter_pattern:
+                        pattern = (pattern + " " + filter_pattern) if pattern else filter_pattern
 
-                if pattern:
-                    query.update({"filterPattern": pattern})
+                    if pattern:
+                        query.update({"filterPattern": pattern})
 
-                if next_token:
-                    query.update({"nextToken": next_token})
+                    if next_token:
+                        query.update({"nextToken": next_token})
 
-                if limit:
-                    query.update({"limit": limit})
+                    if limit:
+                        query.update({"limit": limit})
 
-                records = []
-                for log_group_type in LOG_GROUPS:
-                    query.update({"logGroupName": generate_loggroup_name(log_group_type)})
-                    response = self._filter_log_events(**query)
-                    # TODO observe and handle cases where events are empty but nextToken is returned
-                    # while not response["events"] and response.get("nextToken", None):
-                    #    query.update({"nextToken": response["nextToken"]})
-                    #    time.sleep(1)
-                    #    response = self._filter_log_events(**query)
-                    records.extend(response["events"])
+                    records = []
+                    for log_group_type in LOG_GROUPS:
+                        query.update({"logGroupName": generate_loggroup_name(log_group_type)})
+                        while True:
+                            response = self._filter_log_events(**query)
+                            events = response.get("events", [])
+                            for event in events:
+                                if event.get("message", None):
+                                    event["timestamp"] = datetime.utcfromtimestamp(event["timestamp"] / 1000.0).isoformat()
+                                    if "ingestionTime":
+                                        del event["ingestionTime"]
+                                    if "eventId" in event:
+                                        del event["eventId"]
+                                    if "logStreamName" in event:
+                                        del event["logStreamName"]
+                                    records.append(event)
+                            if limit is not None and len(records) >= limit:
+                                break
 
-                log_stream_urls = generate_logstream_urls(self.region, job_run_id)
-                return ComputeLogQuery(records, log_stream_urls, response.get("nextToken", None))
+                            token = response.get("nextToken", None)
+                            if not token:
+                                if "nextToken" in query:
+                                    del query["nextToken"]
+                                break
+                            query.update({"nextToken": token})
+
+                        if limit is not None and len(records) >= limit:
+                            break
+
+                    log_stream_urls = generate_logstream_urls(self.region, job_run_id)
+                    return ComputeLogQuery(records, log_stream_urls, next_token=None)
 
     # main reason this has been wrapped here is better testability
     def _filter_log_events(self, **query) -> Dict[str, Any]:

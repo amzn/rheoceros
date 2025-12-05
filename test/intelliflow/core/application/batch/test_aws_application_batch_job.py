@@ -423,7 +423,20 @@ class TestAWSApplicationBatchJob(AWSTestBase):
                 AWSBatchJob(
                     containerOverrides={
                         # relies on template rendering at runtime
-                        "command": ["--input1", "${input1_alias}", "--input2", "${input1}", "--o", "${output}", "--r", "${region}"],
+                        "command": [
+                            "--input1",
+                            "${input1_alias}",
+                            "--input2",
+                            "${input1}",
+                            "--o",
+                            "${output}",
+                            "--r",
+                            "${region}",
+                            # driver keywords - at runtime, will be converted to provisioned job def/queue names
+                            "{jobDefinition}",
+                            "{jobQueue}",
+                            "^[eval]'option1' if ${region}==1 else 'option2'",
+                        ],
                     },
                     jobDefinition={
                         "jobDefinitionName": "product-dna-gpu",

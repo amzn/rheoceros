@@ -63,6 +63,7 @@ adex_kickoff_job = app.create_data(id="ADEX_BladeKickOffJob",
                                                        """
                                                         ,
                                                         external_library_paths=[
+                                                            # REPLACE with another super JAR to run the example
                                                             "s3://{JAR_BUCKET}/batch/DexmlBladeGlue-super.jar"
                                                         ]
                                                         ),

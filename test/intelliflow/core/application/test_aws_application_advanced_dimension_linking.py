@@ -205,3 +205,56 @@ class TestAWSApplicationAdvancedDimensionLinking(AWSTestBase):
         assert path
 
         self.patch_aws_stop()
+
+    def test_application_advanced_dimension_linking_output_linking_pitfalls(self):
+        """
+        Output dimension link bad user inputs. Validatino is important here to avoid cryptic error messages later during
+        the activation process.
+        """
+        self.patch_aws_start(glue_catalog_has_all_andes_tables=True)
+
+        app = AWSApplication("out-links-err", self.region)
+
+        ext_data_1 = app.marshal_external_data(
+            external_data_desc=S3Dataset("111222333444", "bucket", "foo", "{}", "{}").link(
+                GlueTable(database="my_database", table_name="foo")
+            ),
+            id="external_data1",
+            dimension_spec={
+                "day": {
+                    "type": DimensionType.DATETIME,
+                    "format": "%Y%m%d",  # declare how it is used in the bucket (e.g '20211122')
+                    "hour": {"type": DimensionType.LONG},
+                }
+            },
+        )
+
+        ext_data_2 = app.marshal_external_data(
+            external_data_desc=S3Dataset("111222333444", "bucket", "bar", "{}"),
+            id="external_data2",
+            dimension_spec={
+                "timestamp": {"type": DimensionType.DATETIME, "format": "%Y-%m-%d %H:%M:%S", "granularity": DatetimeGranularity.HOUR}
+            },
+        )
+
+        # 1 - If LHS is a string (output dimension type), then it must be an output dimension
+        with pytest.raises(ValueError):
+            app.create_data(
+                id="case_1",
+                inputs=[ext_data_1, ext_data_2],
+                output_dim_links=[
+                    ("IS_NOT_AN_OUTPUT_DIMENSION", EQUALS, ext_data_2("day")),
+                ],
+                compute_targets=[NOOPCompute],  # do nothing
+            )
+
+        # 2- LHS must be an output dimension (str) or an input dimension
+        with pytest.raises(ValueError):
+            app.create_data(
+                id="case_1",
+                inputs=[ext_data_1, ext_data_2],
+                output_dim_links=[
+                    (1111, EQUALS, ext_data_2("day")),
+                ],
+                compute_targets=[NOOPCompute],  # do nothing
+            )

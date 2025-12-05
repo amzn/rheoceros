@@ -496,7 +496,7 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
                     retrieved_count = retrieved_count + 1
                     if limit is not None and retrieved_count >= limit:
                         break
-                except AttributeError as serialization_error:
+                except (AttributeError, ModuleNotFoundError) as serialization_error:
                     # TODO METRICS_SUPPORT (backwards incompatible framework change)
                     logging.critical(f"Incompatible inactive record detected during scan. Ignoring...")
 
@@ -516,7 +516,8 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
             # drop PNs due to DDB record size limit. if we don't do this, then in large-scale operations ICRs might drop
             pending_nodes = route.pending_nodes
             route._pending_nodes = None
-            serialized_route = dumps(route, compress=True)
+            # FUTURE enable if we need this in the future (to refer the old snapshot of Route for any use-case)
+            # serialized_route = dumps(route, compress=True)
             route._pending_nodes = pending_nodes
 
             # with self._routing_history_table.batch_writer() as batch:
@@ -554,7 +555,7 @@ class AWSDDBRoutingTable(AWSConstructMixin, RoutingTable):
                             "slot_type": inactive_record.slot.type.value,
                             # TODO create a GSI to get compute records that belong to the same context together
                             "execution_context_id": inactive_record.execution_context_id,
-                            "serialized_route": serialized_route,
+                            # "serialized_route": serialized_route,
                             "serialized_inactive_compute_record": dumps(inactive_record, compress=True),
                         }
                     )

@@ -1159,6 +1159,242 @@ class TestAWSApplicationAdvancedInputModes(AWSTestBase):
 
         self.patch_aws_stop()
 
+    @pytest.mark.parametrize(
+        "timer_shift",
+        [
+            # (None),
+            # (0),
+            (-2),
+            # (2),
+        ],
+    )
+    def test_application_range_expansion_over_materialized_dimension_filter_with_timer_shift(self, timer_shift: int):
+        """Modified version of above test scenario utilizing timer shift:
+        - Signal has a materialized value in dimension filter already in its "external data declaration"
+        - When inputted to a data-node a range is defined
+        - Range expansion should use the materialized (hard-coded) value from its dimension filter as the TIP for the
+        desired range. Range expansion should occur based on the depth defined by the user. So the input should represent
+        multiple resource paths (partitions) starting from the hardcoded value up/down to the end of the range.
+        """
+        app = self._create_app()
+        daily_timer = app.add_timer(
+            "daily_timer",
+            "rate(1 day)",
+            time_dimension_id="day",
+            time_dimension_granularity=DatetimeGranularity.DAY,
+            time_dimension_shift=timer_shift,
+        )
+        if timer_shift is None:
+            timer_shift = 0
+
+        # - define the signal
+        smart_filtering_data = app.marshal_external_data(
+            S3Dataset(
+                self.account_id,
+                "bucket",
+                "folder",
+                "{}",  # partition #1
+                "smart-defaulting-data-{}",  # partition #2
+                "{}",  # partition #3
+                dataset_format=DataFormat.CSV,
+                delimiter=",",
+            ),
+            id="smart_filtering_external_data",
+            dimension_spec={
+                "region": {
+                    "type": DimensionType.STRING,
+                    "day": {"type": DimensionType.DATETIME, "format": "%Y-%m-%d", "index": {"type": DimensionType.LONG}},
+                }
+            },
+            # HARDCODED (prefiltered) value of 7 on partition "index"
+            dimension_filter={"*": {"*": {7: {}}}},
+            protocol=SignalIntegrityProtocol("FILE_CHECK", {"file": "_SUCCESS"}),
+        )
+
+        region = "NA"
+        pre_process_single_date_core_NA = app.create_data(
+            id=f"pre_process_single_date_core_{region}",
+            inputs={"daily_data": smart_filtering_data[region]["*"][:-8].reference(), "timer": daily_timer},
+            output_dimension_spec={
+                "dataset": {
+                    type: DimensionType.STRING,
+                    "modelName": {
+                        type: DimensionType.STRING,
+                        "modelVersion": {
+                            type: DimensionType.STRING,
+                            "region": {
+                                type: DimensionType.STRING,
+                                "day": {type: DimensionType.DATETIME, "granularity": DatetimeGranularity.DAY, "format": "%Y-%m-%d"},
+                            },
+                        },
+                    },
+                }
+            },
+            output_dim_links=[
+                ("dataset", EQUALS, "prod"),
+                ("modelName", EQUALS, "DORE"),
+                ("modelVersion", EQUALS, "1.1"),
+                ("region", EQUALS, region),  # Declaration is unnecessary - adding for better readability
+                ("day", EQUALS, daily_timer("day")),
+            ],
+            compute_targets=[NOOPCompute],
+        )
+        # do an early check even without activation. even in the interpreted node data daily_data input should have the range already.
+        node_route: Route = pre_process_single_date_core_NA.bound.create_route()
+        daily_data_signal: Signal = [signal for signal in node_route.link_node.signals if signal.alias == "daily_data"][0]
+        materialized_resource_paths = daily_data_signal.get_materialized_resource_paths()
+        assert len(materialized_resource_paths) == 8
+        assert materialized_resource_paths[0].endswith("7")
+        assert materialized_resource_paths[7].endswith("0")
+
+        app.execute(pre_process_single_date_core_NA["prod"]["DORE"]["1.1"][region]["2022-09-13"])
+
+        path, compute_records = app.poll(pre_process_single_date_core_NA["prod"]["DORE"]["1.1"][region]["2022-09-13"])
+        assert path
+        compute_record = compute_records[0]
+
+        # this is the signal that would be received by batch-compute drivers or InlinedCompute code
+        daily_data_signal_from_execution: Signal = [
+            signal for signal in compute_record.materialized_inputs if signal.alias == "daily_data"
+        ][0]
+        materialized_resource_paths = daily_data_signal_from_execution.get_materialized_resource_paths()
+        assert len(materialized_resource_paths) == 8
+        assert materialized_resource_paths[0].endswith("7")
+        assert materialized_resource_paths[7].endswith("0")
+
+        # extra sanity-check on both inputs and the output to make sure that links have worked well too
+        timer_signal: Signal = [signal for signal in compute_record.materialized_inputs if signal.alias == "timer"][0]
+        DimensionFilter.check_equivalence(
+            timer_signal.domain_spec.dimension_filter_spec, DimensionFilter.load_raw({f"2022-09-{13 + timer_shift}": {}})  # one day ahead
+        )
+
+        DimensionFilter.check_equivalence(
+            daily_data_signal_from_execution.domain_spec.dimension_filter_spec,
+            DimensionFilter.load_raw(
+                {
+                    "NA": {
+                        "2022-09-13": {  # same as the output
+                            7: {},
+                            6: {},
+                            5: {},
+                            4: {},
+                            3: {},
+                            2: {},
+                            1: {},
+                            0: {},
+                        }
+                    }
+                }
+            ),
+        )
+        # and finally the output
+        DimensionFilter.check_equivalence(
+            compute_record.materialized_output.domain_spec.dimension_filter_spec,
+            DimensionFilter.load_raw({"prod": {"DORE": {"1.1": {region: {"2022-09-13"}}}}}),  # as provided in "execute" call
+        )
+
+        # 2- Now emulate timer event
+        app.process(daily_timer["2022-09-13"])  # final day value will be determined by timer_shift
+
+        output_day = f"2022-09-{13 + timer_shift}"
+        path, compute_records = app.poll(pre_process_single_date_core_NA["prod"]["DORE"]["1.1"][region][output_day])
+        assert path
+        compute_record = compute_records[0]
+
+        # this is the signal that would be received by batch-compute drivers or InlinedCompute code
+        daily_data_signal_from_execution: Signal = [
+            signal for signal in compute_record.materialized_inputs if signal.alias == "daily_data"
+        ][0]
+
+        # extra sanity-check on both inputs and the output to make sure that links have worked well too
+        timer_signal: Signal = [signal for signal in compute_record.materialized_inputs if signal.alias == "timer"][0]
+        DimensionFilter.check_equivalence(
+            timer_signal.domain_spec.dimension_filter_spec, DimensionFilter.load_raw({output_day: {}})  # one day ahead
+        )
+
+        DimensionFilter.check_equivalence(
+            daily_data_signal_from_execution.domain_spec.dimension_filter_spec,
+            DimensionFilter.load_raw(
+                {
+                    "NA": {
+                        output_day: {  # same as the output
+                            7: {},
+                            6: {},
+                            5: {},
+                            4: {},
+                            3: {},
+                            2: {},
+                            1: {},
+                            0: {},
+                        }
+                    }
+                }
+            ),
+        )
+        # and finally the output
+        DimensionFilter.check_equivalence(
+            compute_record.materialized_output.domain_spec.dimension_filter_spec,
+            DimensionFilter.load_raw({"prod": {"DORE": {"1.1": {region: {output_day}}}}}),  # as provided in "execute" call
+        )
+
+        # 3- Emulate raw event ingestion
+        app.process(
+            {
+                "version": "0",
+                "id": "7c289f9d-0d83-e481-8279-257acdc04fac",
+                "detail-type": "Scheduled Event",
+                "source": "aws.events",
+                "account": self.account_id,
+                "time": "2025-02-13T00:00:00Z",
+                "region": self.region,
+                "resources": [f"arn:aws:events:us-east-1:{self.account_id}:rule/{app.id}-daily_timer"],
+                "detail": {},
+            }
+        )
+
+        output_day = f"2025-02-{13 + timer_shift}"
+        path, compute_records = app.poll(pre_process_single_date_core_NA["prod"]["DORE"]["1.1"][region][output_day])
+        assert path
+        compute_record = compute_records[0]
+
+        # this is the signal that would be received by batch-compute drivers or InlinedCompute code
+        daily_data_signal_from_execution: Signal = [
+            signal for signal in compute_record.materialized_inputs if signal.alias == "daily_data"
+        ][0]
+
+        # extra sanity-check on both inputs and the output to make sure that links have worked well too
+        timer_signal: Signal = [signal for signal in compute_record.materialized_inputs if signal.alias == "timer"][0]
+        DimensionFilter.check_equivalence(
+            timer_signal.domain_spec.dimension_filter_spec, DimensionFilter.load_raw({output_day: {}})  # one day ahead
+        )
+
+        DimensionFilter.check_equivalence(
+            daily_data_signal_from_execution.domain_spec.dimension_filter_spec,
+            DimensionFilter.load_raw(
+                {
+                    "NA": {
+                        output_day: {  # same as the output
+                            7: {},
+                            6: {},
+                            5: {},
+                            4: {},
+                            3: {},
+                            2: {},
+                            1: {},
+                            0: {},
+                        }
+                    }
+                }
+            ),
+        )
+        # and finally the output
+        DimensionFilter.check_equivalence(
+            compute_record.materialized_output.domain_spec.dimension_filter_spec,
+            DimensionFilter.load_raw({"prod": {"DORE": {"1.1": {region: {output_day}}}}}),  # as provided in "execute" call
+        )
+
+        self.patch_aws_stop()
+
     def test_application_date_range_on_input_events(self):
         app = self._create_app()
 

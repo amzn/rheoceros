@@ -12,11 +12,16 @@ import pytest
 import intelliflow.core.platform.drivers.compute.aws_emr as compute_driver
 from intelliflow.core.platform.constructs import RoutingTable
 from intelliflow.core.platform.definitions.aws.common import CommonParams
-from intelliflow.core.platform.definitions.aws.emr.client_wrapper import EmrReleaseLabel, build_glue_catalog_configuration
+from intelliflow.core.platform.definitions.aws.emr.client_wrapper import (
+    EmrReleaseLabel,
+    build_glue_catalog_configuration,
+    build_python_configuration,
+)
 from intelliflow.core.platform.definitions.aws.emr.script.batch.common import (
     APPLICATIONS,
     EMR_CONFIGURATIONS,
     EMR_INSTANCES_SPECS,
+    EMR_USE_SYSTEM_LANGUAGE_RUNTIME,
     EXECUTION_ID,
     EXTRA_JARS,
     INSTANCE_CONFIG_KEY,
@@ -189,16 +194,19 @@ class TestAWSEMRBatchCompute(AWSTestBase, DriverTestUtils):
     def get_driver_and_platform(self):
         mock_compute = AWSEMRBatchCompute(self.params)
         mock_compute._iam = MagicMock()
+        mock_platform = HostPlatform(
+            AWSConfiguration.builder()
+            .with_default_credentials(as_admin=True)
+            .with_region("us-east-1")
+            .with_batch_compute(AWSEMRBatchCompute)
+            .with_param(ActivationParams.UNIQUE_ID_FOR_CONTEXT, "unique_id")
+            .build()
+        )
+        # Prevent platform state loading to avoid MagicMock deserialization errors
+        mock_platform.should_load_constructs = lambda: False
         return (
             mock_compute,
-            HostPlatform(
-                AWSConfiguration.builder()
-                .with_default_credentials(as_admin=True)
-                .with_region("us-east-1")
-                .with_batch_compute(AWSEMRBatchCompute)
-                .with_param(ActivationParams.UNIQUE_ID_FOR_CONTEXT, "unique_id")
-                .build()
-            ),
+            mock_platform,
         )
 
     def test_init_constructor_emr(self):
@@ -260,6 +268,36 @@ class TestAWSEMRBatchCompute(AWSTestBase, DriverTestUtils):
         assert error.typename == "ValueError"
         self.patch_aws_stop()
 
+    def test_compute_dev_init_exception_bad_subnet_id(self):
+        self.patch_aws_start()
+        self.setup_platform_and_params()
+        mock_compute, mock_host_platform = self.get_driver_and_platform()
+        with pytest.raises(Exception) as error:
+            self.params[compute_driver.AWSEMRBatchCompute.EMR_CLUSTER_SUBNET_ID] = 1
+            mock_compute.dev_init(mock_host_platform)
+        assert error.typename == "ValueError"
+        self.patch_aws_stop()
+
+    def test_compute_dev_init_exception_bad_subnet_id2(self):
+        self.patch_aws_start()
+        self.setup_platform_and_params()
+        mock_compute, mock_host_platform = self.get_driver_and_platform()
+        with pytest.raises(Exception) as error:
+            self.params[compute_driver.AWSEMRBatchCompute.EMR_CLUSTER_SUBNET_ID] = [1, 2]
+            mock_compute.dev_init(mock_host_platform)
+        assert error.typename == "ValueError"
+        self.patch_aws_stop()
+
+    def test_compute_dev_init_exception_bad_default_runtime_config(self):
+        self.patch_aws_start()
+        self.setup_platform_and_params()
+        mock_compute, mock_host_platform = self.get_driver_and_platform()
+        with pytest.raises(Exception) as error:
+            self.params[compute_driver.AWSEMRBatchCompute.EMR_DEFAULT_RUNTIME_CONFIG] = ""
+            mock_compute.dev_init(mock_host_platform)
+        assert error.typename == "ValueError"
+        self.patch_aws_stop()
+
     def test_compute_provide_output_attributes_emr(self):
         self.patch_aws_start()
         self.setup_platform_and_params()
@@ -280,6 +318,17 @@ class TestAWSEMRBatchCompute(AWSTestBase, DriverTestUtils):
             mock_compute.provide_output_attributes([input_signal], test_slot, dict())
 
         test_slot.extra_params.update({"partition_by": ["col1", "col2"]})
+        mock_compute.provide_output_attributes([input_signal], test_slot, dict())
+
+        test_slot.extra_params.update({EMR_USE_SYSTEM_LANGUAGE_RUNTIME: "asdas"})
+        with pytest.raises(ValueError):
+            mock_compute.provide_output_attributes([input_signal], test_slot, dict())
+
+        test_slot.extra_params.update({EMR_USE_SYSTEM_LANGUAGE_RUNTIME: "False"})
+        with pytest.raises(ValueError):
+            mock_compute.provide_output_attributes([input_signal], test_slot, dict())
+
+        test_slot.extra_params.update({EMR_USE_SYSTEM_LANGUAGE_RUNTIME: False})
         mock_compute.provide_output_attributes([input_signal], test_slot, dict())
 
         self.patch_aws_stop()
@@ -382,7 +431,7 @@ class TestAWSEMRBatchCompute(AWSTestBase, DriverTestUtils):
             == compute_driver.RuntimeConfig.GlueVersion_3_0
         )
 
-        assert mock_compute._translate_runtime_config({"GlueVersion": "2.0"}, []) == compute_driver.RuntimeConfig.GlueVersion_2_0
+        assert mock_compute._translate_runtime_config({"GlueVersion": "5.0"}, []) == compute_driver.RuntimeConfig.GlueVersion_5_0
 
         assert mock_compute._translate_runtime_config({"GlueVersion": "4.0"}, []) == compute_driver.RuntimeConfig.GlueVersion_4_0
 
@@ -563,6 +612,7 @@ class TestAWSEMRBatchCompute(AWSTestBase, DriverTestUtils):
         self.setup_platform_and_params()
         mock_compute, mock_host_platform = self.get_driver_and_platform()
         self.params[compute_driver.AWSEMRBatchCompute.EMR_CLUSTER_SUBNET_ID] = "subnet-12345789asdfwer"
+        self.params[compute_driver.AWSEMRBatchCompute.EMR_DEFAULT_RUNTIME_CONFIG] = compute_driver.RuntimeConfig.EMR_6_10_0
         self.params[ActivationParams.UNIQUE_ID_FOR_CONTEXT] = "test123_e_8"
         mock_compute.dev_init(mock_host_platform)
         mock_compute.activate()
@@ -614,7 +664,9 @@ class TestAWSEMRBatchCompute(AWSTestBase, DriverTestUtils):
         assert "s3://somewhere/a.jar,s3://swelse/b.jar" in jars
         assert " " not in jars
 
-        assert actual_configurations == [custom_config] + [build_glue_catalog_configuration()]
+        assert actual_configurations == mock_compute._merge_emr_configurations(
+            [custom_config] + [build_python_configuration(), build_glue_catalog_configuration()]
+        )
 
         assert actual_instances_specs["InstanceGroups"][1] == {
             "InstanceRole": "CORE",
@@ -637,7 +689,7 @@ class TestAWSEMRBatchCompute(AWSTestBase, DriverTestUtils):
         self.setup_platform_and_params()
         mock_compute, mock_host_platform = self.get_driver_and_platform()
         expected_subnet_id = "subnet-12345789asdfwer"
-        self.params[compute_driver.AWSEMRBatchCompute.EMR_CLUSTER_SUBNET_ID] = expected_subnet_id
+        self.params[compute_driver.AWSEMRBatchCompute.EMR_CLUSTER_SUBNET_ID] = [expected_subnet_id]
 
         mock_host_platform._context_id = "test123_e_9"
         mock_compute.dev_init(mock_host_platform)

@@ -17,6 +17,7 @@ from intelliflow.core.platform.definitions.aws.common import MAX_SLEEP_INTERVAL_
 from intelliflow.core.platform.definitions.aws.glue.client_wrapper import GlueVersion, GlueWorkerType, glue_spark_version_map
 from intelliflow.core.platform.definitions.aws.s3.object_wrapper import build_object_key
 from intelliflow.core.platform.definitions.compute import ComputeFailedSessionStateType, ComputeSessionStateType
+from intelliflow.core.runtime import PYTHON_VERSION_MAJOR, PYTHON_VERSION_MINOR
 from intelliflow.core.signal_processing.definitions.compute_defs import Lang
 from intelliflow.utils.algorithm import chunk_iter
 
@@ -62,10 +63,21 @@ class EmrReleaseLabel(Enum):
     VERSION_6_6_0 = version.parse("6.6.0"), version.parse("3.2.0"), version.parse("3.2.1")
     VERSION_6_8_0 = version.parse("6.8.0"), version.parse("3.3.0"), version.parse("3.2.1")
     VERSION_6_10_0 = version.parse("6.10.0"), version.parse("3.3.1"), version.parse("3.3.3")
+    VERSION_6_11_1 = version.parse("6.11.1"), version.parse("3.3.2"), version.parse("3.3.3")
+    VERSION_6_12_0 = version.parse("6.12.0"), version.parse("3.4.0"), version.parse("3.3.3")
+    VERSION_6_15_0 = version.parse("6.15.0"), version.parse("3.4.1"), version.parse("3.3.6")
+    VERSION_7_0_0 = version.parse("7.0.0"), version.parse("3.5.0"), version.parse("3.3.6")
+    VERSION_7_1_0 = version.parse("7.1.0"), version.parse("3.5.0"), version.parse("3.3.6")
+    VERSION_7_2_0 = version.parse("7.2.0"), version.parse("3.5.1"), version.parse("3.3.6")
+    VERSION_7_3_0 = version.parse("7.3.0"), version.parse("3.5.1"), version.parse("3.3.6")
+    VERSION_7_4_0 = version.parse("7.4.0"), version.parse("3.5.2"), version.parse("3.4.0")
+    VERSION_7_5_0 = version.parse("7.5.0"), version.parse("3.5.2"), version.parse("3.4.0")
+    VERSION_7_8_0 = version.parse("7.8.0"), version.parse("3.5.4"), version.parse("3.4.1")
 
     def __init__(self, emr_version: Version, spark_version: Version, hadoop_version: Version):
         """
         EMR release label with corresponding software versions
+        https://docs.aws.amazon.com/emr/latest/ReleaseGuide/emr-release-app-versions-7.x.html
         https://docs.aws.amazon.com/emr/latest/ReleaseGuide/emr-release-app-versions-6.x.html
         https://docs.aws.amazon.com/emr/latest/ReleaseGuide/emr-release-app-versions-5.x.html
         """
@@ -109,6 +121,9 @@ class EmrReleaseLabel(Enum):
             if not spark_version:
                 continue
             if least_spark_version <= spark_version:
+                if release_label == EmrReleaseLabel.VERSION_6_8_0:
+                    # FIX: provisioning error on 6_8_0 with p3.9+ (FUTURE remove when 6_8_0 will be deprecated)
+                    return EmrReleaseLabel.VERSION_6_10_0
                 return release_label
         return None
 
@@ -146,7 +161,7 @@ def get_emr_step_state_type(step_state: str) -> ComputeSessionStateType:
         return ComputeSessionStateType.FAILED
     else:
         logger.critical(
-            f"AWS Glue introduced a new state type {step_state}!"
+            f"AWS EMR introduced a new state type {step_state}!"
             f" Marking it as {ComputeSessionStateType.UNKNOWN}. "
             f" This should be addressed ASAP by IntelliFlow Core,"
             f" or your app should upgrade to a newer IntelliFlow version."
@@ -172,7 +187,7 @@ def get_emr_cluster_state_type(cluster_status: Dict[str, Any]):
             return ComputeSessionStateType.FAILED
     else:
         logger.critical(
-            f"AWS Glue introduced a new state type {state}!"
+            f"AWS EMR introduced a new state type {state}!"
             f" Marking it as {ComputeSessionStateType.UNKNOWN}. "
             f" This should be addressed ASAP by IntelliFlow Core,"
             f" or your app should upgrade to a newer IntelliFlow version."
@@ -207,8 +222,9 @@ def get_emr_cluster_failure_type(cluster_status: Dict[str, Any]):
             return ComputeFailedSessionStateType.TRANSIENT
         elif code == "VALIDATION_ERROR" and "The subnet is not large enough" in msg:
             return ComputeFailedSessionStateType.TRANSIENT
-        elif code == "BOOTSTRAP_FAILURE" and "application provisioning failed" in msg:
-            return ComputeFailedSessionStateType.TRANSIENT
+        # TODO investigate (commented to due to likelihood of getting this with broken bootstrapper script)
+        # elif code == "BOOTSTRAP_FAILURE" and "application provisioning failed" in msg:
+        #    return ComputeFailedSessionStateType.TRANSIENT
         else:
             return ComputeFailedSessionStateType.APP_INTERNAL
     else:
@@ -310,6 +326,29 @@ def build_glue_catalog_configuration(account_id: Optional[str] = None):
     return config
 
 
+def build_python_configuration():
+    return {
+        "Classification": "spark-env",
+        "Configurations": [
+            {
+                "Classification": "export",
+                "Properties": {
+                    # AWS Support: experiment with this. Currently we are injecting this in emr boilerplate code.
+                    # "PYTHONPATH": "<PRIORITIZED_PY_PATH>:$PYTHONPATH",
+                    # "PYTHONPATH": f"/usr/local/lib/python{PYTHON_VERSION_MAJOR}.{PYTHON_VERSION_MINOR}/site-packages:$PYTHONPATH",
+                    # Updated to use /usr/local/bin paths to match bootstrap script configuration
+                    "PYSPARK_DRIVER_PYTHON": f"/usr/local/bin/python{PYTHON_VERSION_MAJOR}.{PYTHON_VERSION_MINOR}",
+                    "PYSPARK_PYTHON": f"/usr/local/bin/python{PYTHON_VERSION_MAJOR}.{PYTHON_VERSION_MINOR}",
+                },
+            },
+        ],
+        ## TODO experiment with AWS Support suggested property.
+        # "Properties": {
+        #   "spark.yarn.appMasterEnv.PYSPARK_PYTHON": f"/usr/local/bin/python{PYTHON_VERSION_MAJOR}.{PYTHON_VERSION_MINOR}"
+        # }
+    }
+
+
 def list_emr_clusters(
     emr_client,
     **kwargs,
@@ -373,3 +412,12 @@ def delete_instance_profile(iam_client, if_exec_role, instance_profile_name=None
             logger.exception("Couldn't delete instance profile %s.", if_exec_role)
             raise
 
+def get_common_bootstrapper(bootstrapper_name: str) -> Path:
+    from intelliflow.utils.compat import path
+
+    from . import bootstrap_actions as bootstrappers
+
+    bootstrapper = None
+    with path(bootstrappers, bootstrapper_name) as resource_path:
+        bootstrapper = Path(resource_path)
+    return bootstrapper

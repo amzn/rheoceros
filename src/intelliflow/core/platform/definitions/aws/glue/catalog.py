@@ -98,7 +98,6 @@ def get_data_format(output_format: str, serde: str) -> Optional[DatasetSignalSou
 
 
 def create_signal(glue_client, database_name: str, table_name: str) -> Optional[GlueTableDesc]:
-    is_andes: bool = False
     try:
         table = exponential_retry(
             glue_client.get_table,
@@ -112,13 +111,13 @@ def create_signal(glue_client, database_name: str, table_name: str) -> Optional[
             return None
         raise
 
-    storage_desc: str = table["Table"]["StorageDescriptor"]
-    location: str = storage_desc["Location"]
-    output_format: str = storage_desc["OutputFormat"]
-    serde_name: str = storage_desc["SerdeInfo"].get("Name", "")
-    serde: str = storage_desc["SerdeInfo"].get("SerializationLibrary", "")
+    storage_desc: str = table["Table"].get("StorageDescriptor", {})
+    location: str = storage_desc.get("Location", "")
+    output_format: str = storage_desc.get("OutputFormat", "")
+    serde_name: str = storage_desc.get("SerdeInfo", {}).get("Name", "")
+    serde: str = storage_desc.get("SerdeInfo", {}).get("SerializationLibrary", "")
 
-    partition_keys = table["Table"]["PartitionKeys"]
+    partition_keys = table["Table"].get("PartitionKeys", None)
     partition_key_names = None
     dim_spec = None
 
@@ -171,19 +170,7 @@ def create_signal(glue_client, database_name: str, table_name: str) -> Optional[
         )
     except ClientError as ex:
         if ex.response["Error"]["Code"] == "EntityNotFoundException":
-            try:
-                partitions = exponential_retry(
-                    glue_client.get_partitions,
-                    CATALOG_COMMON_RETRYABLE_ERRORS,
-                    DatabaseName="andes",
-                    TableName=f"{database_name}.{table_name}",
-                    MaxResults=1,
-                )
-            except ClientError as ex2:
-                if ex2.response["Error"]["Code"] != "FederationSourceException":
-                    raise
-                access_spec.data_partitions_accessible = False
-                partitions = None
+            partitions = None
         else:
             raise
 
@@ -191,40 +178,52 @@ def create_signal(glue_client, database_name: str, table_name: str) -> Optional[
         logger.critical(f"There no partitions in Glue catalog for table: {table_name} in DB: {database_name}!")
     else:
         partition = partitions["Partitions"][0]
-        partition_values = partition["Values"][: len(partition_key_names)]
-        # IMPORTANT: we force load of partitions using the spec (from partition_keys) with error unwinding enabled.
-        # This will enable inconsistency check against partition_keys definition and the actual partition values
-        # in the catalog.
-        # TODO DateVariant should auto-resolve format, until then <timestamp> should be mapped to string.
-        #   without the format, DATETIME will rendered in default datetime string format and this might not be OK
-        #   with S3 paths, etc.
-        try:
-            new_dim_spec = DimensionFilter.load_raw(partition_values, cast=dim_spec, error_out=True).get_spec()
-        except (ValueError, TypeError) as error:
-            logger.warning(
-                f"Glue catalog has inconsistent partition_keys definition for table {table_name!r} "
-                f"in database {database_name!r}!\n Inferred partition (dimension) spec from actual "
-                f"partition values ({partition_values!r}) does not match "
-                f"the spec from table metadata: {dim_spec!r}\n"
-                f"Cast error: {error!r}\n"
-                f"RheocerOS will prefer actual partition values to infer the dimension spec."
-            )
+        if partition_keys:
+            partition_values = partition["Values"][: len(partition_key_names)]
+            # IMPORTANT: we force load of partitions using the spec (from partition_keys) with error unwinding enabled.
+            # This will enable inconsistency check against partition_keys definition and the actual partition values
+            # in the catalog.
+            # TODO DateVariant should auto-resolve format, until then <timestamp> should be mapped to string.
+            #   without the format, DATETIME will rendered in default datetime string format and this might not be OK
+            #   with S3 paths, etc.
+            try:
+                new_dim_spec = DimensionFilter.load_raw(partition_values, cast=dim_spec, error_out=True).get_spec()
+            except (ValueError, TypeError) as error:
+                logger.warning(
+                    f"Glue catalog has inconsistent partition_keys definition for table {table_name!r} "
+                    f"in database {database_name!r}!\n Inferred partition (dimension) spec from actual "
+                    f"partition values ({partition_values!r}) does not match "
+                    f"the spec from table metadata: {dim_spec!r}\n"
+                    f"Cast error: {error!r}\n"
+                    f"IntelliFlow will prefer actual partition values to infer the dimension spec."
+                )
+                new_dim_spec = DimensionFilter.load_raw(partition_values).get_spec()
+        else:
+            partition_values = partition["Values"]
             new_dim_spec = DimensionFilter.load_raw(partition_values).get_spec()
         # transfer names from the original spec
         new_dim_spec.compensate(other_spec=dim_spec)
         dim_spec = new_dim_spec
-    # all pass filter
-    dim_filter_spec = DimensionFilter.all_pass(dim_spec)
-    dim_filter_spec.set_spec(dim_spec)
+
+    if dim_spec is not None:
+        # all pass filter
+        dim_filter_spec = DimensionFilter.all_pass(dim_spec)
+        dim_filter_spec.set_spec(dim_spec)
+    else:
+        dim_filter_spec = None
 
     signal = Signal(
         type=SignalType.EXTERNAL_GLUE_TABLE_PARTITION_UPDATE,
         resource_access_spec=access_spec,
-        domain_spec=SignalDomainSpec(
-            dimension_spec=dim_spec,
-            dimension_filter_spec=dim_filter_spec,
-            # @USER_PARAM ALWAYS!
-            integrity_check_protocol=None,
+        domain_spec=(
+            SignalDomainSpec(
+                dimension_spec=dim_spec,
+                dimension_filter_spec=dim_filter_spec,
+                # @USER_PARAM ALWAYS!
+                integrity_check_protocol=None,
+            )
+            if (dim_spec is not None)
+            else None
         ),
         alias=table_name,
     )
@@ -290,7 +289,7 @@ def check_table(session: boto3.Session, region: str, database: str, table_name: 
 
         table_list = response_get_tables["TableList"]
         for table in table_list:
-            if table["Name"] == table_name or table["Name"] == f"{database}.{table_name}":
+            if table["Name"] == table_name or table["Name"] == f"{database.lower()}.{table_name.lower()}":
                 return True
     except ClientError:
         logger.exception("Couldnt fetch table %s from %s database", table_name, database)

@@ -9,6 +9,7 @@ from typing import ClassVar, Dict, Iterator, List, Optional, Sequence, Set, Tupl
 
 import boto3
 from botocore.exceptions import ClientError
+from overrides import overrides
 
 from intelliflow.core.platform.definitions.aws.sns.client_wrapper import find_subscription
 from intelliflow.core.platform.definitions.common import ActivationParams
@@ -24,6 +25,7 @@ from intelliflow.core.signal_processing.signal_source import (
 
 from ...constructs import (
     BaseConstruct,
+    ConstructExternalEntityAuthConf,
     ConstructInternalMetricDesc,
     ConstructParamsDict,
     ConstructPermission,
@@ -141,7 +143,7 @@ class AWSS3StorageBasic(AWSConstructMixin, Storage):
 
     def load_folder(self, prefix_or_folders: Union[str, Sequence[str]], limit: int = None) -> Iterator[Tuple[str, bytes]]:
         """returns (materialized full path ~ data) pairs"""
-        folder = prefix_or_folders if isinstance(prefix_or_folders, str) else prefix_or_folders.join("/")
+        folder = prefix_or_folders if isinstance(prefix_or_folders, str) else "/".join(prefix_or_folders)
         objects_in_folder = list_objects(self._bucket, folder, limit)
         for object in objects_in_folder:
             key = object.key
@@ -161,7 +163,7 @@ class AWSS3StorageBasic(AWSConstructMixin, Storage):
             path_it = self.load_folder(materialized_path.lstrip("/"), limit)
             yield from path_it
 
-    def delete_internal(self, internal_signal: Signal, entire_domain: bool = True) -> bool:
+    def _delete_internal(self, internal_signal: Signal, entire_domain: bool = True) -> bool:
         """Deletes the internal data represented by this signal.
 
         If 'entire_domain' is True (by default), then internal data represented by the all possible dimension values
@@ -506,6 +508,91 @@ class AWSS3StorageBasic(AWSConstructMixin, Storage):
             exponential_retry(
                 self._s3.meta.client.delete_bucket_encryption, [], Bucket=self._bucket_name, ExpectedBucketOwner=self._account_id
             )
+
+    @overrides
+    def _process_external_entity_auth_conf(
+        self, new_auth_conf: ConstructExternalEntityAuthConf, current_auth_conf: ConstructExternalEntityAuthConf
+    ) -> None:
+        entities_to_be_added = set(new_auth_conf.keys()) if new_auth_conf else set()
+        entities_to_be_removed = (set(current_auth_conf.keys()) if current_auth_conf else set()) - entities_to_be_added
+
+        if entities_to_be_added or entities_to_be_removed:
+            exponential_retry(
+                put_cmk_policy,
+                ["DependencyTimeoutException", "KMSInternalException"],
+                self._kms,
+                self._cmk_id,
+                self._account_id,
+                users_to_be_added=entities_to_be_added,
+                users_to_be_removed=entities_to_be_removed,
+                # leave this flag as is (None)
+                trust_same_account=None,
+            )
+
+            unique_context_id = self._params[ActivationParams.UNIQUE_ID_FOR_CONTEXT]
+
+            def _custom_perm_statement(self, entity, entity_permissions):
+                return {
+                    "Sid": f"external_entity_{generate_statement_id(entity)}",
+                    "Effect": "Allow",
+                    "Principal": {"AWS": list([entity])},
+                    "Action": [action for perm in entity_permissions for action in perm.action],
+                    "Resource": [f"arn:aws:s3:::{self._bucket.name}/*", f"arn:aws:s3:::{self._bucket.name}"],
+                }
+
+            # remove statements for custom permissions of the removed entities in all cases
+            removed_statements = []
+            for entity in entities_to_be_removed:
+                entity_permissions = current_auth_conf[entity]
+                if entity_permissions:
+                    removed_statements.append(_custom_perm_statement(self, entity, entity_permissions))
+
+            if entities_to_be_added:
+                # same Sid will be used to update the same statement so we don't need to deal with removed
+                # entities separately.
+                put_policy_desc = {
+                    "Version": "2012-10-17",
+                    "Id": str(uuid.uuid1()),
+                    "Statement": [
+                        {
+                            "Sid": f"{unique_context_id}_external_entity_auth_conf",
+                            "Effect": "Allow",
+                            "Principal": {"AWS": list(entities_to_be_added)},
+                            "Action": ["s3:Get*", "s3:List*"],
+                            "Resource": [f"arn:aws:s3:::{self._bucket.name}/*", f"arn:aws:s3:::{self._bucket.name}"],
+                        },
+                    ],
+                }
+
+                # add statements for custom permissions
+                for entity in entities_to_be_added:
+                    entity_permissions = new_auth_conf[entity]
+                    if entity_permissions:
+                        put_policy_desc["Statement"].append(_custom_perm_statement(self, entity, entity_permissions))
+            else:
+                put_policy_desc = None
+                removed_statements = [
+                    {
+                        "Sid": f"{unique_context_id}_external_entity_auth_conf",
+                        "Effect": "Allow",
+                        "Principal": {"AWS": list(entities_to_be_removed)},
+                        "Action": ["s3:Get*", "s3:List*"],
+                        "Resource": [f"arn:aws:s3:::{self._bucket.name}/*", f"arn:aws:s3:::{self._bucket.name}"],
+                    },
+                ]
+            try:
+                exponential_retry(
+                    update_policy,
+                    {"MalformedPolicy", "AccessDenied", "ServiceException", "TooManyRequestsException"},
+                    self._s3,
+                    self._bucket.name,
+                    put_policy_desc,
+                    removed_statements,
+                )
+            except ClientError as error:
+                if error.response["Error"]["Code"] == "MalformedPolicy":
+                    module_logger.error("Couldn't put the policy for storage! Error: %s", str(error))
+                raise
 
     def process_downstream_connection(self, downstream_platform: "DevelopmentPlatform") -> UpstreamGrants:
         """Called by downstream platform to establish/update the connection"""

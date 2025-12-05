@@ -78,6 +78,8 @@ class AWSBatchCompute(AWSConstructMixin, BatchCompute):
     # IntelliFlow-Batch-{APP ID}-{USER_PROVIDED_NAME}
     BATCH_JOB_DEFINITION_NAME_PATTERN = "IntelliFlow-Batch-{}-{}"
 
+    COMMAND_EVAL_KEYWORD = "^[eval]"
+
     @classmethod
     def driver_spec(cls) -> DimensionFilter:
         return DimensionFilter.load_raw(
@@ -256,7 +258,13 @@ class AWSBatchCompute(AWSConstructMixin, BatchCompute):
             command = containerOverrides["command"]
             rendered_command = []
             for arg in command:
-                rendered_command.append(renderer.render(arg))
+                if arg.startswith(self.COMMAND_EVAL_KEYWORD):
+                    try:
+                        rendered_command.append(eval(renderer.render(arg[len(self.COMMAND_EVAL_KEYWORD) :])))
+                    except (ValueError, SyntaxError) as err:
+                        raise err
+                else:
+                    rendered_command.append(renderer.render(arg))
 
             containerOverrides.update({"command": rendered_command})
 
@@ -268,10 +276,20 @@ class AWSBatchCompute(AWSConstructMixin, BatchCompute):
             api_params.update(
                 {"jobDefinition": self._build_batch_job_definition_name(self.get_platform().context_id, job_def["jobDefinitionName"])}
             )
+            # handles when batch script needs provisioned def name too
+            if containerOverrides and "{jobDefinition}" in containerOverrides["command"]:
+                containerOverrides["command"] = [
+                    api_params["jobDefinition"] if arg == "{jobDefinition}" else arg for arg in containerOverrides["command"]
+                ]
 
         if isinstance(job_queue, dict):
             # IF managed queue, set the provisioned queue name
             api_params.update({"jobQueue": self._build_batch_job_queue_name(self.get_platform().context_id, job_queue["jobQueueName"])})
+            # handles when batch script needs provisioned queue name too
+            if containerOverrides and "{jobQueue}" in containerOverrides["command"]:
+                containerOverrides["command"] = [
+                    api_params["jobQueue"] if arg == "{jobQueue}" else arg for arg in containerOverrides["command"]
+                ]
 
         batch_client = self._get_batch_client(slot)
         if AWS_BATCH_ORCHESTRATOR_ROLE_ARN_PARAM in api_params:
@@ -423,7 +441,7 @@ class AWSBatchCompute(AWSConstructMixin, BatchCompute):
         # TODO make this contingent based on the use of IF EXEC role as instancerole in managed compute env (if any)
         #  or execution roles in managed job def (if any)
         #  - use pending routes for this
-        return ["service-role/AWSBatchServiceRole", "service-role/AmazonEC2ContainerServiceforEC2Role"]
+        return ["service-role/AWSBatchServiceRole", "AWSBatchFullAccess", "service-role/AmazonEC2ContainerServiceforEC2Role"]
 
     @classmethod
     def _build_batch_job_name(cls, app_id: str, uuid: str):

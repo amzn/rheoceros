@@ -21,12 +21,14 @@ from intelliflow.core.signal_processing.routing_runtime_constructs import Route
 from intelliflow.core.signal_processing.signal import SignalDomainSpec, SignalType
 from intelliflow.core.signal_processing.signal_source import (
     DATA_FORMAT_KEY,
+    DATA_PERSISTENCE_KEY,
     DATA_TYPE_KEY,
     DATASET_FORMAT_KEY,
     DATASET_HEADER_KEY,
     DATASET_SCHEMA_TYPE_KEY,
     ENCRYPTION_KEY_KEY,
     CWMetricSignalSourceAccessSpec,
+    DataPersistence,
     DatasetSchemaType,
     DatasetSignalSourceAccessSpec,
     DatasetSignalSourceFormat,
@@ -97,6 +99,7 @@ from ...definitions.aws.glue.client_wrapper import (
     start_glue_job,
     update_glue_job,
 )
+from ...definitions.aws.glue.script.batch.glueetl_default_ABI import GlueDefaultABIPython
 from ...definitions.aws.s3.bucket_wrapper import MAX_BUCKET_LEN, bucket_exists, create_bucket, delete_bucket, get_bucket, put_policy
 from ...definitions.aws.s3.object_wrapper import build_object_key, delete_folder, empty_bucket, object_exists, put_object
 from ...definitions.common import ActivationParams
@@ -115,6 +118,7 @@ from ...definitions.compute import (
     ComputeSessionStateType,
     ComputeSuccessfulResponse,
     ComputeSuccessfulResponseType,
+    validate_compute_runtime_identifiers,
 )
 from ..aws_common import AWSConstructMixin
 
@@ -188,9 +192,17 @@ class AWSAthenaBatchCompute(AWSConstructMixin, BatchCompute):
         self._glue = None
 
     def provide_output_attributes(self, inputs: List[Signal], slot: Slot, user_attrs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        # early validation to avoid bad debugging xp at runtime
+        validate_compute_runtime_identifiers(inputs, extra_reserved_keywords=GlueDefaultABIPython.RESERVED_KEYWORDS)
+
         if user_attrs.get(DATA_TYPE_KEY, DataType.DATASET) != DataType.DATASET:
             raise ValueError(
                 f"{DATA_TYPE_KEY!r} must be defined as {DataType.DATASET} or left undefined for {self.__class__.__name__} output!"
+            )
+
+        if user_attrs.get(DATA_PERSISTENCE_KEY, DataPersistence.MANAGED) != DataPersistence.MANAGED:
+            raise ValueError(
+                f"{DATA_PERSISTENCE_KEY!r} must be defined as {DataPersistence.MANAGED} or left undefined for {self.__class__.__name__} output!"
             )
 
         if slot.extra_params and "partition_by" in slot.extra_params:
@@ -214,6 +226,7 @@ class AWSAthenaBatchCompute(AWSConstructMixin, BatchCompute):
 
         return {
             DATA_TYPE_KEY: DataType.DATASET,
+            DATA_PERSISTENCE_KEY: DataPersistence.MANAGED,
             DATASET_HEADER_KEY: not header_not_supported,  # we cannot control CTAS header generation (so ignore usr setting to False)
             DATASET_SCHEMA_TYPE_KEY: DatasetSchemaType.ATHENA_CTAS_SCHEMA_JSON,
             DATASET_FORMAT_KEY: data_format,
@@ -239,7 +252,10 @@ class AWSAthenaBatchCompute(AWSConstructMixin, BatchCompute):
         if retry_session_desc:
             # 0- check which stage should be retried. if it has passed the prologue stage already,
             # then retry on the 2nd stage directly (OPTIMIZATION).
-            prologue_job_arn: str = self._glue_job_lang_map[GlueJobLanguage.from_slot_lang(Lang.PYTHON)]["2.0"]["job_arn"]
+            # Extract GlueVersion from slot extra_params to get correct job ARN
+            glue_version = str(slot.extra_params.get("GlueVersion", "2.0"))
+            python_jobs = self._glue_job_lang_map[GlueJobLanguage.from_slot_lang(Lang.PYTHON)]
+            prologue_job_arn: str = python_jobs.get(glue_version, python_jobs["2.0"])["job_arn"]
             if retry_session_desc.resource_desc.resource_path != prologue_job_arn:
                 # execution is already in the second (Athena CTAS) stage
                 return self._ctas_compute(materialized_inputs, slot, materialized_output, execution_ctx_id, session_dec=retry_session_desc)
@@ -282,9 +298,10 @@ class AWSAthenaBatchCompute(AWSConstructMixin, BatchCompute):
 
         # RUN CTAS PROLOGUE to create materialized Athena views for each input
         lang = GlueJobLanguage.from_slot_lang(Lang.PYTHON)
-        glue_version = "2.0"
+        # Extract GlueVersion from slot extra_params, default to "2.0"
+        glue_version = str(extra_params.get("GlueVersion", "2.0"))
         lang_spec = self._glue_job_lang_map[lang]
-        version_spec = lang_spec[glue_version]
+        version_spec = lang_spec.get(glue_version, lang_spec["2.0"])  # fallback to 2.0
         job_name: str = version_spec["job_name"]
         job_arn: str = version_spec["job_arn"]
         # Add Glue Job execution related params (workers, glue version)
@@ -293,7 +310,7 @@ class AWSAthenaBatchCompute(AWSConstructMixin, BatchCompute):
         # PROCESSOR must have materialized the signals in the exec context
         # so even for internal signals, paths should be absolute, fully materialized.
         input_map = BatchInputMap(materialized_inputs)
-        output = BatchOutput(materialized_output)
+        output = BatchOutput(materialized_output, None)
 
         lang_code = str(Lang.PYTHON)
         unique_compute_id: str = str(uuid.uuid1())
@@ -400,7 +417,10 @@ class AWSAthenaBatchCompute(AWSConstructMixin, BatchCompute):
         no;
             - return the session state of the Athena execution.
         """
-        prologue_job_arn: str = self._glue_job_lang_map[GlueJobLanguage.from_slot_lang(Lang.PYTHON)]["2.0"]["job_arn"]
+        # Extract GlueVersion from active compute record to get correct job ARN
+        glue_version = str(active_compute_record.slot.extra_params.get("GlueVersion", "2.0"))
+        python_jobs = self._glue_job_lang_map[GlueJobLanguage.from_slot_lang(Lang.PYTHON)]
+        prologue_job_arn: str = python_jobs.get(glue_version, python_jobs["2.0"])["job_arn"]
         if session_desc.resource_desc.resource_path == prologue_job_arn:
             # STATE: Glue Prologue Job
             job_name = session_desc.resource_desc.resource_name
@@ -762,9 +782,33 @@ class AWSAthenaBatchCompute(AWSConstructMixin, BatchCompute):
                     "params": {
                         "WorkerType": GlueWorkerType.G_1X.value,
                         "NumberOfWorkers": 20,  # heuristical: optimal # of instances to read 'schema' operation in Spark.
+                        "GlueVersion": "2.0",
+                    },
+                },
+                "3.0": {
+                    "job_name": "",
+                    "job_arn": "",
+                    "boilerplate": GlueAthenaCTASPrologue,
+                    "suffix": "v3_0",
+                    "ext": "py",
+                    "params": {
+                        "WorkerType": GlueWorkerType.G_1X.value,
+                        "NumberOfWorkers": 20,
+                        "GlueVersion": "3.0",
+                    },
+                },
+                "4.0": {
+                    "job_name": "",
+                    "job_arn": "",
+                    "boilerplate": GlueAthenaCTASPrologue,
+                    "suffix": "v4_0",
+                    "ext": "py",
+                    "params": {
+                        "WorkerType": GlueWorkerType.G_1X.value,
+                        "NumberOfWorkers": 20,
                         "GlueVersion": "4.0",
                     },
-                }
+                },
             }
         }
         for lang, lang_spec in self._glue_job_lang_map.items():
@@ -795,7 +839,7 @@ class AWSAthenaBatchCompute(AWSConstructMixin, BatchCompute):
         self._glue = boto3.client("glue", region_name=self._region)
 
     def provide_runtime_trusted_entities(self) -> List[str]:
-        return ["athena.amazonaws.com"]
+        return ["athena.amazonaws.com", "glue.amazonaws.com"]
 
     def provide_runtime_default_policies(self) -> List[str]:
         # For testing purposes add;
@@ -939,6 +983,19 @@ class AWSAthenaBatchCompute(AWSConstructMixin, BatchCompute):
                     "athena:BatchGetNamedQuery",
                     "athena:BatchGetQueryExecution",
                     "athena:GetWorkGroup",
+                ],
+            ),
+            # View /proxy access via LF
+            ConstructPermission(
+                ["*"],
+                [
+                    "lakeformation:GetDataAccess",
+                    "lakeformation:GetTableObjects",
+                    "lakeformation:GetDataLakePrincipal",
+                    "lakeformation:GetDataLakeSettings",
+                    "lakeformation:GetResourceLFTags",
+                    "lakeformation:GetLFTag",
+                    "lakeformation:ListLFTags",
                 ],
             ),
             # CW Logs (might look redundant, but please forget about other drivers while declaring these),
@@ -1469,43 +1526,49 @@ class AWSAthenaBatchCompute(AWSConstructMixin, BatchCompute):
     def describe_compute_record(self, active_compute_record: "RoutingTable.ComputeRecord") -> Optional[Dict[str, Any]]:
         execution_details = dict()
         if active_compute_record.session_state and active_compute_record.session_state.executions:
-            final_execution_details = active_compute_record.session_state.executions[::-1][0].details
-            if "QueryExecution" in final_execution_details and final_execution_details["QueryExecution"]:
-                execution_details["details"] = final_execution_details["QueryExecution"]
-                query_execution_id = execution_details["details"]["QueryExecutionId"]
-                execution_details["details"][
-                    "QueryEditorURL"
-                ] = f"https://{self.region}.console.aws.amazon.com/athena/home?region={self.region}#/query-editor/history/{query_execution_id}"
-            elif "GlueVersion" in final_execution_details:
-                # prologue job (in Glue)
-                details = dict()
-                details["JobId"] = final_execution_details.get("Id", None)
-                details["JobName"] = final_execution_details.get("JobName", None)
-                details["JobURL"] = (
-                    f"https://{self.region}.console.aws.amazon.com/gluestudio/home?region={self.region}#/editor/job/{details['JobName']}/details"
-                )
-                details["JobRunURL"] = (
-                    f"https://{self.region}.console.aws.amazon.com/gluestudio/home?region={self.region}#/job/{details['JobName']}/run/{details['JobId']}"
-                )
-                details["JobLogURL"] = (
-                    f"https://{self.region}.console.aws.amazon.com/cloudwatch/home?region={self.region}#logsV2:log-groups/log-group/$252Faws-glue$252Fjobs$252Foutput/log-events/{details['JobId']}"
-                )
-                details["StartedOn"] = final_execution_details.get("StartedOn", None)
-                details["CompletedOn"] = final_execution_details.get("CompletedOn", None)
-                details["JobRunState"] = final_execution_details.get("JobRunState", None)
-                details["Attempt"] = final_execution_details.get("Attempt", None)
-                details["ExecutionTime"] = final_execution_details.get("ExecutionTime", None)
-                details["WorkerType"] = final_execution_details.get("WorkerType", None)
-                details["NumberOfWorkers"] = final_execution_details.get("NumberOfWorkers", None)
-                details["GlueVersion"] = final_execution_details.get("GlueVersion", None)
+            final_execution_details_list = [
+                exec.details
+                for exec in reversed(active_compute_record.session_state.executions)
+                if (exec and exec.details and (exec.details.get("QueryExecution", None) or exec.details.get("Id", None)))
+            ]
+            if final_execution_details_list:
+                final_execution_details = final_execution_details_list[0]
+                if "QueryExecution" in final_execution_details and final_execution_details["QueryExecution"]:
+                    execution_details["details"] = final_execution_details["QueryExecution"]
+                    query_execution_id = execution_details["details"]["QueryExecutionId"]
+                    execution_details["details"][
+                        "QueryEditorURL"
+                    ] = f"https://{self.region}.console.aws.amazon.com/athena/home?region={self.region}#/query-editor/history/{query_execution_id}"
+                elif "GlueVersion" in final_execution_details:
+                    # prologue job (in Glue)
+                    details = dict()
+                    details["JobId"] = final_execution_details.get("Id", None)
+                    details["JobName"] = final_execution_details.get("JobName", None)
+                    details["JobURL"] = (
+                        f"https://{self.region}.console.aws.amazon.com/gluestudio/home?region={self.region}#/editor/job/{details['JobName']}/details"
+                    )
+                    details["JobRunURL"] = (
+                        f"https://{self.region}.console.aws.amazon.com/gluestudio/home?region={self.region}#/job/{details['JobName']}/run/{details['JobId']}"
+                    )
+                    details["JobLogURL"] = (
+                        f"https://{self.region}.console.aws.amazon.com/cloudwatch/home?region={self.region}#logsV2:log-groups/log-group/$252Faws-glue$252Fjobs$252Foutput/log-events/{details['JobId']}"
+                    )
+                    details["StartedOn"] = final_execution_details.get("StartedOn", None)
+                    details["CompletedOn"] = final_execution_details.get("CompletedOn", None)
+                    details["JobRunState"] = final_execution_details.get("JobRunState", None)
+                    details["Attempt"] = final_execution_details.get("Attempt", None)
+                    details["ExecutionTime"] = final_execution_details.get("ExecutionTime", None)
+                    details["WorkerType"] = final_execution_details.get("WorkerType", None)
+                    details["NumberOfWorkers"] = final_execution_details.get("NumberOfWorkers", None)
+                    details["GlueVersion"] = final_execution_details.get("GlueVersion", None)
 
-                job_run_state = final_execution_details.get("JobRunState", None)
-                # Adding error message if the JobRun FAILED OR TIMEDOUT
-                if job_run_state == "FAILED" or job_run_state == "TIMEOUT":
-                    details["ErrorMessage"] = final_execution_details.get("ErrorMessage", None)
-                    details["Timeout"] = final_execution_details.get("Timeout", None)
+                    job_run_state = final_execution_details.get("JobRunState", None)
+                    # Adding error message if the JobRun FAILED OR TIMEDOUT
+                    if job_run_state == "FAILED" or job_run_state == "TIMEOUT":
+                        details["ErrorMessage"] = final_execution_details.get("ErrorMessage", None)
+                        details["Timeout"] = final_execution_details.get("Timeout", None)
 
-                execution_details.update({"details": details})
+                    execution_details.update({"details": details})
 
         # Extract SLOT info
         if active_compute_record.slot:
@@ -1531,9 +1594,14 @@ class AWSAthenaBatchCompute(AWSConstructMixin, BatchCompute):
     ) -> Optional[ComputeLogQuery]:
         if compute_record.session_state:
             if compute_record.session_state.executions:
-                final_execution_details = compute_record.session_state.executions[::-1][0].details
-                if final_execution_details:
-                    query_execution_id = final_execution_details["QueryExecutionId"]
+                final_execution_details_list = [
+                    exec.details
+                    for exec in reversed(compute_record.session_state.executions)
+                    if (exec and exec.details and exec.details.get("QueryExecution", None))
+                ]
+                if final_execution_details_list:
+                    final_execution_details = final_execution_details_list[0]
+                    query_execution_id = final_execution_details["QueryExecution"]["QueryExecutionId"]
 
                     output_url = f"https://{self.region}.console.aws.amazon.com/athena/home?region={self.region}#/query-editor/history/{query_execution_id}"
-                    return ComputeLogQuery(None, [output_url])
+                    return ComputeLogQuery([], [output_url])

@@ -409,6 +409,7 @@ class Signal(Serializable["Signal"]):
         materialized_resource_path: str,
         is_termination: bool = False,
         from_transformed: bool = False,
+        transform_source: bool = False,
     ) -> Optional["Signal"]:
         if not self.resource_access_spec.proxy:
             # if there is no proxy linked to the resource access spec, then this simple check is enough to reject.
@@ -449,6 +450,8 @@ class Signal(Serializable["Signal"]):
                         # we have to chain because these information (i.e params) might change based on breadth.
                         # ex: datetime params for a region might be different than another region
                         dimension_filter.set_spec(chained_filter)
+                        if transform_source:
+                            dimension_filter = dimension_filter.transform()
                         return Signal(
                             self.type,
                             self.resource_access_spec,
@@ -578,8 +581,8 @@ class Signal(Serializable["Signal"]):
 
         return self.filter(new_filter)
 
-    def get_materialized_access_specs(self) -> List[SignalSourceAccessSpec]:
-        return self.resource_access_spec.materialize_for_filter(self.domain_spec.dimension_filter_spec)
+    def get_materialized_access_specs(self, transform: bool = True) -> List[SignalSourceAccessSpec]:
+        return self.resource_access_spec.materialize_for_filter(self.domain_spec.dimension_filter_spec, transform)
 
     def get_materialized_resource_paths(self) -> List[str]:
         return [spec.path_format for spec in self.get_materialized_access_specs()]
@@ -624,11 +627,17 @@ class Signal(Serializable["Signal"]):
 
     def dimension_values_map(self) -> Dict[str, List[Any]]:
         """Get range of values for each dimension from the underlying dimension_filter_spec"""
-        return {key: self.dimension_values(key) for key in self.domain_spec.dimension_spec.get_flattened_dimension_map().keys()}
+        from collections import OrderedDict
+
+        return OrderedDict(
+            (key, self.dimension_values(key)) for key in self.domain_spec.dimension_spec.get_flattened_dimension_map().keys()
+        )
 
     def dimension_type_map(self) -> Dict[str, List[Any]]:
         """Get type for each dimension from the underlying dimension_spec"""
-        return {key: dim.type.value for key, dim in self.domain_spec.dimension_spec.get_flattened_dimension_map().items()}
+        from collections import OrderedDict
+
+        return OrderedDict((key, dim.type.value) for key, dim in self.domain_spec.dimension_spec.get_flattened_dimension_map().items())
 
     def tip_value(self, dimension_name: str) -> Any:
         """Gets the TIP value from a range of variants of input dimension"""
@@ -727,6 +736,7 @@ class SignalDimensionLink:
         return (
             self.lhs_dim == other.lhs_dim
             and self.dim_link_func.__code__.co_code == other.dim_link_func.__code__.co_code
+            and self.dim_link_func.__code__.co_consts == other.dim_link_func.__code__.co_consts
             and self.rhs_dim == other.rhs_dim
         )
 

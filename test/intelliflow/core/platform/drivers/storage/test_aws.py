@@ -60,9 +60,12 @@ class TestAWSS3StorageBasic(AWSTestBase):
         self.params[CommonParams.IF_EXE_ROLE] = "ExeRole"
 
     def get_driver_and_platform(self):
+        mock_platform = HostPlatform(AWSConfiguration.builder().with_default_credentials(as_admin=True).with_region("us-east-1").build())
+        # Prevent intermittent test failures due to platform state loading during context_id assignment
+        mock_platform.should_load_constructs = lambda: False
         return (
             AWSS3StorageBasic(self.params),
-            HostPlatform(AWSConfiguration.builder().with_default_credentials(as_admin=True).with_region("us-east-1").build()),
+            mock_platform,
         )
 
     def test_storage_successful_dev_init(self):

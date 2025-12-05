@@ -227,7 +227,7 @@ class TestAWSApplicationExternalData(AWSTestBase, AWSTestGlueCatalog):
                             {"Name": "ship_cost", "Type": "decimal(10,2)", "Comment": ""},
                             {"Name": "ship_cost_uom", "Type": "string", "Comment": ""},
                         ],
-                        "Location": "s3://foo-subscriptions/427809481713/ATROPS_DDL/.db/O_SLAM_PACKAGES",
+                        "Location": "s3://FOO-subscriptions/427809481713/ATROPS_DDL/.db/O_SLAM_PACKAGES",
                         "InputFormat": "amazon.conexio.hive.EDXManifestHiveInputFormat",
                         "OutputFormat": "amazon.conexio.hive.EDXManifestHiveOutputFormat",
                         "Compressed": False,
@@ -866,7 +866,7 @@ class TestAWSApplicationExternalData(AWSTestBase, AWSTestGlueCatalog):
     def test_application_external_data_glue_table_1(self):
         self.patch_aws_start(glue_catalog_has_all_tables=False, glue_catalog=self)
 
-        app = AWSApplication("andes-test", self.region)
+        app = AWSApplication("and-test", self.region)
 
         ducsi_data = app.marshal_external_data(external_data_desc=GlueTable("booker", "d_unified_cust_shipment_items"))
         assert ducsi_data.bound.data_id == "d_unified_cust_shipment_items"
@@ -928,7 +928,7 @@ class TestAWSApplicationExternalData(AWSTestBase, AWSTestGlueCatalog):
             inputs=[d_ad_orders_na],
             compute_targets=[
                 BatchCompute(
-                    "output=d_ad_orders_na.limit(100)", WorkerType=GlueWorkerType.G_1X.value, NumberOfWorkers=50, GlueVersion="2.0"
+                    "output=d_ad_orders_na.limit(100)", WorkerType=GlueWorkerType.G_1X.value, NumberOfWorkers=50, GlueVersion="4.0"
                 )
             ],
         )
@@ -950,6 +950,7 @@ output=DEXML_DUCSI.limit(100).join(d_ad_orders_na.limit(100), ['customer_id']).l
                     WorkerType=GlueWorkerType.G_1X.value,
                     NumberOfWorkers=100,
                     Timeout=3 * 60,  # 3 hours
+                    GlueVersion="5.0",
                 )
             ],
         )
@@ -970,7 +971,7 @@ output=DEXML_DUCSI.limit(100).join(d_ad_orders_na.limit(100), ['customer_id']).l
     def test_application_external_data_glue_table_dependency_check(self):
         self.patch_aws_start(glue_catalog_has_all_tables=False, glue_catalog=self)
 
-        app = AWSApplication("andes-test", self.region)
+        app = AWSApplication("and-test", self.region)
 
         ducsi_data = app.marshal_external_data(external_data_desc=GlueTable("booker", "d_unified_cust_shipment_items"))
 
@@ -1042,7 +1043,7 @@ output=DEXML_DUCSI.limit(100).join(d_ad_orders_na.limit(100), ['customer_id']).l
 
         # 4- Reset the application topology and do the test by swapping inputs: making parquet version of DUCSI data
         # as a reference input. application will have one node only for this simple/final case
-        app = AWSApplication("andes-test", self.region)
+        app = AWSApplication("and-test", self.region)
         #  dimensions/partition keys: 'region_id' (LONG), 'order_day' (TIMESTAMP)
         ducsi_data_PARQUET = app.glue_table("booker", "d_unified_cust_shipment_items_parquet")
 
@@ -1205,7 +1206,7 @@ output=DEXML_DUCSI.limit(100).join(d_ad_orders_na.limit(100), ['customer_id']).l
             inputs=[tommy_searches],
             compute_targets=[
                 BatchCompute(
-                    "output = tommy_searches.limit(5)", WorkerType=GlueWorkerType.G_1X.value, NumberOfWorkers=20, GlueVersion="2.0"
+                    "output = tommy_searches.limit(5)", WorkerType=GlueWorkerType.G_1X.value, NumberOfWorkers=20, GlueVersion="5.0"
                 )
             ],
         )
@@ -1215,7 +1216,7 @@ output=DEXML_DUCSI.limit(100).join(d_ad_orders_na.limit(100), ['customer_id']).l
             inputs=[d_ad_orders_na],
             compute_targets=[
                 BatchCompute(
-                    "output=d_ad_orders_na.limit(100)", WorkerType=GlueWorkerType.G_1X.value, NumberOfWorkers=50, GlueVersion="2.0"
+                    "output=d_ad_orders_na.limit(100)", WorkerType=GlueWorkerType.G_1X.value, NumberOfWorkers=50, GlueVersion="4.0"
                 )
             ],
         )
@@ -1349,7 +1350,7 @@ output=DEXML_DUCSI.limit(100).join(d_ad_orders_na.limit(100), ['customer_id']).l
             inputs=[tommy_searches],
             compute_targets=[
                 BatchCompute(
-                    "output = tommy_searches.limit(5)", WorkerType=GlueWorkerType.G_1X.value, NumberOfWorkers=20, GlueVersion="2.0"
+                    "output = tommy_searches.limit(5)", WorkerType=GlueWorkerType.G_1X.value, NumberOfWorkers=20, GlueVersion="4.0"
                 )
             ],
         )
@@ -1359,7 +1360,7 @@ output=DEXML_DUCSI.limit(100).join(d_ad_orders_na.limit(100), ['customer_id']).l
             inputs=[d_ad_orders_na],
             compute_targets=[
                 BatchCompute(
-                    "output=d_ad_orders_na.limit(100)", WorkerType=GlueWorkerType.G_1X.value, NumberOfWorkers=50, GlueVersion="2.0"
+                    "output=d_ad_orders_na.limit(100)", WorkerType=GlueWorkerType.G_1X.value, NumberOfWorkers=50, GlueVersion="4.0"
                 )
             ],
         )
@@ -1477,7 +1478,7 @@ output=DEXML_DUCSI.limit(100).join(d_ad_orders_na.limit(100), ['customer_id']).l
         output = spark.sql("select * from adpd_shadow_data").limit(1)
                                                  """,
                     lang=Lang.PYTHON,
-                    GlueVersion="2.0",
+                    GlueVersion="4.0",
                     WorkerType=GlueWorkerType.G_1X.value,
                     NumberOfWorkers=50,
                     Timeout=10 * 60,  # 10 hours
