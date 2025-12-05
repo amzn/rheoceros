@@ -871,7 +871,7 @@ assert path, "not received events for NA partition yet"
 > app.attach()
 > app.activate()
 > ```
-> This will just end up refreshing your infrastructure in cloud, with not logical change in the current application topology (routing state, pending triggers, etc).
+> This will just end up refreshing your infrastructure in cloud, without logical change in the current application topology (routing state, pending triggers, etc).
 >
 > Let's give a more practical example to this use-case by going back to our example.
 > Assume that we are trying to extend the application was previously activated in a different development environment.
