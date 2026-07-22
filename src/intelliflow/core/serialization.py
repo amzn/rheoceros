@@ -4,6 +4,7 @@
 import codecs
 import copy
 import datetime
+import io
 import json
 import pickle
 import zlib
@@ -63,6 +64,33 @@ class IFUnpickler(Unpickler):
 
 INTELLIFLOW_COMPRESSION_MAGIC: str = "_IntelliFlow_ZIP_"
 
+# Modules whose members must never be resolved during deserialization
+_BLOCKED_MODULE_ROOTS = frozenset(
+    {
+        "os",
+        "posix",
+        "nt",
+        "subprocess",
+        "shutil",
+        "socket",
+        "ctypes",
+        "pty",
+        "runpy",
+        "webbrowser",
+    }
+)
+_BLOCKED_BUILTINS = frozenset({"eval", "exec", "compile", "open", "__import__", "breakpoint", "input"})
+
+
+class _RestrictedUnpickler(pickle.Unpickler):
+    def find_class(self, module: str, name: str):
+        root = module.split(".")[0]
+        if root in _BLOCKED_MODULE_ROOTS:
+            raise DeserializationError(f"Deserialization of {module!r}.{name!r} is not allowed!")
+        if root in ("builtins", "__builtin__") and name in _BLOCKED_BUILTINS:
+            raise DeserializationError(f"Deserialization of builtin {name!r} is not allowed!")
+        return super().find_class(module, name)
+
 
 def loads(dump_str: str) -> Any:
     # Enable for DEBUG on de-serialization errors
@@ -72,7 +100,7 @@ def loads(dump_str: str) -> Any:
         decoded_dump = zlib.decompress(codecs.decode(dump_str.encode(), "base64"))
     else:
         decoded_dump: str = codecs.decode(dump_str.encode(), "base64")
-    return pickle.loads(decoded_dump)
+    return _RestrictedUnpickler(io.BytesIO(decoded_dump)).load()
 
 
 def dumps(obj: Any, compress: Optional[bool] = False) -> str:
