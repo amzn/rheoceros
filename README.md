@@ -1,5 +1,11 @@
 # RheocerOS
 
+> [!IMPORTANT]
+> **This repository is archived and is no longer actively maintained.**
+> The code remains available for reference, but there will be no further
+> updates, releases, bug fixes, or responses to issues and pull requests.
+> You are welcome to fork the project if you wish to continue development.
+
 A cloud-based, lightweight framework designed to push the state-of-art in AI team workflows. It was designed and 
 implemented by one of AI teams at Amazon, as part of an "innovation speed/momentum" initiative.
 
